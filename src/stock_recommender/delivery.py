@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import os
+import subprocess
+from typing import Callable
+
+from .parameters import load_strategy_config, normalize_report_delivery
+
+
+PLATFORM_CHANNELS = {"feishu", "telegram", "discord", "signal"}
+
+
+def delivery_target(config: dict) -> str:
+    delivery = normalize_report_delivery(config.get("delivery"))
+    channel = delivery["channel"]
+    target = delivery["target"]
+    if channel in PLATFORM_CHANNELS:
+        if not target:
+            raise ValueError(f"{channel} 推送需要填写接收目标")
+        return target if target.startswith(f"{channel}:") else f"{channel}:{target}"
+    return channel
+
+
+def delivery_cron(config: dict) -> str:
+    delivery = normalize_report_delivery(config.get("delivery"))
+    local_minutes = delivery["hour"] * 60 + delivery["minute"]
+    utc_minutes = (local_minutes - 8 * 60) % (24 * 60)
+    hour, minute = divmod(utc_minutes, 60)
+    weekdays = ("0-4" if local_minutes < 8 * 60 else "1-5") if delivery["frequency"] == "weekdays" else "*"
+    return f"{minute} {hour} * * {weekdays}"
+
+
+def should_deliver_report(report: str, config: dict) -> bool:
+    delivery = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
+    if not delivery["enabled"]:
+        return False
+    text = str(report or "")
+    is_error = any(marker in text for marker in ["实时行情不可用", "AI 分析失败", "数据源错误", "执行失败"])
+    is_empty = any(marker in text for marker in ["当前策略无匹配股票", "当前策略没有匹配股票"])
+    if is_error and not delivery["push_on_error"]:
+        return False
+    if is_empty and not delivery["push_on_empty"]:
+        return False
+    return True
+
+
+def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dict:
+    job_id = os.getenv("STOCK_AGENT_HERMES_JOB_ID", "").strip()
+    hermes_bin = os.getenv("STOCK_AGENT_HERMES_BIN", "hermes").strip()
+    if not job_id:
+        return {"status": "unavailable", "message": "未配置 Hermes job id"}
+    delivery = normalize_report_delivery(config.get("delivery"))
+    execute = runner or subprocess.run
+    try:
+        if not delivery["enabled"]:
+            command = [hermes_bin, "cron", "pause", job_id]
+            completed = execute(command, capture_output=True, text=True, timeout=15)
+            if completed.returncode != 0:
+                raise RuntimeError((completed.stderr or completed.stdout).strip())
+            return {"status": "paused", "job_id": job_id, "message": "报告推送已暂停"}
+
+        target = delivery_target(config)
+        schedule = delivery_cron(config)
+        edit = execute(
+            [hermes_bin, "cron", "edit", job_id, "--schedule", schedule, "--deliver", target],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if edit.returncode != 0:
+            raise RuntimeError((edit.stderr or edit.stdout).strip())
+        resume = execute([hermes_bin, "cron", "resume", job_id], capture_output=True, text=True, timeout=15)
+        if resume.returncode != 0 and "already" not in (resume.stderr or resume.stdout).lower():
+            raise RuntimeError((resume.stderr or resume.stdout).strip())
+        return {
+            "status": "synced",
+            "job_id": job_id,
+            "schedule": schedule,
+            "deliver": target,
+            "message": "报告推送已同步",
+        }
+    except Exception as exc:
+        return {"status": "error", "job_id": job_id, "message": str(exc)[:1000]}
+
+
+def sync_active_strategy_delivery() -> dict:
+    strategy = load_strategy_config()
+    if not strategy.get("id"):
+        return {"status": "unavailable", "message": "没有活动策略，未修改 Hermes 任务"}
+    return sync_hermes_delivery(strategy)
+
+
+def pause_hermes_delivery() -> dict:
+    return sync_hermes_delivery({"delivery": {"enabled": False}})
