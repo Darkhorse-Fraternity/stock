@@ -193,6 +193,10 @@ Recommendation and hourly tracking runs upsert a 120-day archive at
 recent 30 calendar days, and `/api/performance?days=30` returns the same data as
 JSON. Current quotes are refreshed when the page opens; if a quote source is
 temporarily unavailable, the API clearly marks and uses the last tracked price.
+Stocks are deduplicated by symbol: each row compares the current quote with that
+stock's first recommendation price inside the 30-day window. The recommendation
+success rate is the share of priced stocks whose current price is above that
+first recommendation price.
 
 Set `STOCK_AGENT_PERFORMANCE_URL` in both recommendation and tracking jobs to
 append a Feishu-compatible Markdown link below every delivered report. Existing

@@ -54,10 +54,50 @@ class RecommendationPerformanceTests(unittest.TestCase):
 
         self.assertEqual(payload["summary"]["total_recommendations"], 2)
         self.assertEqual(payload["summary"]["recommendation_days"], 2)
+        self.assertEqual(payload["summary"]["success_rate"], 50)
         self.assertEqual(payload["summary"]["win_rate"], 50)
         self.assertEqual(payload["summary"]["average_return_pct"], 0)
         self.assertEqual(payload["summary"]["best"]["symbol"], "300001")
         self.assertEqual(payload["summary"]["worst"]["symbol"], "300002")
+
+    def test_repeated_stock_uses_first_recommendation_price_for_success_rate(self):
+        now = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            for trade_date, entry_price in (("2026-07-20", 100), ("2026-07-21", 120)):
+                upsert_recommendation_history(
+                    {
+                        "trade_date": trade_date,
+                        "generated_at": f"{trade_date} 09:35:00 CST",
+                        "strategy_id": "strategy-1",
+                        "strategy_name": "科技 AI",
+                        "recommendations": [
+                            {"symbol": "300001", "name": "重复推荐股", "entry_price": entry_price}
+                        ],
+                    },
+                    path=path,
+                    now=now,
+                )
+
+            payload = build_recommendation_performance(
+                days=30,
+                path=path,
+                now=now,
+                quote_fetcher=lambda entries: (
+                    [{"symbol": "300001", "name": "重复推荐股", "price": 110, "percent": 1, "volume": 2000}],
+                    None,
+                ),
+            )
+
+        self.assertEqual(payload["summary"]["total_recommendations"], 2)
+        self.assertEqual(payload["summary"]["unique_stocks"], 1)
+        self.assertEqual(payload["summary"]["successful_stocks"], 1)
+        self.assertEqual(payload["summary"]["success_rate"], 100)
+        self.assertEqual(len(payload["stocks"]), 1)
+        self.assertEqual(payload["stocks"][0]["first_recommendation_price"], 100)
+        self.assertEqual(payload["stocks"][0]["current_price"], 110)
+        self.assertEqual(payload["stocks"][0]["return_pct"], 10)
+        self.assertEqual(payload["stocks"][0]["recommendation_count"], 2)
 
     def test_tracking_updates_archived_recommendation(self):
         recommendation_time = datetime(2026, 7, 20, 1, 35, tzinfo=timezone.utc)

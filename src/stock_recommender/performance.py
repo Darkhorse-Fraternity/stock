@@ -179,10 +179,55 @@ def build_recommendation_performance(
             )
     events.sort(key=lambda item: (str(item.get("trade_date") or ""), -int(item.get("rank") or 0)), reverse=True)
 
-    returns = [item["return_pct"] for item in events if item["return_pct"] is not None]
-    positive = [value for value in returns if value > 0]
-    best = max((item for item in events if item["return_pct"] is not None), key=lambda item: item["return_pct"], default=None)
-    worst = min((item for item in events if item["return_pct"] is not None), key=lambda item: item["return_pct"], default=None)
+    stocks_by_symbol: dict[str, dict] = {}
+    for event in sorted(events, key=lambda item: (str(item.get("trade_date") or ""), str(item.get("generated_at") or ""), int(item.get("rank") or 0))):
+        symbol = event["symbol"]
+        existing = stocks_by_symbol.get(symbol)
+        if existing is None:
+            existing = {
+                "symbol": symbol,
+                "name": event["name"],
+                "first_recommended_date": event["trade_date"],
+                "first_recommended_at": event["generated_at"],
+                "first_recommendation_price": event["entry_price"],
+                "latest_recommended_date": event["trade_date"],
+                "current_price": event["latest_price"],
+                "return_pct": None,
+                "recommendation_count": 0,
+                "maximum_sampled_drawdown_pct": event["maximum_sampled_drawdown_pct"],
+                "volume_hands": event["volume_hands"],
+                "turnover_cny": event["turnover_cny"],
+                "latest_change_pct": event["latest_change_pct"],
+                "strategy_name": event["strategy_name"],
+                "strategy_stage": event["strategy_stage"],
+                "quote_status": event["quote_status"],
+            }
+            stocks_by_symbol[symbol] = existing
+        existing["recommendation_count"] += 1
+        existing["name"] = event["name"]
+        existing["latest_recommended_date"] = event["trade_date"]
+        existing["current_price"] = event["latest_price"]
+        existing["volume_hands"] = event["volume_hands"]
+        existing["turnover_cny"] = event["turnover_cny"]
+        existing["latest_change_pct"] = event["latest_change_pct"]
+        existing["quote_status"] = event["quote_status"]
+        drawdown = event["maximum_sampled_drawdown_pct"]
+        if drawdown is not None:
+            previous = existing["maximum_sampled_drawdown_pct"]
+            existing["maximum_sampled_drawdown_pct"] = min(previous, drawdown) if previous is not None else drawdown
+
+    stocks = list(stocks_by_symbol.values())
+    for item in stocks:
+        item["return_pct"] = _rounded(_return_pct(number(item["first_recommendation_price"]), number(item["current_price"])))
+        item["successful"] = item["return_pct"] is not None and item["return_pct"] > 0
+        first_day = _date_value(item["first_recommended_date"])
+        item["days_since_first_recommendation"] = (current.date() - first_day).days if first_day else None
+    stocks.sort(key=lambda item: (str(item.get("first_recommended_date") or ""), item.get("return_pct") or 0), reverse=True)
+
+    stock_returns = [item["return_pct"] for item in stocks if item["return_pct"] is not None]
+    successful_stocks = [item for item in stocks if item["successful"]]
+    best = max((item for item in stocks if item["return_pct"] is not None), key=lambda item: item["return_pct"], default=None)
+    worst = min((item for item in stocks if item["return_pct"] is not None), key=lambda item: item["return_pct"], default=None)
     daily = []
     for trade_date in sorted({str(item.get("trade_date")) for item in events if item.get("trade_date")}):
         values = [item["return_pct"] for item in events if item.get("trade_date") == trade_date and item["return_pct"] is not None]
@@ -205,14 +250,18 @@ def build_recommendation_performance(
         "summary": {
             "recommendation_days": len({item.get("trade_date") for item in events}),
             "total_recommendations": len(events),
-            "unique_stocks": len({item.get("symbol") for item in events}),
-            "priced_recommendations": len(returns),
-            "average_return_pct": _rounded(statistics.fmean(returns)) if returns else None,
-            "median_return_pct": _rounded(statistics.median(returns)) if returns else None,
-            "win_rate": _rounded(len(positive) / len(returns) * 100) if returns else None,
+            "unique_stocks": len(stocks),
+            "priced_recommendations": len([item for item in events if item["return_pct"] is not None]),
+            "priced_stocks": len(stock_returns),
+            "successful_stocks": len(successful_stocks),
+            "average_return_pct": _rounded(statistics.fmean(stock_returns)) if stock_returns else None,
+            "median_return_pct": _rounded(statistics.median(stock_returns)) if stock_returns else None,
+            "success_rate": _rounded(len(successful_stocks) / len(stock_returns) * 100) if stock_returns else None,
+            "win_rate": _rounded(len(successful_stocks) / len(stock_returns) * 100) if stock_returns else None,
             "best": deepcopy(best),
             "worst": deepcopy(worst),
         },
         "daily": daily,
+        "stocks": stocks,
         "events": events,
     }

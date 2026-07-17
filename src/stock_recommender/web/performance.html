@@ -255,7 +255,7 @@
           <div class="title-block">
             <p class="eyebrow">STOCK AGENT / RECOMMENDATION RECORD</p>
             <h1>近 30 天推荐表现</h1>
-            <p class="subtitle">从每次推荐价格开始计算，统一对照当前行情。这里记录结果，不修改历史。</p>
+            <p class="subtitle">每只股票从近 30 天内第一次推荐价格开始计算，统一对照当前行情。这里记录结果，不修改历史。</p>
           </div>
           <div class="refresh-panel">
             <span class="stage">模拟盘记录</span>
@@ -265,7 +265,7 @@
 
         <section class="scoreboard" aria-label="表现摘要">
           <div class="score primary"><div class="score-label">平均涨跌</div><div class="score-value" id="average-return">—</div><div class="score-note" id="coverage">等待推荐记录</div></div>
-          <div class="score"><div class="score-label">上涨比例</div><div class="score-value" id="win-rate">—</div><div class="score-note">当前收益为正的推荐</div></div>
+          <div class="score"><div class="score-label">推荐成功率</div><div class="score-value" id="win-rate">—</div><div class="score-note" id="success-count">当前价高于首次推荐价</div></div>
           <div class="score"><div class="score-label">最好表现</div><div class="score-value" id="best-return">—</div><div class="score-note" id="best-stock">—</div></div>
           <div class="score"><div class="score-label">最弱表现</div><div class="score-value" id="worst-return">—</div><div class="score-note" id="worst-stock">—</div></div>
         </section>
@@ -284,14 +284,14 @@
           <div class="toolbar">
             <div class="filters" aria-label="筛选推荐结果">
               <button class="filter" type="button" data-filter="all" aria-pressed="true">全部</button>
-              <button class="filter" type="button" data-filter="up" aria-pressed="false">上涨</button>
-              <button class="filter" type="button" data-filter="down" aria-pressed="false">下跌</button>
+              <button class="filter" type="button" data-filter="up" aria-pressed="false">成功</button>
+              <button class="filter" type="button" data-filter="down" aria-pressed="false">未成功</button>
             </div>
             <div class="freshness" id="freshness">正在读取最新行情…</div>
           </div>
           <div class="table-wrap" id="table-wrap">
             <table>
-              <thead><tr><th>推荐日</th><th>股票</th><th>推荐价</th><th>最新价</th><th>推荐后涨跌</th><th>最大采样回撤</th><th>成交量</th></tr></thead>
+              <thead><tr><th>首次推荐日</th><th>股票</th><th>首次推荐价</th><th>当前价</th><th>累计涨跌</th><th>推荐次数</th><th>最大采样回撤</th><th>成交量</th></tr></thead>
               <tbody id="performance-body"></tbody>
             </table>
           </div>
@@ -299,7 +299,7 @@
           <div class="empty" id="empty"><div class="empty-mark">30D</div><h3>还没有可展示的推荐记录</h3><p>下一次工作日 09:35 推荐后，这里会开始积累表现。</p></div>
         </section>
         <footer>
-          <span>涨跌幅 = 最新价 ÷ 推荐价 − 1；红涨绿跌。历史最大回撤来自盘中整点采样，不等同于逐笔最大回撤。</span>
+          <span>累计涨跌 = 当前价 ÷ 首次推荐价 − 1；成功率 = 当前价上涨的股票数 ÷ 有有效价格的股票数。红涨绿跌。</span>
           <span>模拟盘数据，仅供策略验证，不构成投资建议。</span>
         </footer>
       </article>
@@ -328,13 +328,14 @@
       function renderSummary(payload) {
         const summary = payload.summary
         setMetric("#average-return", summary.average_return_pct)
-        $("#win-rate").textContent = summary.win_rate == null ? "—" : `${summary.win_rate.toFixed(1)}%`
-        $("#win-rate").className = `score-value ${summary.win_rate >= 50 ? "up" : summary.win_rate == null ? "flat" : "down"}`
+        $("#win-rate").textContent = summary.success_rate == null ? "—" : `${summary.success_rate.toFixed(1)}%`
+        $("#win-rate").className = `score-value ${summary.success_rate >= 50 ? "up" : summary.success_rate == null ? "flat" : "down"}`
+        $("#success-count").textContent = summary.priced_stocks ? `${summary.successful_stocks}/${summary.priced_stocks} 只股票上涨` : "当前价高于首次推荐价"
         setMetric("#best-return", summary.best?.return_pct)
         setMetric("#worst-return", summary.worst?.return_pct)
-        $("#best-stock").textContent = summary.best ? `${summary.best.name} · ${summary.best.trade_date}` : "—"
-        $("#worst-stock").textContent = summary.worst ? `${summary.worst.name} · ${summary.worst.trade_date}` : "—"
-        $("#coverage").textContent = `${summary.recommendation_days} 个推荐日 · ${summary.total_recommendations} 条记录 · ${summary.unique_stocks} 只股票`
+        $("#best-stock").textContent = summary.best ? `${summary.best.name} · 首推 ${summary.best.first_recommended_date}` : "—"
+        $("#worst-stock").textContent = summary.worst ? `${summary.worst.name} · 首推 ${summary.worst.first_recommended_date}` : "—"
+        $("#coverage").textContent = `${summary.unique_stocks} 只股票 · ${summary.total_recommendations} 次推荐 · ${summary.recommendation_days} 个推荐日`
       }
 
       function renderChart(daily) {
@@ -368,30 +369,31 @@
           ${dots}${dateLabels}`
       }
 
-      function visibleEvents() {
-        const events = state.payload?.events || []
-        if (state.filter === "up") return events.filter((item) => item.return_pct > 0)
-        if (state.filter === "down") return events.filter((item) => item.return_pct < 0)
-        return events
+      function visibleStocks() {
+        const stocks = state.payload?.stocks || []
+        if (state.filter === "up") return stocks.filter((item) => item.successful)
+        if (state.filter === "down") return stocks.filter((item) => item.return_pct != null && !item.successful)
+        return stocks
       }
 
       function renderRows() {
-        const events = visibleEvents()
-        $("#performance-body").innerHTML = events.map((item) => `
+        const stocks = visibleStocks()
+        $("#performance-body").innerHTML = stocks.map((item) => `
           <tr>
-            <td>${esc(item.trade_date)}<br><span class="stock-code">持有 ${item.days_held ?? "—"} 天</span></td>
-            <td><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)} · #${item.rank}</span></td>
-            <td>${price(item.entry_price)}</td><td>${price(item.latest_price)}${item.quote_status === "stored" ? '<br><span class="quote-stored">缓存行情</span>' : ""}</td>
+            <td>${esc(item.first_recommended_date)}<br><span class="stock-code">距今 ${item.days_since_first_recommendation ?? "—"} 天</span></td>
+            <td><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)}</span></td>
+            <td>${price(item.first_recommendation_price)}</td><td>${price(item.current_price)}${item.quote_status === "stored" ? '<br><span class="quote-stored">缓存行情</span>' : ""}</td>
             <td><span class="return-pill ${tone(item.return_pct)}">${pct(item.return_pct)}</span></td>
+            <td>${item.recommendation_count}</td>
             <td class="${tone(item.maximum_sampled_drawdown_pct)}">${pct(item.maximum_sampled_drawdown_pct)}</td>
             <td>${volume(item.volume_hands)}</td>
           </tr>`).join("")
-        $("#mobile-list").innerHTML = events.map((item) => `
+        $("#mobile-list").innerHTML = stocks.map((item) => `
           <article class="mobile-card">
-            <div class="mobile-head"><div><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)} · ${esc(item.trade_date)} · 推荐 #${item.rank}</span></div><div class="mobile-return ${tone(item.return_pct)}">${pct(item.return_pct)}</div></div>
-            <div class="mobile-metrics"><div class="mobile-metric">推荐价<strong>${price(item.entry_price)}</strong></div><div class="mobile-metric">最新价<strong>${price(item.latest_price)}</strong></div><div class="mobile-metric">最大采样回撤<strong class="${tone(item.maximum_sampled_drawdown_pct)}">${pct(item.maximum_sampled_drawdown_pct)}</strong></div><div class="mobile-metric">成交量<strong>${volume(item.volume_hands)}</strong></div></div>
+            <div class="mobile-head"><div><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)} · 首推 ${esc(item.first_recommended_date)} · 共 ${item.recommendation_count} 次</span></div><div class="mobile-return ${tone(item.return_pct)}">${pct(item.return_pct)}</div></div>
+            <div class="mobile-metrics"><div class="mobile-metric">首次推荐价<strong>${price(item.first_recommendation_price)}</strong></div><div class="mobile-metric">当前价<strong>${price(item.current_price)}</strong></div><div class="mobile-metric">最大采样回撤<strong class="${tone(item.maximum_sampled_drawdown_pct)}">${pct(item.maximum_sampled_drawdown_pct)}</strong></div><div class="mobile-metric">成交量<strong>${volume(item.volume_hands)}</strong></div></div>
           </article>`).join("")
-        const empty = !state.payload?.events?.length
+        const empty = !state.payload?.stocks?.length
         $("#empty").style.display = empty ? "block" : "none"
         $("#table-wrap").style.display = empty ? "none" : ""
         if (empty) $("#mobile-list").style.display = "none"
@@ -402,7 +404,7 @@
         renderSummary(payload)
         renderChart(payload.daily || [])
         renderRows()
-        $("#freshness").textContent = `更新：${payload.generated_at} · ${payload.summary.priced_recommendations}/${payload.summary.total_recommendations} 条有价格`
+        $("#freshness").textContent = `更新：${payload.generated_at} · ${payload.summary.priced_stocks}/${payload.summary.unique_stocks} 只股票有价格`
         const notice = $("#notice")
         if (payload.quote_error) {
           notice.style.display = "block"
