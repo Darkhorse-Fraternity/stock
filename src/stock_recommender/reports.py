@@ -7,6 +7,7 @@ from typing import Callable, Iterable
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import collect_analyzed_candidates, extract_market_payload, generate_agent_context
 from .llm import call_llm_analysis
+from .parameters import chase_risk_threshold
 from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
 
@@ -60,6 +61,10 @@ def generate_report(
     top_n: int = 3,
     board_fetcher: Callable | None = None,
     fallback_fetcher: Callable | None = None,
+    history_fetcher: Callable | None = None,
+    financial_fetcher: Callable | None = None,
+    enrich_limit: int | None = None,
+    strategy: dict | None = None,
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
@@ -72,30 +77,32 @@ def generate_report(
         board_name=board_name,
         board_fetcher=board_fetcher,
         fallback_fetcher=fallback_fetcher,
-        watchlist=watchlist_entries,
-        sector_filters=sectors,
+        history_fetcher=history_fetcher,
+        financial_fetcher=financial_fetcher,
+        enrich_limit=enrich_limit,
+        strategy=strategy,
+        watchlist=watchlist_entries if watchlist is not None else None,
+        sector_filters=sectors if sector_filters is not None else None,
         watchlist_fetcher=watchlist_fetcher,
     )
-    top = analyses[:top_n]
-    universe_label = "自选股池" if watchlist_entries else f"{board_name}板块"
-    filter_label = f"（板块：{'、'.join(sectors)}）" if sectors else ""
-    if not top:
+
+    if not analyses:
         return "\n".join(
             [
                 f"📊 **股票每日推荐** ({report_time.strftime('%Y 年%m月%d日')})",
-                "=" * 30,
                 "",
-                f"🎯 **{universe_label}{filter_label}**",
-                "",
-                "暂无符合条件的候选股票。",
-                f"原因：{error or '候选数量为 0'}",
+                "当前策略没有匹配股票。",
+                f"数据状态：{error or '行情正常，筛选条件未命中'}",
                 "",
                 "仅供参考，不构成投资建议。",
             ]
         )
 
+    top = analyses[:top_n]
     avg_score = sum(item["score"] for item in top) / len(top)
     sources = sorted({item.get("source") for item in top if item.get("source")})
+    universe_label = "自选股池" if watchlist_entries else f"{board_name}板块"
+    filter_label = f"（板块：{'、'.join(sectors)}）" if sectors else ""
 
     report = [
         f"📊 **股票每日推荐** ({report_time.strftime('%Y 年%m月%d日')})",
@@ -154,8 +161,8 @@ def generate_report(
             "",
             "📌 **数据说明**",
             f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
-            f"  • 数据来源：{'；'.join(sources) or '无'}",
-            "  • 任务频率：北京时间工作日交易时段每小时播报一次",
+            f"  • 数据来源：{'；'.join(sources)}",
+            "  • 任务频率：北京时间工作日 09:30 推荐；开市期间整点跟踪推荐股",
             "",
             "=" * 30,
         ]
@@ -178,11 +185,15 @@ def generate_ai_report(
     enable_tick: bool = False,
     tick_fetcher: Callable | None = None,
     tick_limit: int = 2,
+    history_fetcher: Callable | None = None,
+    financial_fetcher: Callable | None = None,
+    enrich_limit: int | None = None,
     llm_client: Callable | None = None,
     llm_base_url: str = "",
     llm_model: str = "Flux_AI/Flux_AI:latest",
     llm_api_key: str = "ollama",
     llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
+    strategy: dict | None = None,
 ) -> str:
     context = generate_agent_context(
         now=now,
@@ -191,19 +202,19 @@ def generate_ai_report(
         candidate_limit=candidate_limit,
         board_fetcher=board_fetcher,
         fallback_fetcher=fallback_fetcher,
-        watchlist=watchlist,
-        sector_filters=sector_filters,
-        watchlist_fetcher=watchlist_fetcher,
         enable_tick=enable_tick,
         tick_fetcher=tick_fetcher,
         tick_limit=tick_limit,
+        history_fetcher=history_fetcher,
+        financial_fetcher=financial_fetcher,
+        enrich_limit=enrich_limit,
+        strategy=strategy,
+        watchlist=watchlist,
+        sector_filters=sector_filters,
+        watchlist_fetcher=watchlist_fetcher,
     )
     payload = extract_market_payload(context) or {}
-    if (
-        payload.get("fetch_error")
-        or not payload.get("candidates")
-        or any("估算兜底" in source for source in payload.get("source", []))
-    ):
+    if payload.get("fetch_error") or any("估算兜底" in source for source in payload.get("source", [])):
         return "\n".join(
             [
                 "⚠️ **实时行情不可用**",
@@ -214,6 +225,8 @@ def generate_ai_report(
                 "仅供参考，不构成投资建议。",
             ]
         )
+    if not payload.get("candidates"):
+        return "⚪ **当前策略无匹配股票**\n\n行情数据正常，但没有股票同时满足已启用条件。\n\n仅供参考，不构成投资建议。"
     client = llm_client or call_llm_analysis
     try:
         analysis = client(
@@ -223,7 +236,7 @@ def generate_ai_report(
             api_key=llm_api_key,
             timeout=llm_timeout,
         )
-        guarded = apply_risk_guard(context, analysis)
+        guarded = apply_risk_guard(context, analysis, strategy=strategy)
         snapshot_rows = select_snapshot_candidates(guarded, payload.get("candidates") or [], tracking_limit)
         snapshot = format_recommendation_snapshot(
             snapshot_rows,
@@ -239,6 +252,10 @@ def generate_ai_report(
             top_n=min(3, candidate_limit),
             board_fetcher=board_fetcher,
             fallback_fetcher=fallback_fetcher,
+            history_fetcher=history_fetcher,
+            financial_fetcher=financial_fetcher,
+            enrich_limit=enrich_limit,
+            strategy=strategy,
             watchlist=watchlist,
             sector_filters=sector_filters,
             watchlist_fetcher=watchlist_fetcher,
@@ -246,7 +263,7 @@ def generate_ai_report(
         return f"⚠️ AI 分析失败：{exc}\n\n以下为脚本兜底报告：\n\n{fallback}"
 
 
-def apply_risk_guard(context: str, analysis: str) -> str:
+def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = None) -> str:
     payload = extract_market_payload(context)
     if not payload:
         return analysis
@@ -255,14 +272,14 @@ def apply_risk_guard(context: str, analysis: str) -> str:
     mentioned_symbols = set(re.findall(r"\b\d{6}\b", analysis))
     unknown_symbols = mentioned_symbols - known_symbols
     if unknown_symbols:
-        return build_conservative_report(payload, "数据一致性校验失败：AI 输出包含非候选股票代码")
+        return build_conservative_report(payload, "数据一致性校验失败：AI 输出包含非候选股票代码", strategy=strategy)
 
-    has_high_risk = any(number(item.get("change_percent")) >= 7 for item in candidates)
+    has_high_risk = any(number(item.get("change_percent")) >= chase_risk_threshold(strategy) for item in candidates)
     unsafe_position = any(term in analysis for term in ["重仓", "中仓", "满仓", "30-40", "30%", "40%"])
     if not has_high_risk or not unsafe_position:
         return analysis
 
-    return build_conservative_report(payload, "AI 原始输出包含对高涨幅股票的过高仓位建议")
+    return build_conservative_report(payload, "AI 原始输出包含对高涨幅股票的过高仓位建议", strategy=strategy)
 
 
 def format_cny(value: float) -> str:
@@ -274,11 +291,11 @@ def format_cny(value: float) -> str:
     return f"{amount:.0f}"
 
 
-def market_sentiment_profile(candidates: list[dict]) -> dict:
+def market_sentiment_profile(candidates: list[dict], *, strategy: dict | None = None) -> dict:
     if not candidates:
         return {"label": "弱", "position": "2成", "entries": "3次", "summary": "候选不足，按弱情绪处理"}
     avg_score = sum(number(item.get("signal_score")) for item in candidates) / len(candidates)
-    strong_count = sum(1 for item in candidates if number(item.get("change_percent")) >= 7)
+    strong_count = sum(1 for item in candidates if number(item.get("change_percent")) >= chase_risk_threshold(strategy))
     if avg_score >= 75 or strong_count >= 2:
         return {"label": "强", "position": "8成", "entries": "10次", "summary": f"平均信号分 {avg_score:.0f}，强势候选 {strong_count} 只"}
     if avg_score >= 65:
@@ -286,15 +303,16 @@ def market_sentiment_profile(candidates: list[dict]) -> dict:
     return {"label": "弱", "position": "2成", "entries": "3次", "summary": f"平均信号分 {avg_score:.0f}，信号偏弱"}
 
 
-def candidate_action(item: dict, sentiment: dict) -> dict:
+def candidate_action(item: dict, sentiment: dict, *, strategy: dict | None = None) -> dict:
     pct = number(item.get("change_percent"))
     turnover_rate = number(item.get("turnover_rate"))
-    if pct >= 7:
+    threshold = chase_risk_threshold(strategy)
+    if pct >= threshold:
         return {
             "label": "观望或极轻仓试错",
             "position": "不超过1成",
             "entries": "最多1次",
-            "reason": "涨幅已经超过 7% 追高阈值，按系统风控规则降级",
+            "reason": f"涨幅已经超过 {threshold:g}% 追高阈值，按系统风控规则降级",
         }
     if pct >= 3.5 and turnover_rate >= 2:
         return {
@@ -331,8 +349,8 @@ def price_position_summary(position: dict | None) -> str:
     return "、".join(parts)
 
 
-def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict) -> None:
-    action = candidate_action(item, sentiment)
+def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict, *, strategy: dict | None = None) -> None:
+    action = candidate_action(item, sentiment, strategy=strategy)
     pct = number(item.get("change_percent"))
     turnover_rate = number(item.get("turnover_rate"))
     turnover = number(item.get("turnover_cny"))
@@ -342,13 +360,12 @@ def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict) 
     position_summary = price_position_summary(item.get("price_position"))
     ignition_summary = ignition_signal_summary(item.get("ignition_signal"))
     source = item.get("source") or "结构化行情"
-    sector = item.get("sector") or item.get("board_name") or "未分类"
     reasons = item.get("machine_reasons") or []
     lines.extend(
         [
             f"### {item['name']} ({item['symbol']})",
             "**入选理由**",
-            f"- 来自今日 {sector} 候选股池，实时数据源为{source}。",
+            f"- 来自今日 {item.get('board_name', DEFAULT_BOARD_NAME)} 科技 AI 热点股池，实时数据源为{source}。",
             f"- 涨幅 {pct:.2f}%，换手率 {turnover_rate:.2f}%，成交额 {format_cny(turnover)}，机器信号分 {score:.0f}/100。",
             f"- 流通市值 {format_cny(float_market_cap)}，用于执行 20-100 亿中小盘筛选。",
             f"- 价格位置：{position_summary}。",
@@ -371,12 +388,13 @@ def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict) 
     )
 
 
-def build_conservative_report(payload: dict, reason: str) -> str:
+def build_conservative_report(payload: dict, reason: str, *, strategy: dict | None = None) -> str:
     candidates = payload.get("candidates") or []
-    high_risk = [item for item in candidates if number(item.get("change_percent")) >= 7]
-    moderate = [item for item in candidates if 0 <= number(item.get("change_percent")) < 7]
+    threshold = chase_risk_threshold(strategy)
+    high_risk = [item for item in candidates if number(item.get("change_percent")) >= threshold]
+    moderate = [item for item in candidates if 0 <= number(item.get("change_percent")) < threshold]
     selected = (high_risk[:3] + moderate[:2])[:5]
-    sentiment = market_sentiment_profile(candidates)
+    sentiment = market_sentiment_profile(candidates, strategy=strategy)
     lines = [
         "⚠️ **系统风控修正**",
         "",
@@ -390,12 +408,12 @@ def build_conservative_report(payload: dict, reason: str) -> str:
         lines.extend(["暂无可解释候选。", "", "仅供参考，不构成投资建议。"])
         return "\n".join(lines)
     for item in selected:
-        item.setdefault("board_name", payload.get("board_name") or "AI智能体")
-        append_candidate_explanation(lines, item, sentiment)
+        item.setdefault("board_name", payload.get("board_name") or DEFAULT_BOARD_NAME)
+        append_candidate_explanation(lines, item, sentiment, strategy=strategy)
     lines.extend(
         [
             "## 最终建议",
-            "- 今日不建议追高，涨幅超过 7% 的候选只允许观望或极轻仓试错。",
+            f"- 今日不建议追高，涨幅超过 {threshold:g}% 的候选只允许观望或极轻仓试错。",
             "- 真正买点必须等待 10 秒量价点火、均价线/开盘价/0轴上方；盘口大单被主动吃掉后卖盘变稀疏仍需稳定盘口源确认。",
             "- 仅供参考，不构成投资建议。",
         ]

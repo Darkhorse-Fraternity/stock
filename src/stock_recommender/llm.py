@@ -7,8 +7,8 @@ from typing import Callable
 from .config import DEFAULT_LLM_TIMEOUT_SECONDS
 
 
-def call_llm_analysis(
-    context: str,
+def call_chat_completion(
+    messages: list[dict[str, str]],
     *,
     base_url: str,
     model: str,
@@ -22,15 +22,9 @@ def call_llm_analysis(
     payload = {
         "model": model,
         "temperature": 0.2,
-        "max_tokens": 900,
+        "max_tokens": 1200,
         "stream": False,
-        "messages": [
-            {
-                "role": "system",
-                "content": "你是谨慎的A股短线分析agent。只基于用户提供的结构化行情数据分析，不联网，不编造数据。",
-            },
-            {"role": "user", "content": context},
-        ],
+        "messages": messages,
     }
     request = urllib.request.Request(
         endpoint,
@@ -44,3 +38,28 @@ def call_llm_analysis(
     with opener(request, timeout=timeout) as response:
         data = json.loads(response.read().decode("utf-8"))
     return data["choices"][0]["message"]["content"].strip()
+
+
+def call_llm_analysis(
+    context: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: str = "ollama",
+    timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
+    urlopen_func: Callable | None = None,
+) -> str:
+    return call_chat_completion(
+        [
+            {
+                "role": "system",
+                "content": "你是谨慎的A股短线分析agent。只基于用户提供的结构化行情数据分析，不联网，不编造数据。",
+            },
+            {"role": "user", "content": context},
+        ],
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        timeout=timeout,
+        urlopen_func=urlopen_func,
+    )

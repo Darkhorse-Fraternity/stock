@@ -551,7 +551,7 @@ class StockAgentTests(unittest.TestCase):
 
         filtered = stock_agent.filter_candidates(rows)
 
-        self.assertEqual([row["symbol"] for row in filtered], ["603956", "600000"])
+        self.assertEqual([row["symbol"] for row in filtered], ["603956"])
 
     def test_evaluate_tick_ignition_detects_10s_price_volume_surge(self):
         ticks = []

@@ -1,0 +1,84 @@
+import os
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from stock_recommender.delivery import delivery_cron, delivery_target, should_deliver_report, sync_active_strategy_delivery, sync_hermes_delivery
+from stock_recommender.parameters import default_strategy_config, normalize_strategy_config
+
+
+class DeliveryTests(unittest.TestCase):
+    def test_legacy_strategy_keeps_existing_delivery_enabled(self):
+        with patch.dict(os.environ, {"STOCK_AGENT_DEFAULT_DELIVERY_ENABLED": "1", "STOCK_AGENT_DEFAULT_DELIVERY_TARGET": "oc_current"}):
+            strategy = normalize_strategy_config({"name": "旧策略", "parameters": {}})
+
+        self.assertTrue(strategy["delivery"]["enabled"])
+        self.assertEqual(strategy["delivery"]["target"], "oc_current")
+
+    def test_new_strategy_defaults_to_delivery_disabled(self):
+        self.assertFalse(default_strategy_config()["delivery"]["enabled"])
+
+    def test_beijing_schedule_is_converted_to_utc_cron(self):
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"hour": 9, "minute": 30, "frequency": "weekdays"})
+
+        self.assertEqual(delivery_cron(strategy), "30 1 * * 1-5")
+
+    def test_early_beijing_weekday_schedule_shifts_utc_weekdays(self):
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"hour": 7, "minute": 30, "frequency": "weekdays"})
+
+        self.assertEqual(delivery_cron(strategy), "30 23 * * 0-4")
+
+    def test_platform_delivery_target_includes_channel(self):
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"channel": "feishu", "target": "oc_test"})
+
+        self.assertEqual(delivery_target(strategy), "feishu:oc_test")
+
+    def test_sync_edits_and_resumes_enabled_job(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8})
+        with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1", "STOCK_AGENT_HERMES_BIN": "hermes"}):
+            result = sync_hermes_delivery(strategy, runner=runner)
+
+        self.assertEqual(result["status"], "synced")
+        self.assertEqual(calls[0], ["hermes", "cron", "edit", "job-1", "--schedule", "0 0 * * *", "--deliver", "feishu:oc_test"])
+        self.assertEqual(calls[1], ["hermes", "cron", "resume", "job-1"])
+
+    def test_sync_pauses_disabled_job(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1", "STOCK_AGENT_HERMES_BIN": "hermes"}):
+            result = sync_hermes_delivery(default_strategy_config(), runner=runner)
+
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(calls, [["hermes", "cron", "pause", "job-1"]])
+
+    def test_missing_active_strategy_does_not_modify_hermes(self):
+        with patch("stock_recommender.delivery.load_strategy_config", return_value=default_strategy_config()):
+            result = sync_active_strategy_delivery()
+
+        self.assertEqual(result["status"], "unavailable")
+
+    def test_empty_and_error_reports_follow_delivery_policy(self):
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"enabled": True, "push_on_empty": False, "push_on_error": False})
+
+        self.assertFalse(should_deliver_report("当前策略无匹配股票", strategy))
+        self.assertFalse(should_deliver_report("实时行情不可用", strategy))
+        self.assertTrue(should_deliver_report("今日候选：测试股票", strategy))
+
+
+if __name__ == "__main__":
+    unittest.main()
