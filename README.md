@@ -35,10 +35,29 @@ src/stock_recommender/
   universe.py      watchlist parsing, universe constraints, sector filters
   schedule.py      Beijing-time weekday and hourly publication guard
   tracking.py      daily recommendation state and intraday quote tracking
+  backtest.py      fixed-factor rolling walk-forward evaluation and approval gate
 ```
 
 New code should import from `stock_recommender.*`. Existing automation can keep
 using `stock_agent.py`.
+
+## Strategy Lifecycle And Validation
+
+Persisted strategies follow `draft -> backtesting -> paper -> live`. A newly
+created or materially edited strategy returns to `draft`; a completed backtest
+moves it to paper trading even when the live gate fails. Live promotion requires
+all rolling out-of-sample checks to pass and at least 40 distinct paper-trading
+sessions. Live and archived configurations are immutable; create a revision to
+change their model parameters.
+
+The default gate uses roughly three years of history, purged rolling windows,
+transaction cost and slippage, doubled-cost stress, drawdown, positive-window
+ratio and Deflated Sharpe probability. Data built from today's constituents is
+explicitly marked as point-in-time incomplete and cannot pass the live gate,
+which prevents a convenient current-universe backtest from hiding survivorship
+bias. A separate strategy-parity check also blocks promotion when the historical
+evaluator does not reproduce every live signal. The LLM explains fixed strategy
+output; it does not choose factors or tune thresholds during the evaluation.
 
 ## Local Test
 
@@ -138,7 +157,7 @@ recommendation instead of adding stocks outside the watchlist.
 
 ## Weekday Hourly Tracking
 
-At 09:30, the recommendation job selects the day's stocks and saves their symbols
+At 09:35, the recommendation job selects the day's stocks and saves their symbols
 to `STOCK_AGENT_STATE_PATH`. Later tracking jobs load that same list and fetch
 fresh quotes without running selection again. Each tracking report contains
 latest price, intraday change percentage, trading volume in hands, and turnover
@@ -148,7 +167,7 @@ Configure two Hermes cron jobs in the `Asia/Shanghai` timezone. Generate and sav
 the recommendation after the market opens:
 
 ```cron
-30 9 * * 1-5  hermes-ai-run.sh
+35 9 * * 1-5  hermes-ai-run.sh
 ```
 
 Then publish the saved stocks' current volume and change at the full-hour market
@@ -179,7 +198,7 @@ PYTHONPATH=src python3 src/stock_agent.py
 Or copy `scripts/hermes-ai-run.sh` and `scripts/hermes-tracking-run.sh` into
 `~/.hermes/scripts/`. Configure both as `no-agent` jobs with the two cron
 expressions above. The scripts share `/tmp/stock-agent-daily-selection.json` by
-default, so hourly tracking always follows the 09:30 recommendation list.
+default, so hourly tracking always follows the 09:35 recommendation list.
 
 Alternative setup is a Hermes agent-driven cron job:
 

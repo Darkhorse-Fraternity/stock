@@ -9,12 +9,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .backtest import BacktestInProgressError, get_backtest, list_backtests, start_backtest
 from .delivery import pause_hermes_delivery, sync_active_strategy_delivery, sync_hermes_delivery
 from .parameters import (
     PARAMETER_CATALOG,
     activate_strategy,
     catalog_payload,
     create_strategy,
+    create_strategy_revision,
     deactivate_strategy,
     delete_strategy,
     duplicate_strategy,
@@ -24,7 +26,9 @@ from .parameters import (
     load_strategy_config,
     load_strategy_store,
     save_strategy_config,
+    StrategyLifecycleError,
     strategy_library_payload,
+    transition_strategy_stage,
 )
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
@@ -42,7 +46,15 @@ def health_payload() -> dict:
         for item in PARAMETER_CATALOG
         if config["parameters"][item["id"]].get("enabled") and item["status"] in {"live", "derived"}
     )
-    return {"status": "ok", "strategy": config["name"], "active_parameters": active, "effective_parameters": effective}
+    return {
+        "status": "ok",
+        "strategy": config["name"],
+        "revision": config.get("revision", 1),
+        "stage": config.get("lifecycle", {}).get("stage", "draft"),
+        "approval_gate": config.get("validation", {}).get("approval_gate"),
+        "active_parameters": active,
+        "effective_parameters": effective,
+    }
 
 
 def _is_active_strategy(strategy_id: str | None) -> bool:
@@ -89,8 +101,19 @@ class AdminHandler(BaseHTTPRequestHandler):
             else:
                 self._send_json(run)
             return
+        backtest_id = self._backtest_route(path)
+        if backtest_id:
+            backtest = get_backtest(backtest_id)
+            if backtest is None:
+                self._send_json({"error": "回测记录不存在"}, status=HTTPStatus.NOT_FOUND)
+            else:
+                self._send_json(backtest)
+            return
         if strategy_id and action == "runs":
             self._send_json({"runs": list_strategy_runs(strategy_id)})
+            return
+        if strategy_id and action == "backtests":
+            self._send_json({"backtests": list_backtests(strategy_id)})
             return
         if path == "/":
             self._send_file(WEB_ROOT / "index.html")
@@ -136,6 +159,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 strategy = find_strategy_config(strategy_id)
                 if strategy is None:
                     raise KeyError(strategy_id)
+                if strategy["lifecycle"]["stage"] not in {"paper", "live"}:
+                    raise StrategyLifecycleError("只有模拟盘或已批准实盘策略可以启用定时运行")
                 delivery_sync = sync_hermes_delivery(strategy)
                 if delivery_sync["status"] == "error":
                     self._send_json({"error": delivery_sync["message"], "delivery_sync": delivery_sync}, status=HTTPStatus.BAD_GATEWAY)
@@ -165,6 +190,17 @@ class AdminHandler(BaseHTTPRequestHandler):
             if strategy_id and action == "duplicate":
                 self._send_json(catalog_payload(duplicate_strategy(strategy_id)), status=HTTPStatus.CREATED)
                 return
+            if strategy_id and action == "revision":
+                self._send_json(catalog_payload(create_strategy_revision(strategy_id)), status=HTTPStatus.CREATED)
+                return
+            if strategy_id and action == "stage":
+                updated = transition_strategy_stage(
+                    strategy_id,
+                    body.get("stage", ""),
+                    approved_by=body.get("approved_by", ""),
+                )
+                self._send_json(catalog_payload(updated))
+                return
             if strategy_id and action == "reset":
                 existing = load_strategy_config(strategy_id=strategy_id)
                 reset = default_strategy_config()
@@ -173,6 +209,9 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return
             if strategy_id and action == "runs":
                 self._send_json(start_strategy_run(strategy_id), status=HTTPStatus.ACCEPTED)
+                return
+            if strategy_id and action == "backtests":
+                self._send_json(start_backtest(strategy_id), status=HTTPStatus.ACCEPTED)
                 return
             if strategy_id and action == "sync-delivery":
                 strategy = find_strategy_config(strategy_id)
@@ -186,11 +225,22 @@ class AdminHandler(BaseHTTPRequestHandler):
         except StrategyRunInProgressError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
             return
+        except BacktestInProgressError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
+        except StrategyLifecycleError as exc:
+            self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+            return
         if path == "/api/config/reset":
-            existing = load_strategy_config()
-            reset = default_strategy_config()
-            reset.update({key: existing.get(key) for key in ["id", "name", "description", "created_at", "delivery"]})
-            self._send_json(_catalog_with_delivery_sync(save_strategy_config(reset), previous=existing))
+            try:
+                existing = load_strategy_config()
+                reset = default_strategy_config()
+                reset.update({key: existing.get(key) for key in ["id", "name", "description", "created_at", "delivery"]})
+                saved = save_strategy_config(reset)
+            except (ValueError, OSError, StrategyLifecycleError) as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
+                return
+            self._send_json(_catalog_with_delivery_sync(saved, previous=existing))
             return
         self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -204,7 +254,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             body = self._read_json()
             previous = load_strategy_config(strategy_id=strategy_id)
             saved = save_strategy_config(body, strategy_id=strategy_id)
-        except (ValueError, OSError) as exc:
+        except (ValueError, OSError, StrategyLifecycleError) as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
             return
         self._send_json(_catalog_with_delivery_sync(saved, previous=previous))
@@ -238,6 +288,13 @@ class AdminHandler(BaseHTTPRequestHandler):
     def _run_route(path: str) -> str | None:
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "runs"]:
+            return parts[2]
+        return None
+
+    @staticmethod
+    def _backtest_route(path: str) -> str | None:
+        parts = [part for part in path.split("/") if part]
+        if len(parts) == 3 and parts[:2] == ["api", "backtests"]:
             return parts[2]
         return None
 

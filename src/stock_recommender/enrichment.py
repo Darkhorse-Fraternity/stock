@@ -196,7 +196,15 @@ def fetch_daily_history(symbol: str) -> list[dict]:
         timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
     )
     return [
-        {"date": row.get("日期"), "close": row.get("收盘"), "high": row.get("最高")}
+        {
+            "date": row.get("日期"),
+            "open": row.get("开盘"),
+            "close": row.get("收盘"),
+            "high": row.get("最高"),
+            "low": row.get("最低"),
+            "volume": row.get("成交量"),
+            "turnover": row.get("成交额"),
+        }
         for _, row in frame.iterrows()
     ]
 

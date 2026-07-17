@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import generate_agent_context
+from .data_sources import fetch_board_quotes
 from .delivery import should_deliver_report
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
 from .reports import generate_ai_report, generate_report
@@ -68,7 +69,14 @@ def main() -> None:
             **universe_options,
         )
     if mode in {"ai", "report"}:
-        save_daily_selection(state_path, report)
+        save_daily_selection(
+            state_path,
+            report,
+            strategy=strategy,
+            board_code=board_code,
+            board_name=board_name,
+            benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
+        )
     output = os.getenv("STOCK_AGENT_OUTPUT", "/data/stock_recommendation.md")
     if output:
         path = Path(output).expanduser()

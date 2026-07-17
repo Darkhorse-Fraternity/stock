@@ -7,9 +7,25 @@ from typing import Callable, Iterable
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import collect_analyzed_candidates, extract_market_payload, generate_agent_context
 from .llm import call_llm_analysis
-from .parameters import chase_risk_threshold
+from .parameters import chase_risk_threshold, load_strategy_config
 from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
+
+
+def decorate_strategy_output(report: str, strategy: dict | None) -> str:
+    if not strategy or not strategy.get("id"):
+        return report
+    stage = strategy.get("lifecycle", {}).get("stage", "draft")
+    labels = {
+        "draft": "🧪 **草稿策略输出（不构成正式推荐）**",
+        "backtesting": "🧪 **回测中策略输出（不构成正式推荐）**",
+        "paper": "🧪 **模拟盘观察（非实盘推荐）**",
+        "live": "✅ **已通过门禁的实盘策略**",
+        "paused": "⏸️ **已暂停策略输出**",
+        "archived": "📦 **已归档策略输出**",
+    }
+    version = f"策略版本：v{strategy.get('revision', 1)} · {stage}"
+    return f"{labels.get(stage, labels['draft'])}\n{version}\n\n{report}"
 
 
 def format_volume_hands(value: float) -> str:
@@ -69,6 +85,7 @@ def generate_report(
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
 ) -> str:
+    current_strategy = strategy or load_strategy_config()
     watchlist_entries = normalize_watchlist(watchlist)
     sectors = normalize_sector_filters(sector_filters)
     report_time, analyses, error = collect_analyzed_candidates(
@@ -80,14 +97,14 @@ def generate_report(
         history_fetcher=history_fetcher,
         financial_fetcher=financial_fetcher,
         enrich_limit=enrich_limit,
-        strategy=strategy,
+        strategy=current_strategy,
         watchlist=watchlist_entries if watchlist is not None else None,
         sector_filters=sectors if sector_filters is not None else None,
         watchlist_fetcher=watchlist_fetcher,
     )
 
     if not analyses:
-        return "\n".join(
+        return decorate_strategy_output("\n".join(
             [
                 f"📊 **股票每日推荐** ({report_time.strftime('%Y 年%m月%d日')})",
                 "",
@@ -96,7 +113,7 @@ def generate_report(
                 "",
                 "仅供参考，不构成投资建议。",
             ]
-        )
+        ), current_strategy)
 
     top = analyses[:top_n]
     avg_score = sum(item["score"] for item in top) / len(top)
@@ -162,12 +179,12 @@ def generate_report(
             "📌 **数据说明**",
             f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
             f"  • 数据来源：{'；'.join(sources)}",
-            "  • 任务频率：北京时间工作日 09:30 推荐；开市期间整点跟踪推荐股",
+            "  • 任务频率：北京时间工作日 09:35 推荐；开市期间整点跟踪推荐股",
             "",
             "=" * 30,
         ]
     )
-    return "\n".join(report)
+    return decorate_strategy_output("\n".join(report), current_strategy)
 
 
 def generate_ai_report(
@@ -195,6 +212,7 @@ def generate_ai_report(
     llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
     strategy: dict | None = None,
 ) -> str:
+    current_strategy = strategy or load_strategy_config()
     context = generate_agent_context(
         now=now,
         board_code=board_code,
@@ -208,14 +226,14 @@ def generate_ai_report(
         history_fetcher=history_fetcher,
         financial_fetcher=financial_fetcher,
         enrich_limit=enrich_limit,
-        strategy=strategy,
+        strategy=current_strategy,
         watchlist=watchlist,
         sector_filters=sector_filters,
         watchlist_fetcher=watchlist_fetcher,
     )
     payload = extract_market_payload(context) or {}
     if payload.get("fetch_error") or any("估算兜底" in source for source in payload.get("source", [])):
-        return "\n".join(
+        return decorate_strategy_output("\n".join(
             [
                 "⚠️ **实时行情不可用**",
                 "",
@@ -224,9 +242,9 @@ def generate_ai_report(
                 "",
                 "仅供参考，不构成投资建议。",
             ]
-        )
+        ), current_strategy)
     if not payload.get("candidates"):
-        return "⚪ **当前策略无匹配股票**\n\n行情数据正常，但没有股票同时满足已启用条件。\n\n仅供参考，不构成投资建议。"
+        return decorate_strategy_output("⚪ **当前策略无匹配股票**\n\n行情数据正常，但没有股票同时满足已启用条件。\n\n仅供参考，不构成投资建议。", current_strategy)
     client = llm_client or call_llm_analysis
     try:
         analysis = client(
@@ -236,14 +254,15 @@ def generate_ai_report(
             api_key=llm_api_key,
             timeout=llm_timeout,
         )
-        guarded = apply_risk_guard(context, analysis, strategy=strategy)
+        guarded = apply_risk_guard(context, analysis, strategy=current_strategy)
         snapshot_rows = select_snapshot_candidates(guarded, payload.get("candidates") or [], tracking_limit)
         snapshot = format_recommendation_snapshot(
             snapshot_rows,
             limit=tracking_limit,
             generated_at=payload.get("generated_at") or "",
         )
-        return f"{guarded}\n\n{snapshot}" if snapshot else guarded
+        result = f"{guarded}\n\n{snapshot}" if snapshot else guarded
+        return decorate_strategy_output(result, current_strategy)
     except Exception as exc:
         fallback = generate_report(
             now=now,
@@ -255,12 +274,12 @@ def generate_ai_report(
             history_fetcher=history_fetcher,
             financial_fetcher=financial_fetcher,
             enrich_limit=enrich_limit,
-            strategy=strategy,
+            strategy={**current_strategy, "id": None},
             watchlist=watchlist,
             sector_filters=sector_filters,
             watchlist_fetcher=watchlist_fetcher,
         )
-        return f"⚠️ AI 分析失败：{exc}\n\n以下为脚本兜底报告：\n\n{fallback}"
+        return decorate_strategy_output(f"⚠️ AI 分析失败：{exc}\n\n以下为脚本兜底报告：\n\n{fallback}", current_strategy)
 
 
 def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = None) -> str:

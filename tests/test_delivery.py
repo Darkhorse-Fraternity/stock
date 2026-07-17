@@ -16,7 +16,9 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(strategy["delivery"]["target"], "oc_current")
 
     def test_new_strategy_defaults_to_delivery_disabled(self):
-        self.assertFalse(default_strategy_config()["delivery"]["enabled"])
+        delivery = default_strategy_config()["delivery"]
+        self.assertFalse(delivery["enabled"])
+        self.assertEqual((delivery["frequency"], delivery["hour"], delivery["minute"]), ("weekdays", 9, 35))
 
     def test_beijing_schedule_is_converted_to_utc_cron(self):
         strategy = default_strategy_config()
@@ -44,7 +46,7 @@ class DeliveryTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
         strategy = default_strategy_config()
-        strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8})
+        strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8, "minute": 0, "frequency": "daily"})
         with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1", "STOCK_AGENT_HERMES_BIN": "hermes"}):
             result = sync_hermes_delivery(strategy, runner=runner)
 

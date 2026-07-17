@@ -12,6 +12,15 @@ from stock_recommender.config import (
     MIN_FLOAT_MARKET_CAP,
     STATIC_FALLBACK,
 )
+from stock_recommender.backtest import (
+    deflated_sharpe_probability,
+    evaluate_approval_gate,
+    get_backtest,
+    list_backtests,
+    run_walk_forward_backtest,
+    start_backtest,
+    walk_forward_windows,
+)
 from stock_recommender.context import collect_analyzed_candidates, extract_market_payload, generate_agent_context
 from stock_recommender.data_sources import (
     akshare_symbol,
@@ -23,6 +32,7 @@ from stock_recommender.data_sources import (
     sina_quote_symbol,
 )
 from stock_recommender.llm import call_llm_analysis
+from stock_recommender.parameters import create_strategy_revision, transition_strategy_stage
 from stock_recommender.reports import (
     append_candidate_explanation,
     apply_risk_guard,
@@ -51,9 +61,11 @@ from stock_recommender.cli import main
 from stock_recommender.schedule import DEFAULT_PUBLISH_HOURS, is_market_open, is_weekday, parse_publish_hours, should_publish_now
 from stock_recommender.tracking import (
     TRACKING_HEADER,
+    extract_recommendation_entries,
     extract_recommended_symbols,
     generate_saved_tracking_report,
     load_daily_selection,
+    load_daily_selection_state,
     save_daily_selection,
 )
 from stock_recommender.universe import (
@@ -80,6 +92,8 @@ __all__ = [
     "MIN_FLOAT_MARKET_CAP",
     "STATIC_FALLBACK",
     "TRACKING_HEADER",
+    "create_strategy_revision",
+    "deflated_sharpe_probability",
     "akshare_symbol",
     "analyze",
     "append_candidate_explanation",
@@ -91,6 +105,8 @@ __all__ = [
     "candidate_action",
     "collect_analyzed_candidates",
     "evaluate_tick_ignition",
+    "evaluate_approval_gate",
+    "extract_recommendation_entries",
     "extract_market_payload",
     "fallback_quotes",
     "fetch_board_quotes",
@@ -106,6 +122,7 @@ __all__ = [
     "generate_agent_context",
     "generate_ai_report",
     "generate_report",
+    "get_backtest",
     "ignition_signal_summary",
     "main",
     "market_sentiment_profile",
@@ -123,13 +140,19 @@ __all__ = [
     "select_snapshot_candidates",
     "extract_recommended_symbols",
     "load_daily_selection",
+    "load_daily_selection_state",
+    "list_backtests",
+    "run_walk_forward_backtest",
     "save_daily_selection",
     "should_publish_now",
+    "start_backtest",
     "constrain_to_watchlist",
     "row_matches_sector",
     "row_sector_tags",
     "sina_quote_symbol",
     "tick_seconds",
+    "transition_strategy_stage",
+    "walk_forward_windows",
 ]
 
 

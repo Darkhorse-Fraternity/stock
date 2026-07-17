@@ -146,6 +146,12 @@ PARAMETER_CATALOG = [
 PARAMETERS_BY_ID = {item["id"]: item for item in PARAMETER_CATALOG}
 DELIVERY_CHANNELS = {"feishu", "telegram", "discord", "signal", "origin", "local"}
 DELIVERY_FREQUENCIES = {"daily", "weekdays"}
+STRATEGY_STAGES = {"draft", "backtesting", "paper", "live", "paused", "archived"}
+LOCKED_STRATEGY_STAGES = {"live", "archived"}
+
+
+class StrategyLifecycleError(ValueError):
+    pass
 
 
 def strategy_config_path() -> Path:
@@ -161,14 +167,14 @@ def _environment_int(name: str, default: int) -> int:
 
 def default_report_delivery(*, legacy: bool = False) -> dict:
     channel = os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_CHANNEL", "feishu").strip().lower()
-    frequency = os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_FREQUENCY", "daily").strip().lower()
+    frequency = os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_FREQUENCY", "weekdays").strip().lower()
     return {
         "enabled": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_ENABLED", "1" if legacy else "0") == "1",
         "channel": channel if channel in DELIVERY_CHANNELS else "feishu",
         "target": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_TARGET", "")[:200],
-        "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 8))),
-        "minute": min(59, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_MINUTE", 0))),
-        "frequency": frequency if frequency in DELIVERY_FREQUENCIES else "daily",
+        "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 9))),
+        "minute": min(59, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_MINUTE", 35))),
+        "frequency": frequency if frequency in DELIVERY_FREQUENCIES else "weekdays",
         "push_on_empty": True,
         "push_on_error": True,
     }
@@ -200,14 +206,128 @@ def normalize_report_delivery(value: object, *, legacy: bool = False) -> dict:
     return normalized
 
 
+def default_strategy_lifecycle() -> dict:
+    return {
+        "stage": "draft",
+        "stage_updated_at": None,
+        "approved_at": None,
+        "approved_by": None,
+        "paper_sessions": 0,
+        "paper_started_at": None,
+        "paper_dates": [],
+    }
+
+
+def normalize_strategy_lifecycle(value: object) -> dict:
+    normalized = default_strategy_lifecycle()
+    if not isinstance(value, dict):
+        return normalized
+    try:
+        paper_sessions = max(0, int(value.get("paper_sessions") or 0))
+    except (TypeError, ValueError):
+        paper_sessions = 0
+    stage = str(value.get("stage") or "draft").strip().lower()
+    normalized.update(
+        {
+            "stage": stage if stage in STRATEGY_STAGES else "draft",
+            "stage_updated_at": value.get("stage_updated_at"),
+            "approved_at": value.get("approved_at"),
+            "approved_by": str(value.get("approved_by") or "").strip()[:120] or None,
+            "paper_sessions": paper_sessions,
+            "paper_started_at": value.get("paper_started_at"),
+            "paper_dates": [str(item)[:10] for item in value.get("paper_dates", []) if str(item).strip()][-252:]
+            if isinstance(value.get("paper_dates"), list)
+            else [],
+        }
+    )
+    return normalized
+
+
+def default_validation_config() -> dict:
+    return {
+        "signal_time": "09:35",
+        "holding_period_days": 3,
+        "lookback_days": 60,
+        "history_days_min": 756,
+        "train_days": 504,
+        "validation_days": 63,
+        "test_days": 63,
+        "gap_days": 5,
+        "top_n": 3,
+        "transaction_cost_bps": 10.0,
+        "slippage_bps": 10.0,
+        "minimum_oos_events": 200,
+        "minimum_oos_months": 12,
+        "minimum_positive_fold_ratio": 0.6,
+        "minimum_dsr_probability": 0.95,
+        "maximum_drawdown_pct": 20.0,
+        "minimum_paper_sessions": 40,
+        "last_backtest": None,
+        "approval_gate": {"passed": False, "checks": [], "evaluated_at": None},
+    }
+
+
+def normalize_validation_config(value: object) -> dict:
+    normalized = default_validation_config()
+    if not isinstance(value, dict):
+        return normalized
+    integer_fields = {
+        "holding_period_days": (1, 20),
+        "lookback_days": (20, 252),
+        "history_days_min": (252, 2520),
+        "train_days": (126, 2520),
+        "validation_days": (21, 504),
+        "test_days": (21, 504),
+        "gap_days": (0, 60),
+        "top_n": (1, 20),
+        "minimum_oos_events": (20, 100000),
+        "minimum_oos_months": (3, 120),
+        "minimum_paper_sessions": (5, 252),
+    }
+    float_fields = {
+        "transaction_cost_bps": (0.0, 200.0),
+        "slippage_bps": (0.0, 200.0),
+        "minimum_positive_fold_ratio": (0.0, 1.0),
+        "minimum_dsr_probability": (0.0, 1.0),
+        "maximum_drawdown_pct": (1.0, 100.0),
+    }
+    for field, (minimum, maximum) in integer_fields.items():
+        try:
+            normalized[field] = min(maximum, max(minimum, int(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    for field, (minimum, maximum) in float_fields.items():
+        try:
+            normalized[field] = min(maximum, max(minimum, float(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    signal_time = str(value.get("signal_time") or normalized["signal_time"]).strip()
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", signal_time):
+        normalized["signal_time"] = signal_time
+    if isinstance(value.get("last_backtest"), dict):
+        normalized["last_backtest"] = deepcopy(value["last_backtest"])
+    if isinstance(value.get("approval_gate"), dict):
+        gate = value["approval_gate"]
+        normalized["approval_gate"] = {
+            "passed": bool(gate.get("passed", False)),
+            "checks": deepcopy(gate.get("checks") if isinstance(gate.get("checks"), list) else []),
+            "evaluated_at": gate.get("evaluated_at"),
+        }
+    return normalized
+
+
 def default_strategy_config() -> dict:
     return {
-        "version": 2,
+        "version": 3,
         "id": None,
+        "revision": 1,
+        "parent_strategy_id": None,
         "name": "科技 AI 板块短线筛选",
         "description": "默认覆盖人工智能板块，可叠加自选股池与板块过滤。",
         "created_at": None,
         "updated_at": None,
+        "lifecycle": default_strategy_lifecycle(),
+        "validation": default_validation_config(),
         "delivery": default_report_delivery(),
         "parameters": {
             item["id"]: {"enabled": item["default_enabled"], "value": deepcopy(item["default"])}
@@ -224,9 +344,17 @@ def normalize_strategy_config(config: dict | None) -> dict:
         normalized["name"] = config["name"].strip()[:80]
     strategy_id = str(config.get("id") or "").strip()
     normalized["id"] = strategy_id[:80] or None
+    try:
+        normalized["revision"] = max(1, int(config.get("revision") or 1))
+    except (TypeError, ValueError):
+        normalized["revision"] = 1
+    parent_strategy_id = str(config.get("parent_strategy_id") or "").strip()
+    normalized["parent_strategy_id"] = parent_strategy_id[:80] or None
     normalized["description"] = str(config.get("description") or "").strip()[:500]
     normalized["created_at"] = config.get("created_at")
     normalized["updated_at"] = config.get("updated_at")
+    normalized["lifecycle"] = normalize_strategy_lifecycle(config.get("lifecycle"))
+    normalized["validation"] = normalize_validation_config(config.get("validation"))
     normalized["delivery"] = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
     provided = config.get("parameters")
     if not isinstance(provided, dict):
@@ -262,7 +390,7 @@ def _normalize_value(definition: dict, value: Any) -> Any:
 
 
 def default_strategy_store() -> dict:
-    return {"version": 2, "active_strategy_id": None, "strategies": []}
+    return {"version": 3, "active_strategy_id": None, "strategies": []}
 
 
 def _timestamp() -> str:
@@ -277,25 +405,30 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             legacy = normalize_strategy_config(payload)
             legacy["id"] = legacy.get("id") or "legacy-default"
             legacy["created_at"] = legacy.get("created_at") or legacy.get("updated_at")
-            return {"version": 2, "active_strategy_id": legacy["id"], "strategies": [legacy]}
+            legacy["lifecycle"].update({"stage": "paper", "stage_updated_at": legacy.get("updated_at")})
+            return {"version": 3, "active_strategy_id": legacy["id"], "strategies": [legacy]}
         return default_strategy_store()
 
+    configured_active_id = payload.get("active_strategy_id")
     strategies = []
     used_ids = set()
     for index, item in enumerate(payload["strategies"]):
         if not isinstance(item, dict):
             continue
+        had_lifecycle = isinstance(item.get("lifecycle"), dict)
         strategy = normalize_strategy_config(item)
         strategy_id = strategy.get("id") or f"strategy-{index + 1}"
         if strategy_id in used_ids:
             strategy_id = f"{strategy_id}-{index + 1}"
         strategy["id"] = strategy_id
+        if not had_lifecycle and strategy_id == configured_active_id:
+            strategy["lifecycle"].update({"stage": "paper", "stage_updated_at": strategy.get("updated_at")})
         used_ids.add(strategy_id)
         strategies.append(strategy)
-    active_strategy_id = payload.get("active_strategy_id")
+    active_strategy_id = configured_active_id
     if active_strategy_id is not None and active_strategy_id not in used_ids:
         active_strategy_id = strategies[0]["id"] if strategies else None
-    return {"version": 2, "active_strategy_id": active_strategy_id, "strategies": strategies}
+    return {"version": 3, "active_strategy_id": active_strategy_id, "strategies": strategies}
 
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
@@ -344,8 +477,36 @@ def save_strategy_config(config: dict, path: str | Path | None = None, strategy_
     for index, existing in enumerate(store["strategies"]):
         if existing["id"] != target_id:
             continue
+        changed_model = normalized["parameters"] != existing["parameters"] or any(
+            normalized["validation"].get(key) != existing["validation"].get(key)
+            for key in default_validation_config()
+            if key not in {"last_backtest", "approval_gate"}
+        )
+        existing_stage = existing.get("lifecycle", {}).get("stage", "draft")
+        if changed_model and existing_stage in LOCKED_STRATEGY_STAGES:
+            raise StrategyLifecycleError("已上线或已归档策略不可直接修改，请创建新版本")
         normalized["id"] = existing["id"]
+        normalized["revision"] = existing.get("revision", 1)
+        normalized["parent_strategy_id"] = existing.get("parent_strategy_id")
         normalized["created_at"] = existing.get("created_at") or normalized["updated_at"]
+        normalized["lifecycle"] = deepcopy(existing.get("lifecycle") or default_strategy_lifecycle())
+        if changed_model:
+            normalized["lifecycle"].update(
+                {
+                    "stage": "draft",
+                    "stage_updated_at": normalized["updated_at"],
+                    "approved_at": None,
+                    "approved_by": None,
+                    "paper_sessions": 0,
+                    "paper_started_at": None,
+                    "paper_dates": [],
+                }
+            )
+            normalized["validation"]["last_backtest"] = None
+            normalized["validation"]["approval_gate"] = {"passed": False, "checks": [], "evaluated_at": None}
+        else:
+            normalized["validation"]["last_backtest"] = deepcopy(existing["validation"].get("last_backtest"))
+            normalized["validation"]["approval_gate"] = deepcopy(existing["validation"].get("approval_gate"))
         store["strategies"][index] = normalized
         save_strategy_store(store, path)
         return deepcopy(normalized)
@@ -402,6 +563,131 @@ def deactivate_strategy(strategy_id: str, *, path: str | Path | None = None) -> 
     return save_strategy_store(store, path)
 
 
+def transition_strategy_stage(
+    strategy_id: str,
+    stage: str,
+    *,
+    approved_by: str = "",
+    path: str | Path | None = None,
+) -> dict:
+    target_stage = str(stage or "").strip().lower()
+    if target_stage not in STRATEGY_STAGES:
+        raise StrategyLifecycleError(f"不支持的策略阶段: {stage}")
+    store = load_strategy_store(path)
+    strategy = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+    current_stage = strategy["lifecycle"]["stage"]
+    allowed = {
+        "draft": {"draft", "backtesting", "paused", "archived"},
+        "backtesting": {"draft", "paper", "paused", "archived"},
+        "paper": {"draft", "backtesting", "live", "paused", "archived"},
+        "live": {"paused", "archived"},
+        "paused": {"draft", "backtesting", "paper", "live", "archived"},
+        "archived": {"archived"},
+    }
+    if target_stage not in allowed[current_stage]:
+        raise StrategyLifecycleError(f"策略不能从 {current_stage} 直接进入 {target_stage}")
+    if target_stage == "live":
+        gate = strategy["validation"].get("approval_gate") or {}
+        required_sessions = strategy["validation"]["minimum_paper_sessions"]
+        if not gate.get("passed"):
+            raise StrategyLifecycleError("样本外回测尚未通过上线门禁")
+        if strategy["lifecycle"].get("paper_sessions", 0) < required_sessions:
+            raise StrategyLifecycleError(f"模拟盘不足 {required_sessions} 个交易日")
+    now = _timestamp()
+    lifecycle = strategy["lifecycle"]
+    lifecycle["stage"] = target_stage
+    lifecycle["stage_updated_at"] = now
+    if target_stage == "paper" and not lifecycle.get("paper_started_at"):
+        lifecycle["paper_started_at"] = now
+    if target_stage == "live":
+        lifecycle["approved_at"] = now
+        lifecycle["approved_by"] = str(approved_by or "manual").strip()[:120]
+    elif target_stage in {"draft", "backtesting"}:
+        lifecycle["approved_at"] = None
+        lifecycle["approved_by"] = None
+    strategy["updated_at"] = now
+    if target_stage == "archived" and store["active_strategy_id"] == strategy_id:
+        store["active_strategy_id"] = None
+    save_strategy_store(store, path)
+    return deepcopy(strategy)
+
+
+def record_backtest_evaluation(
+    strategy_id: str,
+    result: dict,
+    *,
+    path: str | Path | None = None,
+) -> dict:
+    store = load_strategy_store(path)
+    strategy = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+    now = _timestamp()
+    summary = deepcopy(result)
+    gate = deepcopy(summary.get("approval_gate") or {"passed": False, "checks": []})
+    gate["evaluated_at"] = gate.get("evaluated_at") or now
+    strategy["validation"]["last_backtest"] = summary
+    strategy["validation"]["approval_gate"] = gate
+    lifecycle = strategy["lifecycle"]
+    if lifecycle["stage"] in {"draft", "backtesting"}:
+        lifecycle.update(
+            {
+                "stage": "paper",
+                "stage_updated_at": now,
+                "paper_started_at": lifecycle.get("paper_started_at") or now,
+            }
+        )
+    strategy["updated_at"] = now
+    save_strategy_store(store, path)
+    return deepcopy(strategy)
+
+
+def record_paper_session(strategy_id: str, trade_date: str, *, path: str | Path | None = None) -> dict:
+    store = load_strategy_store(path)
+    strategy = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
+    if strategy is None:
+        raise KeyError(strategy_id)
+    if strategy["lifecycle"]["stage"] != "paper":
+        return deepcopy(strategy)
+    normalized_date = str(trade_date or "").strip()[:10]
+    dates = strategy["lifecycle"].setdefault("paper_dates", [])
+    if normalized_date and normalized_date not in dates:
+        dates.append(normalized_date)
+        strategy["lifecycle"]["paper_dates"] = dates[-252:]
+        strategy["lifecycle"]["paper_sessions"] = len(strategy["lifecycle"]["paper_dates"])
+        strategy["updated_at"] = _timestamp()
+        save_strategy_store(store, path)
+    return deepcopy(strategy)
+
+
+def create_strategy_revision(strategy_id: str, *, path: str | Path | None = None) -> dict:
+    store = load_strategy_store(path)
+    source = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
+    if source is None:
+        raise KeyError(strategy_id)
+    now = _timestamp()
+    revision = deepcopy(source)
+    revision.update(
+        {
+            "id": uuid.uuid4().hex,
+            "revision": int(source.get("revision", 1)) + 1,
+            "parent_strategy_id": source["id"],
+            "name": f"{source['name']} v{int(source.get('revision', 1)) + 1}"[:80],
+            "created_at": now,
+            "updated_at": now,
+            "lifecycle": default_strategy_lifecycle(),
+        }
+    )
+    revision["validation"]["last_backtest"] = None
+    revision["validation"]["approval_gate"] = {"passed": False, "checks": [], "evaluated_at": None}
+    revision["delivery"]["enabled"] = False
+    store["strategies"].append(revision)
+    save_strategy_store(store, path)
+    return deepcopy(revision)
+
+
 def duplicate_strategy(strategy_id: str, *, path: str | Path | None = None) -> dict:
     store = load_strategy_store(path)
     source = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
@@ -409,7 +695,20 @@ def duplicate_strategy(strategy_id: str, *, path: str | Path | None = None) -> d
         raise KeyError(f"strategy not found: {strategy_id}")
     now = _timestamp()
     copied = deepcopy(source)
-    copied.update({"id": uuid.uuid4().hex, "name": f"{source['name']} - 副本"[:80], "created_at": now, "updated_at": now})
+    copied.update(
+        {
+            "id": uuid.uuid4().hex,
+            "revision": 1,
+            "parent_strategy_id": None,
+            "name": f"{source['name']} - 副本"[:80],
+            "created_at": now,
+            "updated_at": now,
+            "lifecycle": default_strategy_lifecycle(),
+        }
+    )
+    copied["validation"]["last_backtest"] = None
+    copied["validation"]["approval_gate"] = {"passed": False, "checks": [], "evaluated_at": None}
+    copied["delivery"]["enabled"] = False
     store["strategies"].append(copied)
     save_strategy_store(store, path)
     return deepcopy(copied)
@@ -438,6 +737,12 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
                 "description": strategy.get("description") or "",
                 "created_at": strategy.get("created_at"),
                 "updated_at": strategy.get("updated_at"),
+                "revision": strategy.get("revision", 1),
+                "parent_strategy_id": strategy.get("parent_strategy_id"),
+                "lifecycle": deepcopy(strategy["lifecycle"]),
+                "approval_gate": deepcopy(strategy["validation"].get("approval_gate")),
+                "last_backtest": deepcopy(strategy["validation"].get("last_backtest")),
+                "minimum_paper_sessions": strategy["validation"].get("minimum_paper_sessions", 40),
                 "active_parameters": active_parameters,
                 "is_active": strategy["id"] == store["active_strategy_id"],
                 "delivery": deepcopy(strategy["delivery"]),
