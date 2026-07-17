@@ -242,9 +242,11 @@ class StockAgentTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "selection.json")
+            history_path = str(Path(directory) / "history.json")
             env = {
                 "STOCK_AGENT_MODE": "report",
                 "STOCK_AGENT_STATE_PATH": state_path,
+                "STOCK_AGENT_HISTORY_PATH": history_path,
                 "STOCK_AGENT_OUTPUT": "",
             }
             with mock.patch.dict("os.environ", env, clear=True), mock.patch(
