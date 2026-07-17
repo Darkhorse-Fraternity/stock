@@ -7,7 +7,7 @@ from typing import Callable, Iterable
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import collect_analyzed_candidates, extract_market_payload, generate_agent_context
 from .llm import call_llm_analysis
-from .parameters import chase_risk_threshold, load_strategy_config
+from .parameters import chase_risk_threshold
 from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
 
@@ -85,7 +85,7 @@ def generate_report(
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
 ) -> str:
-    current_strategy = strategy or load_strategy_config()
+    current_strategy = strategy
     watchlist_entries = normalize_watchlist(watchlist)
     sectors = normalize_sector_filters(sector_filters)
     report_time, analyses, error = collect_analyzed_candidates(
@@ -212,7 +212,7 @@ def generate_ai_report(
     llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
     strategy: dict | None = None,
 ) -> str:
-    current_strategy = strategy or load_strategy_config()
+    current_strategy = strategy
     context = generate_agent_context(
         now=now,
         board_code=board_code,
@@ -274,7 +274,7 @@ def generate_ai_report(
             history_fetcher=history_fetcher,
             financial_fetcher=financial_fetcher,
             enrich_limit=enrich_limit,
-            strategy={**current_strategy, "id": None},
+            strategy={**current_strategy, "id": None} if current_strategy else None,
             watchlist=watchlist,
             sector_filters=sector_filters,
             watchlist_fetcher=watchlist_fetcher,
