@@ -12,6 +12,13 @@ from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
 
 
+def append_performance_link(report: str, url: str) -> str:
+    target = str(url or "").strip()
+    if not target or target in report:
+        return report
+    return f"{report.rstrip()}\n\n📊 [查看近 30 天推荐表现]({target})"
+
+
 def decorate_strategy_output(report: str, strategy: dict | None) -> str:
     if not strategy or not strategy.get("id"):
         return report

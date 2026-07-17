@@ -8,6 +8,7 @@ from typing import Callable
 
 from .data_sources import fetch_board_quotes, fetch_watchlist_quotes
 from .parameters import record_paper_session
+from .performance import upsert_recommendation_history
 from .reports import format_recommendation_snapshot
 from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
@@ -75,6 +76,7 @@ def save_daily_selection(
     board_code: str = "BK0800",
     board_name: str = "人工智能",
     benchmark_fetcher: Callable | None = None,
+    history_path: str | Path | None = None,
 ) -> list[str]:
     entries = extract_recommendation_entries(report)
     symbols = [item["symbol"] for item in entries] or extract_recommended_symbols(report)
@@ -112,6 +114,7 @@ def save_daily_selection(
         "symbols": symbols,
         "recommendations": entries,
         "strategy_id": (strategy or {}).get("id"),
+        "strategy_name": (strategy or {}).get("name"),
         "strategy_revision": (strategy or {}).get("revision", 1),
         "strategy_stage": lifecycle.get("stage", "draft"),
         "board_code": board_code,
@@ -126,6 +129,12 @@ def save_daily_selection(
             record_paper_session(payload["strategy_id"], payload["trade_date"])
         except Exception as exc:
             payload["paper_session_error"] = str(exc)[:500]
+            _save_state(target, payload)
+    if history_path is not None:
+        try:
+            upsert_recommendation_history(payload, path=history_path, now=current)
+        except Exception as exc:
+            payload["history_archive_error"] = str(exc)[:500]
             _save_state(target, payload)
     return symbols
 
@@ -167,6 +176,7 @@ def generate_saved_tracking_report(
     now: datetime | None = None,
     quote_fetcher: Callable | None = None,
     benchmark_fetcher: Callable | None = None,
+    history_path: str | Path | None = None,
 ) -> str:
     current = beijing_now(now)
     state = load_daily_selection_state(state_path, now=current)
@@ -241,6 +251,11 @@ def generate_saved_tracking_report(
                 "maximum_sampled_drawdown_pct": drawdown,
                 "last_price": price,
                 "last_volume": volume,
+                "last_change_pct": number(row.get("percent")),
+                "last_turnover": number(row.get("turnover")),
+                "return_since_recommendation_pct": since,
+                "benchmark_return_since_recommendation_pct": benchmark_return,
+                "excess_return_pct": excess,
                 "last_updated_at": current.strftime("%Y-%m-%d %H:%M:%S %Z"),
             }
         )
@@ -252,6 +267,12 @@ def generate_saved_tracking_report(
     state["benchmark_current_change_pct"] = current_benchmark
     state["benchmark_error"] = benchmark_error
     _save_state(Path(state_path).expanduser(), state)
+    if history_path is not None:
+        try:
+            upsert_recommendation_history(state, path=history_path, now=current)
+        except Exception as exc:
+            state["history_archive_error"] = str(exc)[:500]
+            _save_state(Path(state_path).expanduser(), state)
 
     snapshot = format_recommendation_snapshot(ordered, limit=len(symbols), generated_at=current.strftime("%m月%d日 %H:%M"))
     mode_label = "🧪 模拟盘" if state.get("strategy_stage") != "live" else "✅ 已批准实盘"

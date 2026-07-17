@@ -8,7 +8,7 @@ from .context import generate_agent_context
 from .data_sources import fetch_board_quotes
 from .delivery import should_deliver_report
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
-from .reports import generate_ai_report, generate_report
+from .reports import append_performance_link, generate_ai_report, generate_report
 from .schedule import parse_publish_hours, should_publish_now
 from .tracking import TRACKING_HEADER, generate_saved_tracking_report, save_daily_selection
 from .universe import normalize_sector_filters, parse_watchlist
@@ -28,6 +28,7 @@ def main() -> None:
     board_code = os.getenv("STOCK_AGENT_BOARD_CODE") or str(parameter_value(strategy, "board_code", DEFAULT_BOARD_CODE))
     board_name = os.getenv("STOCK_AGENT_BOARD_NAME") or str(parameter_value(strategy, "board_name", DEFAULT_BOARD_NAME))
     state_path = os.getenv("STOCK_AGENT_STATE_PATH", "/tmp/stock-agent-daily-selection.json")
+    history_path = os.getenv("STOCK_AGENT_HISTORY_PATH", "data/recommendation_history.json")
     watchlist_raw = os.getenv("STOCK_AGENT_WATCHLIST")
     watchlist = parse_watchlist(watchlist_raw) if watchlist_raw is not None else parameter_value(strategy, "watchlist", [])
     sector_raw = os.getenv("STOCK_AGENT_SECTOR_FILTERS") or os.getenv("STOCK_AGENT_SECTORS")
@@ -36,7 +37,7 @@ def main() -> None:
     )
     universe_options = {"watchlist": watchlist, "sector_filters": sector_filters}
     if mode == "track":
-        report = generate_saved_tracking_report(state_path=state_path)
+        report = generate_saved_tracking_report(state_path=state_path, history_path=history_path)
     elif mode == "data":
         report = generate_agent_context(
             board_code=board_code,
@@ -76,7 +77,10 @@ def main() -> None:
             board_code=board_code,
             board_name=board_name,
             benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
+            history_path=history_path,
         )
+    if mode in {"ai", "report", "track"}:
+        report = append_performance_link(report, os.getenv("STOCK_AGENT_PERFORMANCE_URL", ""))
     output = os.getenv("STOCK_AGENT_OUTPUT", "/data/stock_recommendation.md")
     if output:
         path = Path(output).expanduser()

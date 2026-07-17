@@ -8,6 +8,8 @@ WorkingDirectory=/home/aura/internal-tools/apps/stock-agent
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=/home/aura/internal-tools/apps/stock-agent/src
 Environment=STOCK_AGENT_CONFIG=/home/aura/internal-tools/apps/stock-agent/data/strategy_config.json
+Environment=STOCK_AGENT_HISTORY_PATH=/home/aura/internal-tools/apps/stock-agent/data/recommendation_history.json
+Environment=STOCK_AGENT_PERFORMANCE_URL=http://192.168.3.216:8765/performance
 Environment=STOCK_AGENT_LLM_BASE_URL=http://192.168.3.213:8911/v1
 Environment=STOCK_AGENT_LLM_MODEL=codex-worker
 Environment=STOCK_AGENT_LLM_API_KEY=ollama

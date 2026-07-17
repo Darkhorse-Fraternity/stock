@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#e9f0f4" />
+    <title>近 30 天推荐表现</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --cloud: #e9f0f4;
+        --paper: #f8fbfc;
+        --ink: #14263d;
+        --muted: #617286;
+        --line: #b8c7d0;
+        --line-soft: #d7e1e6;
+        --blue: #3568a8;
+        --up: #c33d4b;
+        --up-soft: #f8e8e9;
+        --down: #178060;
+        --down-soft: #e4f2ed;
+        --amber: #a86c24;
+        --shadow: 0 18px 55px rgba(23, 50, 77, 0.10);
+      }
+
+      * { box-sizing: border-box; }
+      html { background: var(--cloud); }
+      body {
+        margin: 0;
+        min-width: 320px;
+        color: var(--ink);
+        background:
+          linear-gradient(rgba(53, 104, 168, 0.055) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(53, 104, 168, 0.055) 1px, transparent 1px),
+          var(--cloud);
+        background-size: 24px 24px;
+        font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      button { font: inherit; }
+      button:focus-visible { outline: 3px solid rgba(53, 104, 168, 0.32); outline-offset: 2px; }
+      .shell { width: min(1180px, calc(100% - 32px)); margin: 0 auto; padding: 28px 0 56px; }
+      .ledger {
+        overflow: hidden;
+        border: 1px solid rgba(20, 38, 61, 0.18);
+        background: rgba(248, 251, 252, 0.96);
+        box-shadow: var(--shadow);
+      }
+
+      .masthead {
+        display: grid;
+        grid-template-columns: 112px 1fr auto;
+        min-height: 150px;
+        border-bottom: 1px solid var(--ink);
+      }
+      .issue {
+        display: grid;
+        place-items: center;
+        border-right: 1px solid var(--ink);
+        background: var(--ink);
+        color: white;
+        font: 600 12px/1.5 ui-monospace, "SFMono-Regular", Consolas, monospace;
+        letter-spacing: 0.18em;
+        text-align: center;
+        writing-mode: vertical-rl;
+        transform: rotate(180deg);
+      }
+      .title-block { padding: 29px 34px 26px; align-self: center; }
+      .eyebrow {
+        margin: 0 0 10px;
+        color: var(--blue);
+        font: 700 11px/1.4 ui-monospace, "SFMono-Regular", Consolas, monospace;
+        letter-spacing: 0.15em;
+      }
+      h1 {
+        margin: 0;
+        font-family: "Songti SC", STSong, serif;
+        font-size: clamp(30px, 5vw, 52px);
+        font-weight: 700;
+        letter-spacing: -0.04em;
+      }
+      .subtitle { margin: 10px 0 0; color: var(--muted); font-size: 14px; line-height: 1.7; }
+      .refresh-panel {
+        display: flex;
+        min-width: 190px;
+        flex-direction: column;
+        align-items: flex-end;
+        justify-content: space-between;
+        padding: 28px;
+      }
+      .stage {
+        border: 1px solid #d49a51;
+        background: #fff8ec;
+        color: #82521c;
+        padding: 6px 9px;
+        font: 700 11px/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+        letter-spacing: 0.08em;
+      }
+      .refresh {
+        border: 1px solid var(--ink);
+        background: transparent;
+        color: var(--ink);
+        padding: 9px 13px;
+        cursor: pointer;
+        transition: background 160ms ease, color 160ms ease;
+      }
+      .refresh:hover { background: var(--ink); color: white; }
+      .refresh[disabled] { cursor: wait; opacity: 0.55; }
+
+      .scoreboard {
+        display: grid;
+        grid-template-columns: 1.2fr repeat(3, 1fr);
+        border-bottom: 1px solid var(--line);
+      }
+      .score {
+        min-height: 124px;
+        padding: 22px 25px;
+        border-right: 1px solid var(--line);
+      }
+      .score:last-child { border-right: 0; }
+      .score.primary { background: #f0f5f8; }
+      .score-label { color: var(--muted); font-size: 12px; }
+      .score-value {
+        margin-top: 12px;
+        font: 650 clamp(25px, 3vw, 36px)/1 ui-monospace, "SFMono-Regular", Consolas, monospace;
+        letter-spacing: -0.05em;
+      }
+      .score-note { margin-top: 10px; color: var(--muted); font-size: 11px; }
+      .up { color: var(--up) !important; }
+      .down { color: var(--down) !important; }
+      .flat { color: var(--muted) !important; }
+
+      .tape-section { display: grid; grid-template-columns: 260px 1fr; border-bottom: 1px solid var(--line); }
+      .section-intro { padding: 28px; border-right: 1px solid var(--line); }
+      .section-kicker { color: var(--blue); font: 700 11px/1.4 ui-monospace, monospace; letter-spacing: 0.12em; }
+      h2 { margin: 9px 0 0; font-family: "Songti SC", STSong, serif; font-size: 25px; }
+      .section-copy { margin: 12px 0 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+      .chart-wrap { min-height: 245px; padding: 22px 26px 15px; background: #fbfdfe; }
+      #performance-chart { width: 100%; height: 190px; overflow: visible; }
+      .axis-label { fill: var(--muted); font: 10px ui-monospace, monospace; }
+      .chart-empty { display: grid; min-height: 190px; place-items: center; color: var(--muted); font-size: 13px; }
+
+      .toolbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        padding: 17px 22px;
+        border-bottom: 1px solid var(--line);
+      }
+      .filters { display: flex; gap: 4px; }
+      .filter {
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        padding: 7px 11px;
+        cursor: pointer;
+      }
+      .filter[aria-pressed="true"] { background: var(--ink); color: white; }
+      .freshness { color: var(--muted); font: 11px/1.4 ui-monospace, monospace; text-align: right; }
+
+      .table-wrap { overflow-x: auto; }
+      table { width: 100%; border-collapse: collapse; }
+      th {
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 600;
+        text-align: right;
+        white-space: nowrap;
+      }
+      th:first-child, th:nth-child(2), td:first-child, td:nth-child(2) { text-align: left; }
+      td {
+        padding: 16px;
+        border-bottom: 1px solid var(--line-soft);
+        font: 12px/1.45 ui-monospace, "SFMono-Regular", Consolas, monospace;
+        text-align: right;
+        white-space: nowrap;
+      }
+      tbody tr:last-child td { border-bottom: 0; }
+      tbody tr:hover { background: #f1f6f8; }
+      .stock-name { display: block; color: var(--ink); font: 600 14px/1.4 "PingFang SC", sans-serif; }
+      .stock-code { color: var(--muted); font-size: 10px; }
+      .return-pill { display: inline-block; min-width: 72px; padding: 5px 8px; text-align: center; }
+      .return-pill.up { background: var(--up-soft); }
+      .return-pill.down { background: var(--down-soft); }
+      .quote-stored { color: var(--amber); font-size: 10px; }
+
+      .mobile-list { display: none; }
+      .mobile-card { padding: 18px; border-bottom: 1px solid var(--line); }
+      .mobile-card:last-child { border-bottom: 0; }
+      .mobile-head, .mobile-metrics { display: flex; justify-content: space-between; gap: 14px; }
+      .mobile-return { font: 700 21px/1 ui-monospace, monospace; }
+      .mobile-metrics { margin-top: 17px; padding-top: 14px; border-top: 1px dashed var(--line); }
+      .mobile-metric { color: var(--muted); font-size: 10px; }
+      .mobile-metric strong { display: block; margin-top: 5px; color: var(--ink); font: 600 12px ui-monospace, monospace; }
+
+      .empty { display: none; padding: 68px 24px; text-align: center; }
+      .empty-mark { font: 700 48px/1 ui-monospace, monospace; color: var(--line); }
+      .empty h3 { margin: 17px 0 6px; font-family: "Songti SC", STSong, serif; font-size: 22px; }
+      .empty p { margin: 0; color: var(--muted); font-size: 13px; }
+      .notice {
+        display: none;
+        margin: 18px 22px 0;
+        border-left: 3px solid var(--amber);
+        background: #fff8ec;
+        color: #714716;
+        padding: 11px 13px;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      footer {
+        display: flex;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 21px 24px;
+        border-top: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.7;
+      }
+
+      @media (max-width: 800px) {
+        .shell { width: min(100% - 20px, 680px); padding-top: 10px; }
+        .masthead { grid-template-columns: 46px 1fr; }
+        .issue { font-size: 9px; }
+        .title-block { padding: 23px 20px; }
+        .refresh-panel { grid-column: 1 / -1; min-width: 0; flex-direction: row; align-items: center; padding: 12px 16px; border-top: 1px solid var(--line); }
+        .scoreboard { grid-template-columns: 1fr 1fr; }
+        .score { min-height: 108px; padding: 18px; }
+        .score:nth-child(2) { border-right: 0; }
+        .score:nth-child(-n+2) { border-bottom: 1px solid var(--line); }
+        .tape-section { grid-template-columns: 1fr; }
+        .section-intro { padding: 21px; border-right: 0; border-bottom: 1px solid var(--line); }
+        .chart-wrap { padding-inline: 12px; }
+        .toolbar { align-items: flex-start; flex-direction: column; }
+        .freshness { text-align: left; }
+        .table-wrap { display: none; }
+        .mobile-list { display: block; }
+        footer { flex-direction: column; }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="shell">
+      <article class="ledger">
+        <header class="masthead">
+          <div class="issue">ROLLING · 30D · LEDGER</div>
+          <div class="title-block">
+            <p class="eyebrow">STOCK AGENT / RECOMMENDATION RECORD</p>
+            <h1>近 30 天推荐表现</h1>
+            <p class="subtitle">从每次推荐价格开始计算，统一对照当前行情。这里记录结果，不修改历史。</p>
+          </div>
+          <div class="refresh-panel">
+            <span class="stage">模拟盘记录</span>
+            <button class="refresh" id="refresh" type="button">刷新行情</button>
+          </div>
+        </header>
+
+        <section class="scoreboard" aria-label="表现摘要">
+          <div class="score primary"><div class="score-label">平均涨跌</div><div class="score-value" id="average-return">—</div><div class="score-note" id="coverage">等待推荐记录</div></div>
+          <div class="score"><div class="score-label">上涨比例</div><div class="score-value" id="win-rate">—</div><div class="score-note">当前收益为正的推荐</div></div>
+          <div class="score"><div class="score-label">最好表现</div><div class="score-value" id="best-return">—</div><div class="score-note" id="best-stock">—</div></div>
+          <div class="score"><div class="score-label">最弱表现</div><div class="score-value" id="worst-return">—</div><div class="score-note" id="worst-stock">—</div></div>
+        </section>
+
+        <section class="tape-section">
+          <div class="section-intro">
+            <div class="section-kicker">DAILY COHORT TAPE</div>
+            <h2>按推荐日看组合</h2>
+            <p class="section-copy">每个节点代表当天所有推荐股从推荐价到当前价的平均涨跌。中线是零收益。</p>
+          </div>
+          <div class="chart-wrap" id="chart-wrap"><svg id="performance-chart" role="img" aria-label="每日推荐组合平均涨跌折线图"></svg></div>
+        </section>
+
+        <div class="notice" id="notice"></div>
+        <section>
+          <div class="toolbar">
+            <div class="filters" aria-label="筛选推荐结果">
+              <button class="filter" type="button" data-filter="all" aria-pressed="true">全部</button>
+              <button class="filter" type="button" data-filter="up" aria-pressed="false">上涨</button>
+              <button class="filter" type="button" data-filter="down" aria-pressed="false">下跌</button>
+            </div>
+            <div class="freshness" id="freshness">正在读取最新行情…</div>
+          </div>
+          <div class="table-wrap" id="table-wrap">
+            <table>
+              <thead><tr><th>推荐日</th><th>股票</th><th>推荐价</th><th>最新价</th><th>推荐后涨跌</th><th>最大采样回撤</th><th>成交量</th></tr></thead>
+              <tbody id="performance-body"></tbody>
+            </table>
+          </div>
+          <div class="mobile-list" id="mobile-list"></div>
+          <div class="empty" id="empty"><div class="empty-mark">30D</div><h3>还没有可展示的推荐记录</h3><p>下一次工作日 09:35 推荐后，这里会开始积累表现。</p></div>
+        </section>
+        <footer>
+          <span>涨跌幅 = 最新价 ÷ 推荐价 − 1；红涨绿跌。历史最大回撤来自盘中整点采样，不等同于逐笔最大回撤。</span>
+          <span>模拟盘数据，仅供策略验证，不构成投资建议。</span>
+        </footer>
+      </article>
+    </main>
+
+    <script>
+      const state = { payload: null, filter: "all" }
+      const $ = (selector) => document.querySelector(selector)
+      const esc = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[char])
+      const tone = (value) => value > 0 ? "up" : value < 0 ? "down" : "flat"
+      const pct = (value) => value == null ? "—" : `${value > 0 ? "+" : ""}${Number(value).toFixed(2)}%`
+      const price = (value) => value == null ? "—" : `¥${Number(value).toFixed(2)}`
+      const volume = (value) => {
+        if (value == null || !Number(value)) return "—"
+        if (value >= 100000000) return `${(value / 100000000).toFixed(2)} 亿手`
+        if (value >= 10000) return `${(value / 10000).toFixed(2)} 万手`
+        return `${Math.round(value)} 手`
+      }
+
+      function setMetric(selector, value) {
+        const element = $(selector)
+        element.textContent = pct(value)
+        element.className = `score-value ${tone(Number(value || 0))}`
+      }
+
+      function renderSummary(payload) {
+        const summary = payload.summary
+        setMetric("#average-return", summary.average_return_pct)
+        $("#win-rate").textContent = summary.win_rate == null ? "—" : `${summary.win_rate.toFixed(1)}%`
+        $("#win-rate").className = `score-value ${summary.win_rate >= 50 ? "up" : summary.win_rate == null ? "flat" : "down"}`
+        setMetric("#best-return", summary.best?.return_pct)
+        setMetric("#worst-return", summary.worst?.return_pct)
+        $("#best-stock").textContent = summary.best ? `${summary.best.name} · ${summary.best.trade_date}` : "—"
+        $("#worst-stock").textContent = summary.worst ? `${summary.worst.name} · ${summary.worst.trade_date}` : "—"
+        $("#coverage").textContent = `${summary.recommendation_days} 个推荐日 · ${summary.total_recommendations} 条记录 · ${summary.unique_stocks} 只股票`
+      }
+
+      function renderChart(daily) {
+        const wrapper = $("#chart-wrap")
+        const svg = $("#performance-chart")
+        if (!daily.length || !daily.some((item) => item.average_return_pct != null)) {
+          svg.style.display = "none"
+          if (!wrapper.querySelector(".chart-empty")) wrapper.insertAdjacentHTML("beforeend", '<div class="chart-empty">积累两个推荐日后，趋势会更清楚。</div>')
+          return
+        }
+        wrapper.querySelector(".chart-empty")?.remove()
+        svg.style.display = "block"
+        const points = daily.filter((item) => item.average_return_pct != null)
+        const width = 760, height = 190, left = 42, right = 20, top = 18, bottom = 32
+        const values = points.map((item) => Number(item.average_return_pct))
+        const bound = Math.max(1, ...values.map(Math.abs)) * 1.18
+        const x = (index) => left + (points.length === 1 ? (width - left - right) / 2 : index * (width - left - right) / (points.length - 1))
+        const y = (value) => top + (bound - value) * (height - top - bottom) / (bound * 2)
+        const zero = y(0)
+        const path = points.map((item, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(item.average_return_pct).toFixed(1)}`).join(" ")
+        const area = `${path} L${x(points.length - 1).toFixed(1)},${zero.toFixed(1)} L${x(0).toFixed(1)},${zero.toFixed(1)} Z`
+        const dots = points.map((item, index) => `<circle cx="${x(index)}" cy="${y(item.average_return_pct)}" r="4.5" fill="${item.average_return_pct >= 0 ? "#c33d4b" : "#178060"}"><title>${esc(item.trade_date)} ${pct(item.average_return_pct)}</title></circle>`).join("")
+        const dateLabels = points.map((item, index) => (index === 0 || index === points.length - 1 || points.length <= 6) ? `<text x="${x(index)}" y="180" text-anchor="middle" class="axis-label">${esc(item.trade_date.slice(5))}</text>` : "").join("")
+        svg.setAttribute("viewBox", `0 0 ${width} ${height}`)
+        svg.innerHTML = `
+          <line x1="${left}" y1="${zero}" x2="${width - right}" y2="${zero}" stroke="#9fb1bd" stroke-dasharray="4 5" />
+          <text x="4" y="${top + 4}" class="axis-label">${pct(bound)}</text>
+          <text x="4" y="${height - bottom}" class="axis-label">${pct(-bound)}</text>
+          <path d="${area}" fill="rgba(53,104,168,0.08)" />
+          <path d="${path}" fill="none" stroke="#3568a8" stroke-width="2.4" stroke-linecap="square" stroke-linejoin="round" />
+          ${dots}${dateLabels}`
+      }
+
+      function visibleEvents() {
+        const events = state.payload?.events || []
+        if (state.filter === "up") return events.filter((item) => item.return_pct > 0)
+        if (state.filter === "down") return events.filter((item) => item.return_pct < 0)
+        return events
+      }
+
+      function renderRows() {
+        const events = visibleEvents()
+        $("#performance-body").innerHTML = events.map((item) => `
+          <tr>
+            <td>${esc(item.trade_date)}<br><span class="stock-code">持有 ${item.days_held ?? "—"} 天</span></td>
+            <td><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)} · #${item.rank}</span></td>
+            <td>${price(item.entry_price)}</td><td>${price(item.latest_price)}${item.quote_status === "stored" ? '<br><span class="quote-stored">缓存行情</span>' : ""}</td>
+            <td><span class="return-pill ${tone(item.return_pct)}">${pct(item.return_pct)}</span></td>
+            <td class="${tone(item.maximum_sampled_drawdown_pct)}">${pct(item.maximum_sampled_drawdown_pct)}</td>
+            <td>${volume(item.volume_hands)}</td>
+          </tr>`).join("")
+        $("#mobile-list").innerHTML = events.map((item) => `
+          <article class="mobile-card">
+            <div class="mobile-head"><div><span class="stock-name">${esc(item.name)}</span><span class="stock-code">${esc(item.symbol)} · ${esc(item.trade_date)} · 推荐 #${item.rank}</span></div><div class="mobile-return ${tone(item.return_pct)}">${pct(item.return_pct)}</div></div>
+            <div class="mobile-metrics"><div class="mobile-metric">推荐价<strong>${price(item.entry_price)}</strong></div><div class="mobile-metric">最新价<strong>${price(item.latest_price)}</strong></div><div class="mobile-metric">最大采样回撤<strong class="${tone(item.maximum_sampled_drawdown_pct)}">${pct(item.maximum_sampled_drawdown_pct)}</strong></div><div class="mobile-metric">成交量<strong>${volume(item.volume_hands)}</strong></div></div>
+          </article>`).join("")
+        const empty = !state.payload?.events?.length
+        $("#empty").style.display = empty ? "block" : "none"
+        $("#table-wrap").style.display = empty ? "none" : ""
+        if (empty) $("#mobile-list").style.display = "none"
+      }
+
+      function render(payload) {
+        state.payload = payload
+        renderSummary(payload)
+        renderChart(payload.daily || [])
+        renderRows()
+        $("#freshness").textContent = `更新：${payload.generated_at} · ${payload.summary.priced_recommendations}/${payload.summary.total_recommendations} 条有价格`
+        const notice = $("#notice")
+        if (payload.quote_error) {
+          notice.style.display = "block"
+          notice.textContent = `实时行情暂不可用，部分结果使用最后一次盘中记录：${payload.quote_error}`
+        } else {
+          notice.style.display = "none"
+        }
+      }
+
+      async function load() {
+        const button = $("#refresh")
+        button.disabled = true
+        button.textContent = "读取中…"
+        try {
+          const response = await fetch("/api/performance?days=30", { cache: "no-store" })
+          const payload = await response.json()
+          if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`)
+          render(payload)
+        } catch (error) {
+          const notice = $("#notice")
+          notice.style.display = "block"
+          notice.textContent = `页面数据加载失败：${error.message}`
+          $("#freshness").textContent = "数据暂不可用"
+        } finally {
+          button.disabled = false
+          button.textContent = "刷新行情"
+        }
+      }
+
+      document.querySelectorAll(".filter").forEach((button) => button.addEventListener("click", () => {
+        state.filter = button.dataset.filter
+        document.querySelectorAll(".filter").forEach((item) => item.setAttribute("aria-pressed", String(item === button)))
+        renderRows()
+      }))
+      $("#refresh").addEventListener("click", load)
+      load()
+    </script>
+  </body>
+</html>

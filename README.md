@@ -35,6 +35,7 @@ src/stock_recommender/
   universe.py      watchlist parsing, universe constraints, sector filters
   schedule.py      Beijing-time weekday and hourly publication guard
   tracking.py      daily recommendation state and intraday quote tracking
+  performance.py   rolling recommendation archive and 30-day performance API
   backtest.py      fixed-factor rolling walk-forward evaluation and approval gate
 ```
 
@@ -152,6 +153,8 @@ recommendation instead of adding stocks outside the watchlist.
 | `STOCK_AGENT_LLM_TIMEOUT` | `60` | LLM request timeout in seconds. |
 | `STOCK_AGENT_TRACKING_LIMIT` | `3` | Maximum recommended stocks in the hourly volume/change tracking block. |
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
+| `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Rolling recommendation archive used by the 30-day performance page. |
+| `STOCK_AGENT_PERFORMANCE_URL` | empty | Link appended to recommendation and tracking reports, for example `http://host:8765/performance`. |
 | `STOCK_AGENT_SCHEDULE_GUARD` | `0` | Set to `1` to skip publication outside configured weekday hours. Background scripts default to `1`. |
 | `STOCK_AGENT_PUBLISH_HOURS` | `9,10,11,13,14,15` | Beijing-time hours allowed by the schedule guard. |
 
@@ -182,6 +185,19 @@ Accidental triggers on weekends, during the lunch break, before open, or after
 close exit without generating or overwriting a report. This guard treats
 Monday-Friday as workdays; exchange holidays still need to be excluded by the
 external scheduler when applicable.
+
+## 30-day Recommendation Performance
+
+Recommendation and hourly tracking runs upsert a 120-day archive at
+`STOCK_AGENT_HISTORY_PATH`. The read-only `/performance` page displays the most
+recent 30 calendar days, and `/api/performance?days=30` returns the same data as
+JSON. Current quotes are refreshed when the page opens; if a quote source is
+temporarily unavailable, the API clearly marks and uses the last tracked price.
+
+Set `STOCK_AGENT_PERFORMANCE_URL` in both recommendation and tracking jobs to
+append a Feishu-compatible Markdown link below every delivered report. Existing
+installations start accumulating history after this feature is deployed; the
+archive does not invent or reconstruct recommendations that were not persisted.
 
 ## Hermes Cron
 

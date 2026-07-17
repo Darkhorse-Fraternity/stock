@@ -7,7 +7,7 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .backtest import BacktestInProgressError, get_backtest, list_backtests, start_backtest
 from .delivery import pause_hermes_delivery, sync_active_strategy_delivery, sync_hermes_delivery
@@ -30,6 +30,7 @@ from .parameters import (
     strategy_library_payload,
     transition_strategy_stage,
 )
+from .performance import build_recommendation_performance
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
 
@@ -75,7 +76,8 @@ class AdminHandler(BaseHTTPRequestHandler):
     server_version = "StockAgentAdmin/1.0"
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        request = urlparse(self.path)
+        path = request.path
         if path == "/api/config":
             self._send_json(catalog_payload())
             return
@@ -92,6 +94,13 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json(health_payload())
+            return
+        if path == "/api/performance":
+            try:
+                days = int((parse_qs(request.query).get("days") or ["30"])[0])
+            except ValueError:
+                days = 30
+            self._send_json(build_recommendation_performance(days=days))
             return
         run_id = self._run_route(path)
         if run_id:
@@ -117,6 +126,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/":
             self._send_file(WEB_ROOT / "index.html")
+            return
+        if path in {"/performance", "/performance/"}:
+            self._send_file(WEB_ROOT / "performance.html")
             return
         static_path = (WEB_ROOT / path.lstrip("/")).resolve()
         try:
