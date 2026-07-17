@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stock-recommender"
+version = "0.1.0"
+description = "A-share stock recommendation pipeline with market data fallback and LLM reporting."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+tick = ["akshare"]
+
+[project.scripts]
+stock-agent = "stock_recommender.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
