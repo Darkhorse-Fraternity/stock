@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -89,6 +90,48 @@ class HermesScriptRegressionTests(unittest.TestCase):
             self.assertEqual(
                 result.stdout.strip(),
                 f"{app_dir}|fixture-model|ai",
+            )
+
+    def test_ai_script_finds_checkout_when_started_through_runtime_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            app_dir = root / "stock-agent"
+            source_dir = app_dir / "src"
+            scripts_dir = app_dir / "scripts"
+            runtime_dir = root / "hermes" / "scripts"
+            source_dir.mkdir(parents=True)
+            scripts_dir.mkdir(parents=True)
+            runtime_dir.mkdir(parents=True)
+            (source_dir / "stock_agent.py").write_text("", encoding="utf-8")
+
+            fake_python = root / "fake-python"
+            fake_python.write_text(
+                '#!/bin/sh\nprintf "%s|%s|%s\\n" "$PWD" "$STOCK_AGENT_LLM_MODEL" "$STOCK_AGENT_MODE"\n',
+                encoding="utf-8",
+            )
+            fake_python.chmod(0o755)
+            (app_dir / ".env").write_text(
+                f"STOCK_AGENT_PYTHON={fake_python}\n"
+                "STOCK_AGENT_LLM_MODEL=symlink-model\n",
+                encoding="utf-8",
+            )
+
+            installed_script = scripts_dir / "hermes-ai-run.sh"
+            shutil.copy2(ROOT / "scripts" / "hermes-ai-run.sh", installed_script)
+            runtime_script = runtime_dir / "hermes-ai-run.sh"
+            runtime_script.symlink_to(installed_script)
+
+            result = subprocess.run(
+                [str(runtime_script)],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={"PATH": os.environ["PATH"]},
+            )
+
+            self.assertEqual(
+                result.stdout.strip(),
+                f"{app_dir.resolve()}|symlink-model|ai",
             )
 
 
