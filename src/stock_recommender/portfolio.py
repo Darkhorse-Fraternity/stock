@@ -523,6 +523,7 @@ def plan_daily_candidates(
 
     def mutation(account: dict) -> list[dict]:
         events = _activate_strategy(account, strategy, current)
+        _roll_settlements(account, current)
         run_key = f"daily:{current.date().isoformat()}"
         if run_key in account.setdefault("committed_run_keys", []):
             return events
@@ -843,11 +844,16 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
     return events
 
 
+def _roll_settlements(account: dict, now: datetime) -> None:
+    settlement_date = now.date().isoformat()
+    for position in account.get("positions", {}).values():
+        if settlement_date >= str(position.get("sellable_on") or "9999-12-31"):
+            position["sellable_quantity"] = int(position["quantity"])
+
+
 def _mark_positions(account: dict, quotes: dict[str, dict], now: datetime) -> None:
     config = account["portfolio_config"]
     for symbol, position in account.get("positions", {}).items():
-        if now.date().isoformat() >= str(position.get("sellable_on") or "9999-12-31"):
-            position["sellable_quantity"] = int(position["quantity"])
         quote = quotes.get(symbol)
         if not quote:
             continue
@@ -965,6 +971,7 @@ def process_market_snapshot(
         if run_key in account.setdefault("committed_run_keys", []):
             return events
         events.extend(_expire_old_entries(account, current))
+        _roll_settlements(account, current)
         order_ids = [order["id"] for order in _open_orders(account)]
         for order_id in order_ids:
             order = next((item for item in account.get("orders", []) if item.get("id") == order_id), None)
@@ -1105,6 +1112,7 @@ def build_strategy_performance(
     if account is None:
         account = _new_account(strategy, current)
     projected = deepcopy(account)
+    _roll_settlements(projected, current)
     symbols = list(projected.get("positions", {}))
     quote_error = None
     if symbols and quote_fetcher is not False:
