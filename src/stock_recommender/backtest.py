@@ -388,7 +388,8 @@ def load_current_universe_dataset(strategy: dict) -> dict:
             break
     panel: dict[str, list[dict]] = {}
     errors = []
-    with ThreadPoolExecutor(max_workers=min(4, len(symbols)), thread_name_prefix="stock-backtest") as executor:
+    configured_workers = max(1, int(os.getenv("STOCK_AGENT_HISTORY_FETCH_WORKERS", "2")))
+    with ThreadPoolExecutor(max_workers=min(configured_workers, len(symbols)), thread_name_prefix="stock-backtest") as executor:
         futures = {executor.submit(fetch_daily_history, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]

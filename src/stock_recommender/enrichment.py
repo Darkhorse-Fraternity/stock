@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Callable, Iterable
 
+from .market_history import fetch_daily_history_with_cache
 from .parameters import load_strategy_config
 
 
@@ -184,7 +185,7 @@ def normalize_financial_snapshot(record: dict, *, total_market_cap: float = 0.0)
     return result
 
 
-def fetch_daily_history(symbol: str) -> list[dict]:
+def _download_daily_history(symbol: str) -> list[dict]:
     import akshare as ak
 
     frame = ak.stock_zh_a_hist(
@@ -207,6 +208,48 @@ def fetch_daily_history(symbol: str) -> list[dict]:
         }
         for _, row in frame.iterrows()
     ]
+
+
+def fetch_daily_history(
+    symbol: str,
+    *,
+    cache_dir=None,
+    cache_ttl_seconds: float | None = None,
+    attempts: int | None = None,
+    backoff_seconds: float | None = None,
+    downloader: Callable[[str], Iterable[dict]] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    ttl = (
+        float(cache_ttl_seconds)
+        if cache_ttl_seconds is not None
+        else float(os.getenv("STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
+    )
+    maximum_attempts = (
+        int(attempts)
+        if attempts is not None
+        else int(os.getenv("STOCK_AGENT_HISTORY_FETCH_ATTEMPTS", "3"))
+    )
+    backoff = (
+        float(backoff_seconds)
+        if backoff_seconds is not None
+        else float(os.getenv("STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS", "1"))
+    )
+    loader = downloader or _download_daily_history
+    options = {}
+    if sleep is not None:
+        options["sleep"] = sleep
+    return fetch_daily_history_with_cache(
+        symbol,
+        lambda: loader(symbol),
+        cache_dir=cache_dir,
+        cache_ttl_seconds=ttl,
+        attempts=maximum_attempts,
+        backoff_seconds=backoff,
+        now=now,
+        **options,
+    )
 
 
 def _financial_symbol(symbol: str) -> str:

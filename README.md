@@ -169,6 +169,11 @@ recommendation instead of adding stocks outside the watchlist.
 | `STOCK_AGENT_TRACKING_LIMIT` | `3` | Maximum recommended stocks in the hourly volume/change tracking block. |
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
 | `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Rolling recommendation archive used by the 30-day performance page. |
+| `STOCK_AGENT_MARKET_HISTORY_CACHE_DIR` | `data/market_history_cache` | Per-symbol daily-history cache used by enrichment, backtests, and replay tools. |
+| `STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS` | `21600` | Fresh-cache lifetime; stale data remains available when the upstream source fails. |
+| `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `3` | Bounded daily-history download attempts. |
+| `STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS` | `1` | Initial exponential retry delay. |
+| `STOCK_AGENT_HISTORY_FETCH_WORKERS` | `2` | Maximum concurrent history downloads during a backtest. |
 | `STOCK_AGENT_PERFORMANCE_URL` | empty | Link appended to recommendation and tracking reports, for example `http://host:8765/performance`. |
 | `STOCK_AGENT_SCHEDULE_GUARD` | `0` | Set to `1` to skip publication outside configured weekday hours. Background scripts default to `1`. |
 | `STOCK_AGENT_PUBLISH_HOURS` | `9,10,11,13,14,15` | Beijing-time hours allowed by the schedule guard. |
@@ -213,6 +218,25 @@ Set `STOCK_AGENT_PERFORMANCE_URL` in both recommendation and tracking jobs to
 append a Feishu-compatible Markdown link below every delivered report. Existing
 installations start accumulating history after this feature is deployed; the
 archive does not invent or reconstruct recommendations that were not persisted.
+
+Daily history downloads are cached per symbol and retried with exponential
+backoff. A fresh cache avoids the upstream request entirely; if refresh attempts
+fail, the most recent valid cache is returned so an already reproducible replay
+does not become unavailable during a provider outage.
+
+If a strategy is recreated with a new ID, reconcile legacy recommendation
+records only after backing up the archive:
+
+```bash
+PYTHONPATH=src python3 scripts/reconcile-recommendation-history.py --dry-run
+PYTHONPATH=src python3 scripts/reconcile-recommendation-history.py
+```
+
+The migration changes only orphaned records whose strategy name has exactly one
+current match, and preserves the prior value as `legacy_strategy_id`. When a
+legacy record used a different name, provide an audited mapping such as
+`--map OLD_ID=NEW_ID`; mappings whose target is not a current strategy are
+rejected.
 
 ## Hermes Cron
 

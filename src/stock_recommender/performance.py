@@ -52,6 +52,92 @@ def _write_history(payload: dict, path: str | Path | None = None) -> None:
     temporary.replace(target)
 
 
+def reconcile_recommendation_history_strategies(
+    strategy_store: dict,
+    *,
+    path: str | Path | None = None,
+    now: datetime | None = None,
+    dry_run: bool = False,
+    explicit_mapping: dict[str, str] | None = None,
+) -> dict:
+    """Remap orphaned history IDs only when a strategy name has one exact match."""
+    current = beijing_now(now)
+    strategies = [item for item in strategy_store.get("strategies", []) if isinstance(item, dict)]
+    strategies_by_id = {
+        str(item.get("id")): item
+        for item in strategies
+        if str(item.get("id") or "").strip()
+    }
+    strategies_by_name: dict[str, list[dict]] = {}
+    for strategy in strategies:
+        name = str(strategy.get("name") or "").strip()
+        if name:
+            strategies_by_name.setdefault(name, []).append(strategy)
+
+    payload = _read_history(path)
+    migrated = []
+    unresolved = []
+    unchanged = 0
+    mapping = {str(key).strip(): str(value).strip() for key, value in (explicit_mapping or {}).items()}
+    for record in payload["records"]:
+        strategy_id = str(record.get("strategy_id") or "").strip()
+        if strategy_id in strategies_by_id:
+            unchanged += 1
+            continue
+        strategy_name = str(record.get("strategy_name") or "").strip()
+        mapped_id = mapping.get(strategy_id)
+        matches = strategies_by_name.get(strategy_name, [])
+        if mapped_id:
+            target = strategies_by_id.get(mapped_id)
+            migration_reason = "explicit_strategy_id_mapping"
+        elif len(matches) == 1:
+            target = matches[0]
+            migration_reason = "unique_strategy_name_match"
+        else:
+            target = None
+            migration_reason = None
+        if target is None:
+            reason = "invalid_mapping_target" if mapped_id else (
+                "ambiguous_name" if len(matches) > 1 else "no_unique_name_match"
+            )
+            unresolved.append(
+                {
+                    "trade_date": record.get("trade_date"),
+                    "strategy_id": strategy_id or None,
+                    "strategy_name": strategy_name or None,
+                    "reason": reason,
+                }
+            )
+            continue
+        target_id = str(target["id"])
+        if strategy_id and not record.get("legacy_strategy_id"):
+            record["legacy_strategy_id"] = strategy_id
+        record["strategy_id"] = target_id
+        record["strategy_name"] = target.get("name") or strategy_name
+        record["strategy_id_migrated_at"] = current.isoformat(timespec="seconds")
+        record["strategy_id_migration"] = migration_reason
+        migrated.append(
+            {
+                "trade_date": record.get("trade_date"),
+                "from_strategy_id": strategy_id or None,
+                "to_strategy_id": target_id,
+                "strategy_name": record["strategy_name"],
+                "reason": migration_reason,
+            }
+        )
+
+    if migrated and not dry_run:
+        _write_history(payload, path)
+    return {
+        "dry_run": bool(dry_run),
+        "migrated_count": len(migrated),
+        "unchanged_count": unchanged,
+        "unresolved_count": len(unresolved),
+        "migrated": migrated,
+        "unresolved": unresolved,
+    }
+
+
 def upsert_recommendation_history(
     record: dict,
     *,
