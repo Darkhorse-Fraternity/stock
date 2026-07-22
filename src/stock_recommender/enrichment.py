@@ -185,29 +185,55 @@ def normalize_financial_snapshot(record: dict, *, total_market_cap: float = 0.0)
     return result
 
 
-def _download_daily_history(symbol: str) -> list[dict]:
-    import akshare as ak
-
-    frame = ak.stock_zh_a_hist(
-        symbol=str(symbol),
-        period="daily",
-        start_date="19700101",
-        end_date="20500101",
-        adjust="qfq",
-        timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
-    )
+def _history_rows(frame) -> list[dict]:
     return [
         {
-            "date": row.get("日期"),
-            "open": row.get("开盘"),
-            "close": row.get("收盘"),
-            "high": row.get("最高"),
-            "low": row.get("最低"),
-            "volume": row.get("成交量"),
-            "turnover": row.get("成交额"),
+            "date": row.get("日期", row.get("date")),
+            "open": row.get("开盘", row.get("open")),
+            "close": row.get("收盘", row.get("close")),
+            "high": row.get("最高", row.get("high")),
+            "low": row.get("最低", row.get("low")),
+            "volume": row.get("成交量", row.get("volume")),
+            "turnover": row.get("成交额", row.get("amount")),
         }
         for _, row in frame.iterrows()
     ]
+
+
+def _download_daily_history(symbol: str) -> list[dict]:
+    import akshare as ak
+
+    normalized_symbol = str(symbol)
+    try:
+        primary = ak.stock_zh_a_hist(
+            symbol=normalized_symbol,
+            period="daily",
+            start_date="19700101",
+            end_date="20500101",
+            adjust="qfq",
+            timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
+        )
+        rows = _history_rows(primary)
+        if rows:
+            return rows
+        raise RuntimeError("东方财富日线返回空数据")
+    except Exception as primary_error:
+        prefix = "sh" if normalized_symbol.startswith("6") else "bj" if normalized_symbol.startswith(("4", "8")) else "sz"
+        try:
+            fallback = ak.stock_zh_a_daily(
+                symbol=f"{prefix}{normalized_symbol}",
+                start_date="19700101",
+                end_date="20500101",
+                adjust="qfq",
+            )
+            rows = _history_rows(fallback)
+            if rows:
+                return rows
+            raise RuntimeError("新浪日线返回空数据")
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"东方财富与新浪日线均不可用：{primary_error}; {fallback_error}"
+            ) from fallback_error
 
 
 def fetch_daily_history(
