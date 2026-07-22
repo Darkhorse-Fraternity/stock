@@ -4,29 +4,10 @@ After=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/aura/internal-tools/apps/stock-agent
+WorkingDirectory=%h/internal-tools/apps/stock-agent
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=PYTHONPATH=/home/aura/internal-tools/apps/stock-agent/src
-Environment=STOCK_AGENT_CONFIG=/home/aura/internal-tools/apps/stock-agent/data/strategy_config.json
-Environment=STOCK_AGENT_HISTORY_PATH=/home/aura/internal-tools/apps/stock-agent/data/recommendation_history.json
-Environment=STOCK_AGENT_PERFORMANCE_URL=http://192.168.3.216:8765/performance
-Environment=STOCK_AGENT_LLM_BASE_URL=http://192.168.3.213:8911/v1
-Environment=STOCK_AGENT_LLM_MODEL=codex-worker
-Environment=STOCK_AGENT_LLM_API_KEY=ollama
-Environment=STOCK_AGENT_LLM_TIMEOUT=120
-Environment=STOCK_AGENT_RUN_PYTHON=/home/aura/.hermes/venv/stock-trading/bin/python
-Environment=STOCK_AGENT_RUN_MODE=ai
-Environment=STOCK_AGENT_RUN_TIMEOUT=240
-Environment=STOCK_AGENT_CANDIDATE_LIMIT=6
-Environment=STOCK_AGENT_ENABLE_TICK=1
-Environment=STOCK_AGENT_TICK_LIMIT=2
-Environment=STOCK_AGENT_HERMES_BIN=/home/aura/.local/bin/hermes
-Environment=STOCK_AGENT_HERMES_JOB_ID=a92bdfaa9fec
-Environment=STOCK_AGENT_DEFAULT_DELIVERY_ENABLED=1
-Environment=STOCK_AGENT_DEFAULT_DELIVERY_CHANNEL=feishu
-Environment=STOCK_AGENT_DEFAULT_DELIVERY_TARGET=oc_a3446a13f014342b302cd79fba37f011
-Environment=STOCK_AGENT_DEFAULT_DELIVERY_HOUR=8
-Environment=STOCK_AGENT_DEFAULT_DELIVERY_MINUTE=0
+Environment=PYTHONPATH=src
+EnvironmentFile=-%h/internal-tools/apps/stock-agent/.env
 ExecStart=/usr/bin/python3 -m stock_recommender.admin --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=3

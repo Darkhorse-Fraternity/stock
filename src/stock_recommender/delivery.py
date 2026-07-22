@@ -48,7 +48,7 @@ def should_deliver_report(report: str, config: dict) -> bool:
 
 def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dict:
     job_id = os.getenv("STOCK_AGENT_HERMES_JOB_ID", "").strip()
-    hermes_bin = os.getenv("STOCK_AGENT_HERMES_BIN", "/home/aura/.local/bin/hermes").strip()
+    hermes_bin = os.getenv("STOCK_AGENT_HERMES_BIN", "hermes").strip()
     if not job_id:
         return {"status": "unavailable", "message": "未配置 Hermes job id"}
     delivery = normalize_report_delivery(config.get("delivery"))

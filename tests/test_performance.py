@@ -164,7 +164,7 @@ class RecommendationPerformanceTests(unittest.TestCase):
         self.assertAlmostEqual(history[0]["recommendations"][0]["return_since_recommendation_pct"], 5)
 
     def test_performance_link_is_appended_once(self):
-        url = "http://192.168.3.216:8765/performance"
+        url = "https://stocks.example.test/performance"
         report = append_performance_link("模拟盘报告", url)
 
         self.assertIn(f"[查看策略表现]({url})", report)

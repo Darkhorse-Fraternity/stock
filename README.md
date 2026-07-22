@@ -37,6 +37,9 @@ src/stock_recommender/
   tracking.py      daily recommendation state and intraday quote tracking
   performance.py   rolling recommendation archive and 30-day performance API
   backtest.py      fixed-factor rolling walk-forward evaluation and approval gate
+  pipeline.py      composable strategy stages and execution context
+  portfolio.py     per-strategy positions, orders, exits, and performance
+  portfolio_pipeline.py  entry, risk, exit, and replacement orchestration
 ```
 
 New code should import from `stock_recommender.*`. Existing automation can keep
@@ -66,6 +69,18 @@ output; it does not choose factors or tune thresholds during the evaluation.
 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
+Instance-specific settings belong in an ignored `.env` file. Start from the
+versioned template and restrict its permissions before adding model credentials,
+Hermes job IDs, or delivery targets:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+```
+
+The Hermes launch scripts and the systemd service load this file automatically.
+Set `STOCK_AGENT_ENV_FILE` when a launch script should use a different file.
+
 If installed as a package, the CLI entrypoint is:
 
 ```bash
@@ -94,8 +109,8 @@ To let stock-agent call an OpenAI-compatible LLM endpoint directly:
 
 ```bash
 STOCK_AGENT_MODE=ai \
-STOCK_AGENT_LLM_BASE_URL=http://192.168.3.213:8911/v1 \
-STOCK_AGENT_LLM_MODEL=codex-worker \
+STOCK_AGENT_LLM_BASE_URL=http://127.0.0.1:8911/v1 \
+STOCK_AGENT_LLM_MODEL=your-model \
 PYTHONPATH=src python3 src/stock_agent.py
 ```
 
@@ -186,17 +201,13 @@ close exit without generating or overwriting a report. This guard treats
 Monday-Friday as workdays; exchange holidays still need to be excluded by the
 external scheduler when applicable.
 
-## 30-day Recommendation Performance
+## Strategy Portfolio Performance
 
-Recommendation and hourly tracking runs upsert a 120-day archive at
-`STOCK_AGENT_HISTORY_PATH`. The read-only `/performance` page displays the most
-recent 30 calendar days, and `/api/performance?days=30` returns the same data as
-JSON. Current quotes are refreshed when the page opens; if a quote source is
-temporarily unavailable, the API clearly marks and uses the last tracked price.
-Stocks are deduplicated by symbol: each row compares the current quote with that
-stock's first recommendation price inside the 30-day window. The recommendation
-success rate is the share of priced stocks whose current price is above that
-first recommendation price.
+Each strategy owns an independent paper portfolio with at most ten positions.
+The portfolio pipeline records entries, partial fills, fees, exits, replacement
+events, NAV, drawdown, and win rate for the strategy's full lifecycle. Open a
+strategy at `/strategies/<strategy-id>/portfolio`; the matching JSON endpoint is
+`/api/strategies/<strategy-id>/portfolio`.
 
 Set `STOCK_AGENT_PERFORMANCE_URL` in both recommendation and tracking jobs to
 append a Feishu-compatible Markdown link below every delivered report. Existing
@@ -210,8 +221,8 @@ Preferred setup is now a no-agent Hermes cron that runs stock-agent in `ai` mode
 ```bash
 cd /path/to/internal-tools/apps/stock-agent
 STOCK_AGENT_MODE=ai \
-STOCK_AGENT_LLM_BASE_URL=http://192.168.3.213:8911/v1 \
-STOCK_AGENT_LLM_MODEL=codex-worker \
+STOCK_AGENT_LLM_BASE_URL=http://127.0.0.1:8911/v1 \
+STOCK_AGENT_LLM_MODEL=your-model \
 PYTHONPATH=src python3 src/stock_agent.py
 ```
 
