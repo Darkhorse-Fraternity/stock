@@ -13,6 +13,7 @@ class HermesScriptRegressionTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         self.assertLess(int(match.group("seconds")), 120)
+        self.assertIn('STOCK_AGENT_ENABLE_TICK="${STOCK_AGENT_ENABLE_TICK:-0}"', script)
 
 
 if __name__ == "__main__":
