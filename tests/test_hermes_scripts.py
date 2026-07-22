@@ -13,9 +13,13 @@ class HermesScriptRegressionTests(unittest.TestCase):
     def test_daily_llm_timeout_stays_below_hermes_script_limit(self) -> None:
         script = (ROOT / "scripts" / "hermes-ai-run.sh").read_text(encoding="utf-8")
         match = re.search(r"STOCK_AGENT_LLM_TIMEOUT:-(?P<seconds>\d+)", script)
+        example = (ROOT / ".env.example").read_text(encoding="utf-8")
+        example_match = re.search(r"^STOCK_AGENT_LLM_TIMEOUT=(?P<seconds>\d+)$", example, re.MULTILINE)
 
         self.assertIsNotNone(match)
+        self.assertIsNotNone(example_match)
         self.assertLess(int(match.group("seconds")), 120)
+        self.assertLess(int(example_match.group("seconds")), 120)
         self.assertIn('STOCK_AGENT_ENABLE_TICK="${STOCK_AGENT_ENABLE_TICK:-0}"', script)
 
     def test_runtime_scripts_load_ignored_environment_file_without_private_defaults(self) -> None:
