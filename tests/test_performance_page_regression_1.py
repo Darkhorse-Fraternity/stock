@@ -12,6 +12,7 @@ class PerformancePageMobileRegressionTests(unittest.TestCase):
         self.assertIn(".metric{min-width:0", page)
         self.assertIn("main{width:100%;margin:0;overflow:hidden}", page)
         self.assertIn(".metric strong{font-size:clamp(19px,5.5vw,24px);white-space:nowrap}", page)
+        self.assertIn("font:700 clamp(22px,2.2vw,30px) Georgia,serif;white-space:nowrap", page)
 
 
 if __name__ == "__main__":
