@@ -8,9 +8,10 @@ from .context import generate_agent_context
 from .data_sources import fetch_board_quotes
 from .delivery import should_deliver_report
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
+from .portfolio import format_action_notifications, format_portfolio_summary, monitor_portfolio
 from .reports import append_performance_link, generate_ai_report, generate_report
 from .schedule import parse_publish_hours, should_publish_now
-from .tracking import TRACKING_HEADER, generate_saved_tracking_report, save_daily_selection
+from .tracking import save_daily_selection
 from .universe import normalize_sector_filters, parse_watchlist
 
 
@@ -29,6 +30,11 @@ def main() -> None:
     board_name = os.getenv("STOCK_AGENT_BOARD_NAME") or str(parameter_value(strategy, "board_name", DEFAULT_BOARD_NAME))
     state_path = os.getenv("STOCK_AGENT_STATE_PATH", "/tmp/stock-agent-daily-selection.json")
     history_path = os.getenv("STOCK_AGENT_HISTORY_PATH", "data/recommendation_history.json")
+    portfolio_path = os.getenv("STOCK_AGENT_PORTFOLIO_PATH", "data/strategy_portfolios.json")
+    performance_url = os.getenv("STOCK_AGENT_PERFORMANCE_URL", "")
+    if performance_url and strategy.get("id"):
+        separator = "&" if "?" in performance_url else "?"
+        performance_url = f"{performance_url}{separator}strategy_id={strategy['id']}"
     watchlist_raw = os.getenv("STOCK_AGENT_WATCHLIST")
     watchlist = parse_watchlist(watchlist_raw) if watchlist_raw is not None else parameter_value(strategy, "watchlist", [])
     sector_raw = os.getenv("STOCK_AGENT_SECTOR_FILTERS") or os.getenv("STOCK_AGENT_SECTORS")
@@ -37,7 +43,11 @@ def main() -> None:
     )
     universe_options = {"watchlist": watchlist, "sector_filters": sector_filters}
     if mode == "track":
-        report = generate_saved_tracking_report(state_path=state_path, history_path=history_path)
+        account, _, quote_error = monitor_portfolio(strategy, path=portfolio_path)
+        report = format_portfolio_summary(account, performance_url=performance_url, quote_error=quote_error)
+    elif mode == "risk":
+        account, events, _ = monitor_portfolio(strategy, path=portfolio_path)
+        report = format_action_notifications(account, events, performance_url=performance_url) if events else ""
     elif mode == "data":
         report = generate_agent_context(
             board_code=board_code,
@@ -78,15 +88,18 @@ def main() -> None:
             board_name=board_name,
             benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
             history_path=history_path,
+            portfolio_path=portfolio_path,
         )
-    if mode in {"ai", "report", "track"}:
-        report = append_performance_link(report, os.getenv("STOCK_AGENT_PERFORMANCE_URL", ""))
+    if mode in {"ai", "report"}:
+        report = append_performance_link(report, performance_url)
+    if not report:
+        return
     output = os.getenv("STOCK_AGENT_OUTPUT", "/data/stock_recommendation.md")
     if output:
         path = Path(output).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(report, encoding="utf-8")
-    delivery_allowed = TRACKING_HEADER in report if mode == "track" else should_deliver_report(report, strategy)
+    delivery_allowed = mode in {"track", "risk"} or should_deliver_report(report, strategy)
     if os.getenv("STOCK_AGENT_DELIVERY_RUN", "0") != "1" or delivery_allowed:
         print(report)
 

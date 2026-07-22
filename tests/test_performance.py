@@ -59,6 +59,47 @@ class RecommendationPerformanceTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["average_return_pct"], 0)
         self.assertEqual(payload["summary"]["best"]["symbol"], "300001")
         self.assertEqual(payload["summary"]["worst"]["symbol"], "300002")
+        self.assertEqual(payload["summary"]["strategy_count"], 1)
+        self.assertEqual(payload["strategies"][0]["name"], "科技 AI")
+        self.assertEqual(payload["strategies"][0]["revision"], 1)
+        self.assertEqual(payload["strategies"][0]["recommendations"], 2)
+
+    def test_performance_identifies_multiple_strategies(self):
+        now = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "history.json"
+            for strategy_id, strategy_name, symbol in (
+                ("strategy-1", "科技 AI", "300001"),
+                ("strategy-2", "成长股", "300002"),
+            ):
+                upsert_recommendation_history(
+                    {
+                        "trade_date": "2026-07-20",
+                        "generated_at": "2026-07-20 08:00:00 CST",
+                        "strategy_id": strategy_id,
+                        "strategy_name": strategy_name,
+                        "strategy_revision": 2,
+                        "strategy_stage": "paper",
+                        "recommendations": [{"symbol": symbol, "name": symbol, "entry_price": 100}],
+                    },
+                    path=path,
+                    now=now,
+                )
+
+            payload = build_recommendation_performance(
+                days=30,
+                path=path,
+                now=now,
+                quote_fetcher=lambda entries: (
+                    [{"symbol": item["symbol"], "name": item["symbol"], "price": 105} for item in entries],
+                    None,
+                ),
+            )
+
+        self.assertEqual(payload["summary"]["strategy_count"], 2)
+        self.assertEqual({item["name"] for item in payload["strategies"]}, {"科技 AI", "成长股"})
+        self.assertTrue(all(item["revision"] == 2 for item in payload["strategies"]))
+        self.assertTrue(all(item["stage"] == "paper" for item in payload["strategies"]))
 
     def test_repeated_stock_uses_first_recommendation_price_for_success_rate(self):
         now = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
@@ -126,7 +167,7 @@ class RecommendationPerformanceTests(unittest.TestCase):
         url = "http://192.168.3.216:8765/performance"
         report = append_performance_link("模拟盘报告", url)
 
-        self.assertIn(f"[查看近 30 天推荐表现]({url})", report)
+        self.assertIn(f"[查看策略表现]({url})", report)
         self.assertEqual(append_performance_link(report, url), report)
 
 

@@ -9,6 +9,7 @@ from typing import Callable
 from .data_sources import fetch_board_quotes, fetch_watchlist_quotes
 from .parameters import record_paper_session
 from .performance import upsert_recommendation_history
+from .portfolio import plan_daily_candidates
 from .reports import format_recommendation_snapshot
 from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
@@ -77,6 +78,7 @@ def save_daily_selection(
     board_name: str = "人工智能",
     benchmark_fetcher: Callable | None = None,
     history_path: str | Path | None = None,
+    portfolio_path: str | Path | None = None,
 ) -> list[str]:
     entries = extract_recommendation_entries(report)
     symbols = [item["symbol"] for item in entries] or extract_recommended_symbols(report)
@@ -129,6 +131,15 @@ def save_daily_selection(
             record_paper_session(payload["strategy_id"], payload["trade_date"])
         except Exception as exc:
             payload["paper_session_error"] = str(exc)[:500]
+            _save_state(target, payload)
+    if payload["strategy_id"] and (strategy or {}).get("portfolio", {}).get("enabled", True):
+        try:
+            account, events = plan_daily_candidates(strategy or {}, entries, now=current, path=portfolio_path)
+            payload["portfolio_account_id"] = account.get("id")
+            payload["portfolio_event_ids"] = [event.get("id") for event in events]
+            _save_state(target, payload)
+        except Exception as exc:
+            payload["portfolio_plan_error"] = str(exc)[:500]
             _save_state(target, payload)
     if history_path is not None:
         try:

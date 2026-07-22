@@ -33,6 +33,15 @@ from stock_recommender.data_sources import (
 )
 from stock_recommender.llm import call_llm_analysis
 from stock_recommender.parameters import create_strategy_revision, transition_strategy_stage
+from stock_recommender.pipeline import PipelineContractError, PipelineRunner, PipelineStage, StageInput, StageOutput
+from stock_recommender.portfolio import (
+    build_strategy_performance,
+    format_action_notifications,
+    format_portfolio_summary,
+    load_portfolio_account,
+    monitor_portfolio,
+    plan_daily_candidates,
+)
 from stock_recommender.reports import (
     append_candidate_explanation,
     apply_risk_guard,
@@ -92,6 +101,12 @@ __all__ = [
     "MIN_FLOAT_MARKET_CAP",
     "STATIC_FALLBACK",
     "TRACKING_HEADER",
+    "PipelineContractError",
+    "PipelineRunner",
+    "PipelineStage",
+    "StageInput",
+    "StageOutput",
+    "build_strategy_performance",
     "create_strategy_revision",
     "deflated_sharpe_probability",
     "akshare_symbol",
@@ -116,6 +131,8 @@ __all__ = [
     "filter_candidates",
     "filter_rows_by_sector",
     "format_cny",
+    "format_action_notifications",
+    "format_portfolio_summary",
     "format_recommendation_snapshot",
     "format_volume_hands",
     "generate_saved_tracking_report",
@@ -141,8 +158,11 @@ __all__ = [
     "extract_recommended_symbols",
     "load_daily_selection",
     "load_daily_selection_state",
+    "load_portfolio_account",
     "list_backtests",
     "run_walk_forward_backtest",
+    "monitor_portfolio",
+    "plan_daily_candidates",
     "save_daily_selection",
     "should_publish_now",
     "start_backtest",

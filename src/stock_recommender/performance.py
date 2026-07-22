@@ -179,6 +179,38 @@ def build_recommendation_performance(
             )
     events.sort(key=lambda item: (str(item.get("trade_date") or ""), -int(item.get("rank") or 0)), reverse=True)
 
+    strategies_by_key: dict[tuple[str, int], dict] = {}
+    for event in events:
+        strategy_id = str(event.get("strategy_id") or "")
+        revision = int(event.get("strategy_revision") or 1)
+        key = (strategy_id or str(event.get("strategy_name") or "股票推荐策略"), revision)
+        strategy = strategies_by_key.setdefault(
+            key,
+            {
+                "id": strategy_id or None,
+                "name": event.get("strategy_name") or "股票推荐策略",
+                "revision": revision,
+                "stage": event.get("strategy_stage") or "draft",
+                "recommendations": 0,
+                "first_recommended_date": event.get("trade_date"),
+                "last_recommended_date": event.get("trade_date"),
+            },
+        )
+        strategy["recommendations"] += 1
+        strategy["first_recommended_date"] = min(
+            str(strategy.get("first_recommended_date") or event.get("trade_date") or ""),
+            str(event.get("trade_date") or ""),
+        )
+        strategy["last_recommended_date"] = max(
+            str(strategy.get("last_recommended_date") or event.get("trade_date") or ""),
+            str(event.get("trade_date") or ""),
+        )
+    strategies = sorted(
+        strategies_by_key.values(),
+        key=lambda item: (str(item.get("last_recommended_date") or ""), str(item.get("name") or "")),
+        reverse=True,
+    )
+
     stocks_by_symbol: dict[str, dict] = {}
     for event in sorted(events, key=lambda item: (str(item.get("trade_date") or ""), str(item.get("generated_at") or ""), int(item.get("rank") or 0))):
         symbol = event["symbol"]
@@ -247,7 +279,9 @@ def build_recommendation_performance(
         "data_start": min((item.get("trade_date") for item in events), default=None),
         "data_end": max((item.get("trade_date") for item in events), default=None),
         "quote_error": quote_error,
+        "strategies": strategies,
         "summary": {
+            "strategy_count": len(strategies),
             "recommendation_days": len({item.get("trade_date") for item in events}),
             "total_recommendations": len(events),
             "unique_stocks": len(stocks),

@@ -30,7 +30,7 @@ from .parameters import (
     strategy_library_payload,
     transition_strategy_stage,
 )
-from .performance import build_recommendation_performance
+from .portfolio import build_strategy_performance
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
 
@@ -96,11 +96,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             self._send_json(health_payload())
             return
         if path == "/api/performance":
-            try:
-                days = int((parse_qs(request.query).get("days") or ["30"])[0])
-            except ValueError:
-                days = 30
-            self._send_json(build_recommendation_performance(days=days))
+            strategy_id = (parse_qs(request.query).get("strategy_id") or [None])[0]
+            self._send_json(build_strategy_performance(strategy_id=strategy_id))
             return
         run_id = self._run_route(path)
         if run_id:
@@ -124,10 +121,16 @@ class AdminHandler(BaseHTTPRequestHandler):
         if strategy_id and action == "backtests":
             self._send_json({"backtests": list_backtests(strategy_id)})
             return
+        if strategy_id and action == "portfolio":
+            if find_strategy_config(strategy_id) is None:
+                self._send_json({"error": "策略不存在"}, status=HTTPStatus.NOT_FOUND)
+                return
+            self._send_json(build_strategy_performance(strategy_id=strategy_id))
+            return
         if path == "/":
             self._send_file(WEB_ROOT / "index.html")
             return
-        if path in {"/performance", "/performance/"}:
+        if path in {"/performance", "/performance/"} or self._portfolio_page_route(path):
             self._send_file(WEB_ROOT / "performance.html")
             return
         static_path = (WEB_ROOT / path.lstrip("/")).resolve()
@@ -302,6 +305,11 @@ class AdminHandler(BaseHTTPRequestHandler):
         if len(parts) == 3 and parts[:2] == ["api", "runs"]:
             return parts[2]
         return None
+
+    @staticmethod
+    def _portfolio_page_route(path: str) -> bool:
+        parts = [part for part in path.split("/") if part]
+        return len(parts) == 3 and parts[0] == "strategies" and parts[2] == "portfolio"
 
     @staticmethod
     def _backtest_route(path: str) -> str | None:

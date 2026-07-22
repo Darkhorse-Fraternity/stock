@@ -8,6 +8,8 @@ from .parameters import load_strategy_config, normalize_report_delivery
 
 
 PLATFORM_CHANNELS = {"feishu", "telegram", "discord", "signal"}
+PORTFOLIO_TRACKING_CRON = "0 2,3,5,6,7 * * 1-5"
+PORTFOLIO_RISK_CRON = "*/5 1-7 * * 1-5"
 
 
 def delivery_target(config: dict) -> str:
@@ -51,13 +53,21 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
         return {"status": "unavailable", "message": "未配置 Hermes job id"}
     delivery = normalize_report_delivery(config.get("delivery"))
     execute = runner or subprocess.run
+    auxiliary_jobs = [
+        ("tracking", os.getenv("STOCK_AGENT_HERMES_TRACKING_JOB_ID", "").strip(), PORTFOLIO_TRACKING_CRON),
+        ("risk", os.getenv("STOCK_AGENT_HERMES_RISK_JOB_ID", "").strip(), PORTFOLIO_RISK_CRON),
+    ]
     try:
         if not delivery["enabled"]:
-            command = [hermes_bin, "cron", "pause", job_id]
-            completed = execute(command, capture_output=True, text=True, timeout=15)
-            if completed.returncode != 0:
-                raise RuntimeError((completed.stderr or completed.stdout).strip())
-            return {"status": "paused", "job_id": job_id, "message": "报告推送已暂停"}
+            paused = []
+            for _, target_job_id, _ in [("daily", job_id, ""), *auxiliary_jobs]:
+                if not target_job_id:
+                    continue
+                completed = execute([hermes_bin, "cron", "pause", target_job_id], capture_output=True, text=True, timeout=15)
+                if completed.returncode != 0:
+                    raise RuntimeError((completed.stderr or completed.stdout).strip())
+                paused.append(target_job_id)
+            return {"status": "paused", "job_id": job_id, "jobs": paused, "message": "策略通知任务已暂停"}
 
         target = delivery_target(config)
         schedule = delivery_cron(config)
@@ -72,12 +82,30 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
         resume = execute([hermes_bin, "cron", "resume", job_id], capture_output=True, text=True, timeout=15)
         if resume.returncode != 0 and "already" not in (resume.stderr or resume.stdout).lower():
             raise RuntimeError((resume.stderr or resume.stdout).strip())
+        synced_jobs = [{"kind": "daily", "job_id": job_id, "schedule": schedule}]
+        if config.get("portfolio", {}).get("enabled", True):
+            for kind, target_job_id, target_schedule in auxiliary_jobs:
+                if not target_job_id:
+                    continue
+                edit = execute(
+                    [hermes_bin, "cron", "edit", target_job_id, "--schedule", target_schedule, "--deliver", target],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                if edit.returncode != 0:
+                    raise RuntimeError((edit.stderr or edit.stdout).strip())
+                resume = execute([hermes_bin, "cron", "resume", target_job_id], capture_output=True, text=True, timeout=15)
+                if resume.returncode != 0 and "already" not in (resume.stderr or resume.stdout).lower():
+                    raise RuntimeError((resume.stderr or resume.stdout).strip())
+                synced_jobs.append({"kind": kind, "job_id": target_job_id, "schedule": target_schedule})
         return {
             "status": "synced",
             "job_id": job_id,
             "schedule": schedule,
             "deliver": target,
-            "message": "报告推送已同步",
+            "jobs": synced_jobs,
+            "message": f"策略通知任务已同步（{len(synced_jobs)} 个）",
         }
     except Exception as exc:
         return {"status": "error", "job_id": job_id, "message": str(exc)[:1000]}

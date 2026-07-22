@@ -4,3 +4,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 data/
+.gstack/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo

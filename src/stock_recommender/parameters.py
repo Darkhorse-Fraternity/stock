@@ -172,8 +172,8 @@ def default_report_delivery(*, legacy: bool = False) -> dict:
         "enabled": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_ENABLED", "1" if legacy else "0") == "1",
         "channel": channel if channel in DELIVERY_CHANNELS else "feishu",
         "target": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_TARGET", "")[:200],
-        "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 9))),
-        "minute": min(59, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_MINUTE", 35))),
+        "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 8))),
+        "minute": min(59, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_MINUTE", 0))),
         "frequency": frequency if frequency in DELIVERY_FREQUENCIES else "weekdays",
         "push_on_empty": True,
         "push_on_error": True,
@@ -316,6 +316,79 @@ def normalize_validation_config(value: object) -> dict:
     return normalized
 
 
+def default_portfolio_config() -> dict:
+    return {
+        "enabled": True,
+        "initial_cash": 1_000_000.0,
+        "max_positions": 10,
+        "target_weight_pct": 10.0,
+        "stop_loss_pct": 8.0,
+        "trailing_activation_pct": 10.0,
+        "trailing_drawdown_pct": 5.0,
+        "signal_invalid_days": 2,
+        "replacement_score_delta": 0.10,
+        "replacement_cost_multiple": 3.0,
+        "warning_drawdown_pct": 12.0,
+        "derisk_drawdown_pct": 14.0,
+        "halt_drawdown_pct": 15.0,
+        "warning_max_exposure_pct": 70.0,
+        "commission_rate_pct": 0.03,
+        "minimum_commission_cny": 5.0,
+        "stamp_duty_rate_pct": 0.05,
+        "transfer_fee_rate_pct": 0.001,
+        "slippage_bps": 10.0,
+        "max_bar_participation_pct": 5.0,
+        "benchmark_symbol": "000300",
+        "benchmark_name": "沪深 300 全收益",
+    }
+
+
+def normalize_portfolio_config(value: object) -> dict:
+    normalized = default_portfolio_config()
+    if not isinstance(value, dict):
+        return normalized
+    normalized["enabled"] = bool(value.get("enabled", normalized["enabled"]))
+    integer_fields = {
+        "max_positions": (1, 10),
+        "signal_invalid_days": (1, 20),
+    }
+    float_fields = {
+        "initial_cash": (10_000.0, 1_000_000_000.0),
+        "target_weight_pct": (0.1, 10.0),
+        "stop_loss_pct": (0.1, 50.0),
+        "trailing_activation_pct": (0.1, 100.0),
+        "trailing_drawdown_pct": (0.1, 50.0),
+        "replacement_score_delta": (0.0, 1.0),
+        "replacement_cost_multiple": (0.0, 20.0),
+        "warning_drawdown_pct": (0.1, 99.0),
+        "derisk_drawdown_pct": (0.1, 99.0),
+        "halt_drawdown_pct": (0.1, 100.0),
+        "warning_max_exposure_pct": (0.0, 100.0),
+        "commission_rate_pct": (0.0, 5.0),
+        "minimum_commission_cny": (0.0, 1_000.0),
+        "stamp_duty_rate_pct": (0.0, 5.0),
+        "transfer_fee_rate_pct": (0.0, 1.0),
+        "slippage_bps": (0.0, 500.0),
+        "max_bar_participation_pct": (0.1, 100.0),
+    }
+    for field, (minimum, maximum) in integer_fields.items():
+        try:
+            normalized[field] = min(maximum, max(minimum, int(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    for field, (minimum, maximum) in float_fields.items():
+        try:
+            normalized[field] = min(maximum, max(minimum, float(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    warning = normalized["warning_drawdown_pct"]
+    normalized["derisk_drawdown_pct"] = max(warning, normalized["derisk_drawdown_pct"])
+    normalized["halt_drawdown_pct"] = max(normalized["derisk_drawdown_pct"], normalized["halt_drawdown_pct"])
+    normalized["benchmark_symbol"] = str(value.get("benchmark_symbol") or normalized["benchmark_symbol"]).strip()[:32]
+    normalized["benchmark_name"] = str(value.get("benchmark_name") or normalized["benchmark_name"]).strip()[:80]
+    return normalized
+
+
 def default_strategy_config() -> dict:
     return {
         "version": 3,
@@ -328,6 +401,7 @@ def default_strategy_config() -> dict:
         "updated_at": None,
         "lifecycle": default_strategy_lifecycle(),
         "validation": default_validation_config(),
+        "portfolio": default_portfolio_config(),
         "delivery": default_report_delivery(),
         "parameters": {
             item["id"]: {"enabled": item["default_enabled"], "value": deepcopy(item["default"])}
@@ -355,6 +429,7 @@ def normalize_strategy_config(config: dict | None) -> dict:
     normalized["updated_at"] = config.get("updated_at")
     normalized["lifecycle"] = normalize_strategy_lifecycle(config.get("lifecycle"))
     normalized["validation"] = normalize_validation_config(config.get("validation"))
+    normalized["portfolio"] = normalize_portfolio_config(config.get("portfolio"))
     normalized["delivery"] = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
     provided = config.get("parameters")
     if not isinstance(provided, dict):
@@ -477,7 +552,7 @@ def save_strategy_config(config: dict, path: str | Path | None = None, strategy_
     for index, existing in enumerate(store["strategies"]):
         if existing["id"] != target_id:
             continue
-        changed_model = normalized["parameters"] != existing["parameters"] or any(
+        changed_model = normalized["parameters"] != existing["parameters"] or normalized["portfolio"] != existing.get("portfolio") or any(
             normalized["validation"].get(key) != existing["validation"].get(key)
             for key in default_validation_config()
             if key not in {"last_backtest", "approval_gate"}

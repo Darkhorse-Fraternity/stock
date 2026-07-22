@@ -16,7 +16,7 @@ def append_performance_link(report: str, url: str) -> str:
     target = str(url or "").strip()
     if not target or target in report:
         return report
-    return f"{report.rstrip()}\n\n📊 [查看近 30 天推荐表现]({target})"
+    return f"{report.rstrip()}\n\n📊 [查看策略表现]({target})"
 
 
 def decorate_strategy_output(report: str, strategy: dict | None) -> str:
@@ -31,7 +31,10 @@ def decorate_strategy_output(report: str, strategy: dict | None) -> str:
         "paused": "⏸️ **已暂停策略输出**",
         "archived": "📦 **已归档策略输出**",
     }
-    version = f"策略版本：v{strategy.get('revision', 1)} · {stage}"
+    version = (
+        f"使用策略：{strategy.get('name') or strategy.get('id')} ({strategy.get('id')}) · "
+        f"策略版本：v{strategy.get('revision', 1)} · {stage}"
+    )
     return f"{labels.get(stage, labels['draft'])}\n{version}\n\n{report}"
 
 
