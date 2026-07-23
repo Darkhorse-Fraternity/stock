@@ -92,7 +92,7 @@ class HermesScriptRegressionTests(unittest.TestCase):
                 f"{app_dir}|fixture-model|ai",
             )
 
-    def test_ai_script_finds_checkout_when_started_through_runtime_symlink(self) -> None:
+    def test_installed_runtime_launcher_stays_inside_hermes_scripts_directory(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             app_dir = root / "stock-agent"
@@ -100,7 +100,6 @@ class HermesScriptRegressionTests(unittest.TestCase):
             scripts_dir = app_dir / "scripts"
             runtime_dir = root / "hermes" / "scripts"
             source_dir.mkdir(parents=True)
-            scripts_dir.mkdir(parents=True)
             runtime_dir.mkdir(parents=True)
             (source_dir / "stock_agent.py").write_text("", encoding="utf-8")
 
@@ -112,14 +111,32 @@ class HermesScriptRegressionTests(unittest.TestCase):
             fake_python.chmod(0o755)
             (app_dir / ".env").write_text(
                 f"STOCK_AGENT_PYTHON={fake_python}\n"
-                "STOCK_AGENT_LLM_MODEL=symlink-model\n",
+                "STOCK_AGENT_LLM_MODEL=runtime-model\n",
                 encoding="utf-8",
             )
 
-            installed_script = scripts_dir / "hermes-ai-run.sh"
-            shutil.copy2(ROOT / "scripts" / "hermes-ai-run.sh", installed_script)
+            shutil.copytree(ROOT / "scripts", scripts_dir)
+            result = subprocess.run(
+                [str(scripts_dir / "install-hermes-launchers.sh")],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": os.environ["PATH"],
+                    "HERMES_SCRIPTS_DIR": str(runtime_dir),
+                },
+            )
+
             runtime_script = runtime_dir / "hermes-ai-run.sh"
-            runtime_script.symlink_to(installed_script)
+            self.assertIn(str(runtime_dir), result.stdout)
+            self.assertFalse(runtime_script.is_symlink())
+            self.assertEqual(runtime_script.resolve().parent, runtime_dir.resolve())
+
+            app_dir_pointer = runtime_dir / "stock-agent-app-dir"
+            self.assertEqual(
+                app_dir_pointer.read_text(encoding="utf-8").strip(), str(app_dir.resolve())
+            )
+            self.assertEqual(app_dir_pointer.stat().st_mode & 0o777, 0o600)
 
             result = subprocess.run(
                 [str(runtime_script)],
@@ -127,13 +144,22 @@ class HermesScriptRegressionTests(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 env={"PATH": os.environ["PATH"]},
+                cwd=runtime_dir,
             )
 
             self.assertEqual(
                 result.stdout.strip(),
-                f"{app_dir.resolve()}|symlink-model|ai",
+                f"{app_dir.resolve()}|runtime-model|ai",
             )
 
+            for name in (
+                "hermes-agent-data-run.sh",
+                "hermes-portfolio-risk-run.sh",
+                "hermes-tracking-run.sh",
+            ):
+                installed = runtime_dir / name
+                self.assertTrue(installed.is_file())
+                self.assertFalse(installed.is_symlink())
 
 if __name__ == "__main__":
     unittest.main()

@@ -250,14 +250,25 @@ STOCK_AGENT_LLM_MODEL=your-model \
 PYTHONPATH=src python3 src/stock_agent.py
 ```
 
-Or copy `scripts/hermes-ai-run.sh` and `scripts/hermes-tracking-run.sh` into
-`~/.hermes/scripts/`. Configure both as `no-agent` jobs with the two cron
-expressions above. The scripts share `/tmp/stock-agent-daily-selection.json` by
-default, so hourly tracking always follows the 09:35 recommendation list.
+Install regular runtime launchers into Hermes' allowed scripts directory:
+
+```bash
+scripts/install-hermes-launchers.sh
+```
+
+Configure each `no-agent` cron job with `--workdir` set to the stock-agent
+checkout. Do not symlink files into `~/.hermes/scripts/`: Hermes resolves the
+scheduled path and rejects links whose target is outside that directory. The
+installer records the checkout in a plain `stock-agent-app-dir` pointer file.
+The runtime launchers stay inside the allowed directory, read that pointer, and
+delegate to the matching versioned script. Re-run the installer after moving the
+checkout. The daily and tracking scripts
+share `/tmp/stock-agent-daily-selection.json` by default, so hourly tracking
+always follows the 09:35 recommendation list.
 
 Alternative setup is a Hermes agent-driven cron job:
 
-1. Copy `scripts/hermes-agent-data-run.sh` into `~/.hermes/scripts/`.
+1. Run `scripts/install-hermes-launchers.sh`.
 2. Create or edit a Hermes cron job with `--script hermes-agent-data-run.sh`.
 3. Keep `no_agent` disabled so Hermes injects the script output into the prompt.
 4. Use `prompts/hermes-stock-analysis.md` as the job prompt.
