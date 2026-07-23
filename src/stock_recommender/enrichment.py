@@ -7,7 +7,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from typing import Callable, Iterable
 
+from .market_history import fetch_daily_history_with_cache
 from .parameters import load_strategy_config
+from .signal_engine import extract_signal_features, normalize_signal_history
 
 
 TECHNICAL_PARAMETER_IDS = {
@@ -184,21 +186,97 @@ def normalize_financial_snapshot(record: dict, *, total_market_cap: float = 0.0)
     return result
 
 
-def fetch_daily_history(symbol: str) -> list[dict]:
-    import akshare as ak
-
-    frame = ak.stock_zh_a_hist(
-        symbol=str(symbol),
-        period="daily",
-        start_date="19700101",
-        end_date="20500101",
-        adjust="qfq",
-        timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
-    )
+def _history_rows(frame) -> list[dict]:
     return [
-        {"date": row.get("日期"), "close": row.get("收盘"), "high": row.get("最高")}
+        {
+            "date": row.get("日期", row.get("date")),
+            "open": row.get("开盘", row.get("open")),
+            "close": row.get("收盘", row.get("close")),
+            "high": row.get("最高", row.get("high")),
+            "low": row.get("最低", row.get("low")),
+            "volume": row.get("成交量", row.get("volume")),
+            "turnover": row.get("成交额", row.get("amount")),
+        }
         for _, row in frame.iterrows()
     ]
+
+
+def _download_daily_history(symbol: str) -> list[dict]:
+    import akshare as ak
+
+    normalized_symbol = str(symbol)
+    try:
+        primary = ak.stock_zh_a_hist(
+            symbol=normalized_symbol,
+            period="daily",
+            start_date="19700101",
+            end_date="20500101",
+            adjust="qfq",
+            timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
+        )
+        rows = _history_rows(primary)
+        if rows:
+            return rows
+        raise RuntimeError("东方财富日线返回空数据")
+    except Exception as primary_error:
+        prefix = "sh" if normalized_symbol.startswith("6") else "bj" if normalized_symbol.startswith(("4", "8")) else "sz"
+        try:
+            fallback = ak.stock_zh_a_daily(
+                symbol=f"{prefix}{normalized_symbol}",
+                start_date="19700101",
+                end_date="20500101",
+                adjust="qfq",
+            )
+            rows = _history_rows(fallback)
+            if rows:
+                return rows
+            raise RuntimeError("新浪日线返回空数据")
+        except Exception as fallback_error:
+            raise RuntimeError(
+                f"东方财富与新浪日线均不可用：{primary_error}; {fallback_error}"
+            ) from fallback_error
+
+
+def fetch_daily_history(
+    symbol: str,
+    *,
+    cache_dir=None,
+    cache_ttl_seconds: float | None = None,
+    attempts: int | None = None,
+    backoff_seconds: float | None = None,
+    downloader: Callable[[str], Iterable[dict]] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    now: datetime | None = None,
+) -> list[dict]:
+    ttl = (
+        float(cache_ttl_seconds)
+        if cache_ttl_seconds is not None
+        else float(os.getenv("STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS", str(6 * 60 * 60)))
+    )
+    maximum_attempts = (
+        int(attempts)
+        if attempts is not None
+        else int(os.getenv("STOCK_AGENT_HISTORY_FETCH_ATTEMPTS", "3"))
+    )
+    backoff = (
+        float(backoff_seconds)
+        if backoff_seconds is not None
+        else float(os.getenv("STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS", "1"))
+    )
+    loader = downloader or _download_daily_history
+    options = {}
+    if sleep is not None:
+        options["sleep"] = sleep
+    return fetch_daily_history_with_cache(
+        symbol,
+        lambda: loader(symbol),
+        cache_dir=cache_dir,
+        cache_ttl_seconds=ttl,
+        attempts=maximum_attempts,
+        backoff_seconds=backoff,
+        now=now,
+        **options,
+    )
 
 
 def _financial_symbol(symbol: str) -> str:
@@ -231,27 +309,38 @@ def enrich_candidates(
     history_fetcher: Callable[[str], list[dict]] | None = None,
     financial_fetcher: Callable[[str], dict] | None = None,
     limit: int | None = None,
+    signal_cutoff: date | datetime | str | None = None,
 ) -> list[dict]:
     current = strategy or load_strategy_config()
     needs_technical = _requires(current, TECHNICAL_PARAMETER_IDS)
     needs_financial = _requires(current, FINANCIAL_PARAMETER_IDS)
     candidates = [dict(row) for row in rows]
-    if not needs_technical and not needs_financial:
-        return candidates
 
-    maximum = limit if limit is not None else int(os.getenv("STOCK_AGENT_ENRICH_LIMIT", "12"))
+    maximum = limit if limit is not None else int(os.getenv("STOCK_AGENT_SIGNAL_UNIVERSE_LIMIT", "30"))
     target_count = min(len(candidates), max(0, maximum))
     history_client = history_fetcher or fetch_daily_history
     financial_client = financial_fetcher or fetch_financial_record
+    signal_config = current.get("signal", {})
+    minimum_history_rows = int(signal_config.get("minimum_history_rows", 61))
 
     def enrich(index: int) -> tuple[int, dict]:
         row = dict(candidates[index])
         errors = []
-        if needs_technical:
-            try:
-                row.update(calculate_technical_indicators(history_client(row["symbol"])))
-            except Exception as exc:
-                errors.append(f"technical: {exc}")
+        try:
+            history = history_client(row["symbol"])
+            signal_history = normalize_signal_history(history, cutoff=signal_cutoff)
+            features = extract_signal_features(
+                signal_history,
+                minimum_rows=minimum_history_rows,
+            )
+            if features is None:
+                errors.append(f"signal: 有效历史不足 {minimum_history_rows} 行")
+            else:
+                row["signal_features"] = features
+            if needs_technical:
+                row.update(calculate_technical_indicators(signal_history))
+        except Exception as exc:
+            errors.append(f"signal: {exc}")
         if needs_financial:
             try:
                 record = financial_client(row["symbol"])

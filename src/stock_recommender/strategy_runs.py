@@ -86,6 +86,7 @@ def run_strategy_command(strategy_id: str) -> str:
     env.update(
         {
             "STOCK_AGENT_MODE": os.getenv("STOCK_AGENT_RUN_MODE", "ai"),
+            "STOCK_AGENT_EXECUTION_KIND": "preview",
             "STOCK_AGENT_STRATEGY_ID": strategy_id,
             "STOCK_AGENT_OUTPUT": "",
             "STOCK_AGENT_CANDIDATE_LIMIT": os.getenv("STOCK_AGENT_CANDIDATE_LIMIT", "6"),

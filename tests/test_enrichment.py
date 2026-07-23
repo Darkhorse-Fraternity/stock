@@ -1,8 +1,12 @@
 import math
+import sys
 import unittest
 from datetime import date, timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from stock_recommender.enrichment import (
+    _download_daily_history,
     calculate_technical_indicators,
     enrich_candidates,
     normalize_financial_snapshot,
@@ -17,6 +21,40 @@ def history(closes):
 
 
 class EnrichmentTests(unittest.TestCase):
+    def test_daily_history_falls_back_to_sina_after_eastmoney_failure(self):
+        class Frame:
+            def iterrows(self):
+                return iter(
+                    [
+                        (
+                            0,
+                            {
+                                "date": date(2026, 7, 21),
+                                "open": 10,
+                                "close": 10.5,
+                                "high": 10.8,
+                                "low": 9.9,
+                                "volume": 1000,
+                                "amount": 10500,
+                            },
+                        )
+                    ]
+                )
+
+        calls = []
+        fake_akshare = SimpleNamespace(
+            stock_zh_a_hist=lambda **kwargs: (_ for _ in ()).throw(ConnectionError("eastmoney unavailable")),
+            stock_zh_a_daily=lambda **kwargs: calls.append(kwargs) or Frame(),
+        )
+
+        with patch.dict(sys.modules, {"akshare": fake_akshare}):
+            rows = _download_daily_history("002230")
+
+        self.assertEqual(calls[0]["symbol"], "sz002230")
+        self.assertEqual(calls[0]["adjust"], "qfq")
+        self.assertEqual(rows[0]["date"], date(2026, 7, 21))
+        self.assertEqual(rows[0]["turnover"], 10500)
+
     def test_technical_indicators_cover_trend_momentum_and_risk(self):
         rows = history([10 + index * 0.1 for index in range(260)])
 

@@ -16,6 +16,7 @@ analysis = ["akshare>=1.18.64"]
 [project.scripts]
 stock-agent = "stock_recommender.cli:main"
 stock-agent-admin = "stock_recommender.admin:main"
+stock-backtest-data = "stock_recommender.historical_data_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

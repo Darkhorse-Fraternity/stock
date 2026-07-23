@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Callable, Iterable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_TIMEOUT_SECONDS, EASTMONEY_URL, STATIC_FALLBACK
+from .universe import normalize_stock_symbol, normalize_watchlist
 from .utils import number
 
 
@@ -144,12 +145,24 @@ def sina_quote_symbol(symbol: str) -> str:
 
 def fetch_sina_fallback_quotes(
     *,
-    symbols: Iterable[str] | None = None,
+    symbols: Iterable[object] | None = None,
     board_name: str = DEFAULT_BOARD_NAME,
+    source_label: str | None = None,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     urlopen_func: Callable | None = None,
 ) -> tuple[list[dict], str | None]:
-    quote_symbols = [sina_quote_symbol(item["symbol"] if isinstance(item, dict) else item) for item in (symbols or STATIC_FALLBACK)]
+    entries = list(STATIC_FALLBACK if symbols is None else symbols)
+    metadata: dict[str, dict] = {}
+    quote_symbols = []
+    for item in entries:
+        configured = dict(item) if isinstance(item, dict) else {}
+        raw_symbol = configured.get("symbol") if configured else item
+        try:
+            symbol = normalize_stock_symbol(raw_symbol)
+        except ValueError:
+            continue
+        metadata[symbol] = configured
+        quote_symbols.append(sina_quote_symbol(symbol))
     quote_symbols = [item for item in quote_symbols if re.match(r"^(sh|sz)\d{6}$", item)]
     if not quote_symbols:
         return [], "No Sina quote symbols configured"
@@ -172,13 +185,16 @@ def fetch_sina_fallback_quotes(
         return [], str(exc)
 
     quotes = []
-    source = f"新浪财经实时行情（{board_name}备用股池）"
+    source = source_label or f"新浪财经实时行情（{board_name}备用股池）"
     for match in re.finditer(r'var hq_str_(sh|sz)(\d{6})="(.*?)";', text, flags=re.S):
         symbol = match.group(2)
         fields = match.group(3).split(",")
         if len(fields) < 10:
             continue
-        name = fields[0].strip() or symbol
+        configured = metadata.get(symbol) or {}
+        name = str(configured.get("name") or fields[0].strip() or symbol)
+        sector = str(configured.get("sector") or board_name)
+        sectors = configured.get("sectors") or ([sector] if sector else [])
         open_price = number(fields[1])
         prev_close = number(fields[2])
         price = number(fields[3])
@@ -198,7 +214,8 @@ def fetch_sina_fallback_quotes(
             {
                 "symbol": symbol,
                 "name": name,
-                "sector": board_name,
+                "sector": sector,
+                "sectors": sectors,
                 "price": round(price, 2),
                 "percent": round(percent, 2),
                 "change": round(change, 2),
@@ -207,6 +224,7 @@ def fetch_sina_fallback_quotes(
                 "turnover_rate": 0.0,
                 "volume_ratio": 0.0,
                 "pe": 0.0,
+                "pb": 0.0,
                 "amplitude": round(amplitude, 2),
                 "high": round(high, 2),
                 "low": round(low, 2),
@@ -220,6 +238,24 @@ def fetch_sina_fallback_quotes(
     if not quotes:
         return [], "Sina returned no usable quote rows"
     return quotes, None
+
+
+def fetch_watchlist_quotes(
+    watchlist: Iterable[object],
+    *,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    urlopen_func: Callable | None = None,
+) -> tuple[list[dict], str | None]:
+    entries = normalize_watchlist(watchlist)
+    if not entries:
+        return [], "自选股池为空"
+    return fetch_sina_fallback_quotes(
+        symbols=entries,
+        board_name="未分类",
+        source_label="新浪财经实时行情（自选股池）",
+        timeout=timeout,
+        urlopen_func=urlopen_func,
+    )
 
 
 def akshare_symbol(symbol: str) -> str:
@@ -262,6 +298,7 @@ def fallback_quotes(now: datetime, reason: str) -> list[dict]:
                 "turnover_rate": 0.0,
                 "volume_ratio": 0.0,
                 "pe": 0.0,
+                "pb": 0.0,
                 "amplitude": 0.0,
                 "source": f"估算兜底（实时接口失败：{reason}）",
                 "time": now.strftime("%Y-%m-%d %H:%M"),

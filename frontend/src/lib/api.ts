@@ -42,6 +42,62 @@ export interface ReportDelivery {
   push_on_error: boolean
 }
 
+export interface PortfolioConfig {
+  enabled: boolean
+  initial_cash: number
+  max_positions: number
+  target_weight_pct: number
+  stop_loss_pct: number
+  trailing_activation_pct: number
+  trailing_drawdown_pct: number
+  signal_invalid_days: number
+  replacement_score_delta: number
+  replacement_cost_multiple: number
+  warning_drawdown_pct: number
+  derisk_drawdown_pct: number
+  halt_drawdown_pct: number
+  warning_max_exposure_pct: number
+  commission_rate_pct: number
+  minimum_commission_cny: number
+  stamp_duty_rate_pct: number
+  transfer_fee_rate_pct: number
+  slippage_bps: number
+  max_bar_participation_pct: number
+  benchmark_symbol: string
+  benchmark_name: string
+}
+
+export interface SignalConfig {
+  model: "factor_rank_v1"
+  run_time: string
+  data_cutoff: "previous_trading_day_close"
+  minimum_history_rows: number
+  max_hot_candidates: number
+  factor_weights: Record<string, number>
+}
+
+export interface AllocationConfig {
+  model: "trend_breadth_v1"
+  enabled: boolean
+  minimum_universe_size: number
+  breadth_threshold_pct: number
+  risk_on_min_signals: number
+  neutral_min_signals: number
+  risk_on_exposure_pct: number
+  neutral_exposure_pct: number
+  risk_off_exposure_pct: number
+  unknown_exposure_pct: number
+  minimum_candidate_momentum20_pct: number
+  minimum_candidate_trend: number
+  exit_on_risk_off: boolean
+  rebalance_to_target_exposure: boolean
+}
+
+export interface StrategyLifecycle {
+  stage: "draft" | "backtesting" | "paper" | "live" | "paused" | "archived"
+  paper_sessions: number
+}
+
 export interface DeliverySync {
   status: "synced" | "paused" | "unavailable" | "error"
   message: string
@@ -57,7 +113,12 @@ export interface StrategyConfig {
   description: string
   created_at: string | null
   updated_at: string | null
+  revision: number
+  lifecycle: StrategyLifecycle
+  signal: SignalConfig
+  allocation: AllocationConfig
   delivery: ReportDelivery
+  portfolio: PortfolioConfig
   parameters: Record<string, { enabled: boolean; value: unknown }>
 }
 
@@ -67,6 +128,10 @@ export interface StrategySummary {
   description: string
   created_at: string | null
   updated_at: string | null
+  revision: number
+  lifecycle: StrategyLifecycle
+  signal: SignalConfig
+  allocation: AllocationConfig
   active_parameters: number
   is_active: boolean
   delivery: ReportDelivery
