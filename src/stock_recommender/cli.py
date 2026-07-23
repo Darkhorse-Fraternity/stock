@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from urllib.parse import quote
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import generate_agent_context
@@ -34,10 +35,12 @@ def main() -> None:
     state_path = os.getenv("STOCK_AGENT_STATE_PATH", "/tmp/stock-agent-daily-selection.json")
     history_path = os.getenv("STOCK_AGENT_HISTORY_PATH", "data/recommendation_history.json")
     portfolio_path = os.getenv("STOCK_AGENT_PORTFOLIO_PATH", "data/strategy_portfolios.json")
-    performance_url = os.getenv("STOCK_AGENT_PERFORMANCE_URL", "")
-    if performance_url and strategy.get("id"):
-        separator = "&" if "?" in performance_url else "?"
-        performance_url = f"{performance_url}{separator}strategy_id={strategy['id']}"
+    public_url = os.getenv("STOCK_AGENT_PUBLIC_URL", "").strip().rstrip("/")
+    performance_url = (
+        f"{public_url}/strategies/{quote(str(strategy['id']), safe='')}/portfolio"
+        if public_url and strategy.get("id")
+        else ""
+    )
     watchlist_raw = os.getenv("STOCK_AGENT_WATCHLIST")
     watchlist = parse_watchlist(watchlist_raw) if watchlist_raw is not None else parameter_value(strategy, "watchlist", [])
     sector_raw = os.getenv("STOCK_AGENT_SECTOR_FILTERS") or os.getenv("STOCK_AGENT_SECTORS")

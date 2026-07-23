@@ -6,7 +6,6 @@ from pathlib import Path
 from stock_recommender.performance import (
     build_recommendation_performance,
     load_recommendation_history,
-    reconcile_recommendation_history_strategies,
     upsert_recommendation_history,
 )
 from stock_recommender.reports import append_performance_link, format_recommendation_snapshot
@@ -15,96 +14,6 @@ from recommendation_fixtures import make_recommendation_plan
 
 
 class RecommendationPerformanceTests(unittest.TestCase):
-    def test_history_strategy_reconciliation_is_auditable_and_idempotent(self):
-        now = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "history.json"
-            upsert_recommendation_history(
-                {
-                    "trade_date": "2026-07-21",
-                    "strategy_id": "retired-id",
-                    "strategy_name": "科技 AI",
-                    "recommendations": [{"symbol": "300001", "name": "测试", "entry_price": 10}],
-                },
-                path=path,
-                now=now,
-            )
-            store = {
-                "active_strategy_id": "current-id",
-                "strategies": [{"id": "current-id", "name": "科技 AI", "revision": 1}],
-            }
-
-            dry_run = reconcile_recommendation_history_strategies(store, path=path, now=now, dry_run=True)
-            migrated = reconcile_recommendation_history_strategies(store, path=path, now=now)
-            repeated = reconcile_recommendation_history_strategies(store, path=path, now=now)
-            record = load_recommendation_history(days=2, path=path, now=now)[0]
-
-        self.assertEqual(dry_run["migrated_count"], 1)
-        self.assertEqual(migrated["migrated_count"], 1)
-        self.assertEqual(repeated["migrated_count"], 0)
-        self.assertEqual(record["strategy_id"], "current-id")
-        self.assertEqual(record["legacy_strategy_id"], "retired-id")
-        self.assertEqual(record["strategy_id_migration"], "unique_strategy_name_match")
-
-    def test_history_strategy_reconciliation_leaves_ambiguous_names_unchanged(self):
-        now = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "history.json"
-            upsert_recommendation_history(
-                {
-                    "trade_date": "2026-07-21",
-                    "strategy_id": "retired-id",
-                    "strategy_name": "科技 AI",
-                    "recommendations": [{"symbol": "300001", "name": "测试", "entry_price": 10}],
-                },
-                path=path,
-                now=now,
-            )
-            store = {
-                "strategies": [
-                    {"id": "one", "name": "科技 AI"},
-                    {"id": "two", "name": "科技 AI"},
-                ]
-            }
-
-            result = reconcile_recommendation_history_strategies(store, path=path, now=now)
-            record = load_recommendation_history(days=2, path=path, now=now)[0]
-
-        self.assertEqual(result["migrated_count"], 0)
-        self.assertEqual(result["unresolved_count"], 1)
-        self.assertEqual(result["unresolved"][0]["reason"], "ambiguous_name")
-        self.assertEqual(record["strategy_id"], "retired-id")
-
-    def test_history_strategy_reconciliation_supports_audited_explicit_mapping(self):
-        now = datetime(2026, 7, 22, 8, 0, tzinfo=timezone.utc)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "history.json"
-            upsert_recommendation_history(
-                {
-                    "trade_date": "2026-07-21",
-                    "strategy_id": "retired-id",
-                    "strategy_name": "旧名称",
-                    "recommendations": [{"symbol": "300001", "name": "测试", "entry_price": 10}],
-                },
-                path=path,
-                now=now,
-            )
-            store = {"strategies": [{"id": "current-id", "name": "科技 AI"}]}
-
-            result = reconcile_recommendation_history_strategies(
-                store,
-                path=path,
-                now=now,
-                explicit_mapping={"retired-id": "current-id"},
-            )
-            record = load_recommendation_history(days=2, path=path, now=now)[0]
-
-        self.assertEqual(result["migrated_count"], 1)
-        self.assertEqual(result["migrated"][0]["reason"], "explicit_strategy_id_mapping")
-        self.assertEqual(record["strategy_id"], "current-id")
-        self.assertEqual(record["strategy_name"], "科技 AI")
-        self.assertEqual(record["legacy_strategy_id"], "retired-id")
-
     def test_history_upsert_replaces_same_strategy_day_and_builds_summary(self):
         now = datetime(2026, 7, 31, 8, 0, tzinfo=timezone.utc)
         with tempfile.TemporaryDirectory() as directory:

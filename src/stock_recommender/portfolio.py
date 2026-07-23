@@ -1090,13 +1090,12 @@ def monitor_portfolio(
     return account, [event for event in events if event.get("type") in ACTION_EVENT_TYPES], error
 
 
-def _with_event_link(base_url: str, strategy_id: str, event_id: str | None = None) -> str:
+def _with_event_link(base_url: str, event_id: str | None = None) -> str:
     target = str(base_url or "").strip()
     if not target:
         return ""
     parts = urlsplit(target)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["strategy_id"] = strategy_id
     if event_id:
         query["event"] = event_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
@@ -1118,7 +1117,7 @@ def format_action_notifications(account: dict, events: Iterable[dict], *, perfor
         line = f"- {event.get('message')}"
         if data.get("fill_price") is not None:
             line += f"；成交价 ¥{number(data.get('fill_price')):.2f}，费用 ¥{number(data.get('fees')):.2f}"
-        link = _with_event_link(performance_url, str(account.get("strategy_id") or ""), event.get("id"))
+        link = _with_event_link(performance_url, event.get("id"))
         if link:
             line += f"；[查看事件]({link})"
         lines.append(line)
@@ -1163,7 +1162,7 @@ def format_portfolio_summary(account: dict, *, performance_url: str = "", quote_
             )
     if quote_error:
         lines.extend(["", f"⚠️ 行情提示：{quote_error}"])
-    link = _with_event_link(performance_url, str(account.get("strategy_id") or ""))
+    link = _with_event_link(performance_url)
     if link:
         lines.extend(["", f"📈 [查看策略表现]({link})"])
     lines.extend(["", "模拟盘数据，仅供策略验证，不构成投资建议。"])

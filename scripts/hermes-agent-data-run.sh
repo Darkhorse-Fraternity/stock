@@ -16,7 +16,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 APP_DIR="${STOCK_AGENT_APP_DIR:-$DEFAULT_APP_DIR}"
-if [ ! -f "$APP_DIR/src/stock_agent.py" ]; then
+if [ ! -f "$APP_DIR/src/stock_recommender/cli.py" ]; then
   echo "Set STOCK_AGENT_APP_DIR to the stock-agent checkout path" >&2
   exit 2
 fi
@@ -27,4 +27,4 @@ exec env \
   STOCK_AGENT_SCHEDULE_GUARD="${STOCK_AGENT_SCHEDULE_GUARD:-1}" \
   STOCK_AGENT_PUBLISH_HOURS="${STOCK_AGENT_PUBLISH_HOURS:-9}" \
   PYTHONPATH=src \
-  python3 src/stock_agent.py
+  python3 -m stock_recommender.cli

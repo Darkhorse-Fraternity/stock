@@ -20,8 +20,7 @@ fallback when the AI model is unavailable.
 
 ## Architecture
 
-The compatibility entrypoint is still `src/stock_agent.py`, but the implementation
-is split by responsibility:
+The implementation is split by responsibility:
 
 ```text
 src/stock_recommender/
@@ -36,7 +35,7 @@ src/stock_recommender/
   schedule.py      Beijing-time weekday and hourly publication guard
   tracking.py      daily recommendation state and intraday quote tracking
   recommendation.py structured recommendation plan shared by reports, tracking, and portfolio execution
-  performance.py   legacy recommendation archive and compatibility API
+  performance.py   recommendation audit archive
   backtest.py      shared-signal rolling walk-forward orchestration and approval gate
   portfolio_backtest.py  isolated in-memory replay using the live portfolio engine
   market_regime.py  sector breadth, exposure budget, and absolute-momentum admission
@@ -45,8 +44,8 @@ src/stock_recommender/
   portfolio_pipeline.py  entry, risk, exit, and replacement orchestration
 ```
 
-New code should import from `stock_recommender.*`. Existing automation can keep
-using `stock_agent.py`.
+Application code imports from `stock_recommender.*`; automation runs the package
+CLI with `python3 -m stock_recommender.cli`.
 
 ## Strategy Lifecycle And Validation
 
@@ -56,6 +55,11 @@ moves it to paper trading even when the live gate fails. Live promotion requires
 all rolling out-of-sample checks to pass and at least 40 distinct paper-trading
 sessions. Live and archived configurations are immutable; create a revision to
 change their model parameters.
+
+The persisted strategy store accepts only schema `version: 5`. Unsupported
+single-strategy files, missing lifecycle metadata, missing or duplicate IDs, and
+an invalid `active_strategy_id` fail explicitly; the service does not migrate or
+silently repair them.
 
 The default gate uses roughly three years of history, purged rolling windows,
 the same T+1/order/exit/risk pipeline as paper trading, doubled-cost stress,
@@ -94,7 +98,7 @@ stock-agent
 ## Run Once
 
 ```bash
-STOCK_AGENT_MODE=report PYTHONPATH=src python3 src/stock_agent.py
+STOCK_AGENT_MODE=report PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 The generated report is written to:
@@ -106,7 +110,7 @@ data/stock_recommendation.md
 To output structured market data for an AI agent instead of a final report:
 
 ```bash
-STOCK_AGENT_MODE=data PYTHONPATH=src python3 src/stock_agent.py
+STOCK_AGENT_MODE=data PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 To let stock-agent call an OpenAI-compatible LLM endpoint directly:
@@ -115,7 +119,7 @@ To let stock-agent call an OpenAI-compatible LLM endpoint directly:
 STOCK_AGENT_MODE=ai \
 STOCK_AGENT_LLM_BASE_URL=http://127.0.0.1:8911/v1 \
 STOCK_AGENT_LLM_MODEL=your-model \
-PYTHONPATH=src python3 src/stock_agent.py
+PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 ## Custom Watchlist And Sector Filters
@@ -127,7 +131,7 @@ sector are optional:
 ```bash
 STOCK_AGENT_MODE=report \
 STOCK_AGENT_WATCHLIST='600519:贵州茅台:白酒,000858:五粮液:白酒,300750:宁德时代:新能源' \
-PYTHONPATH=src python3 src/stock_agent.py
+PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 Apply one or more exact sector-label filters with
@@ -136,7 +140,7 @@ Apply one or more exact sector-label filters with
 ```bash
 STOCK_AGENT_WATCHLIST='600519:贵州茅台:白酒,000858:五粮液:白酒,300750:宁德时代:新能源' \
 STOCK_AGENT_SECTOR_FILTERS='白酒' \
-PYTHONPATH=src python3 src/stock_agent.py
+PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 JSON is supported when a stock needs multiple sector tags:
@@ -147,7 +151,7 @@ STOCK_AGENT_WATCHLIST='[
   {"symbol":"600519","name":"贵州茅台","sector":"白酒"}
 ]' \
 STOCK_AGENT_SECTOR_FILTERS='新能源,白酒' \
-PYTHONPATH=src python3 src/stock_agent.py
+PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 When a watchlist is configured, board collection and the built-in fallback pool
@@ -172,14 +176,14 @@ recommendation instead of adding stocks outside the watchlist.
 | `STOCK_AGENT_LLM_TIMEOUT` | `60` | LLM request timeout in seconds. |
 | `STOCK_AGENT_TRACKING_LIMIT` | `3` | Maximum recommended stocks in the hourly volume/change tracking block. |
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
-| `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Legacy recommendation audit archive; strategy performance uses the full portfolio ledger. |
+| `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Recommendation audit archive; strategy performance uses the full portfolio ledger. |
 | `STOCK_AGENT_MARKET_HISTORY_CACHE_DIR` | `data/market_history_cache` | Per-symbol daily-history cache used by enrichment, backtests, and replay tools. |
 | `STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS` | `21600` | Fresh-cache lifetime; stale data remains available when the upstream source fails. |
 | `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `3` | Bounded daily-history download attempts. |
 | `STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS` | `1` | Initial exponential retry delay. |
 | `STOCK_AGENT_HISTORY_FETCH_WORKERS` | `2` | Maximum concurrent history downloads during a backtest. |
 | `STOCK_AGENT_BACKTEST_DATASET_PATH` | empty | Optional read-only point-in-time JSON dataset; when absent the current-universe exploratory loader is used and cannot pass the live gate. |
-| `STOCK_AGENT_PERFORMANCE_URL` | empty | Link appended to recommendation and tracking reports, for example `http://host:8765/performance`. |
+| `STOCK_AGENT_PUBLIC_URL` | empty | Public service origin used to build canonical strategy-performance links, for example `http://host:8765`. |
 | `STOCK_AGENT_SCHEDULE_GUARD` | `0` | Set to `1` to skip publication outside configured weekday hours. Background scripts default to `1`. |
 | `STOCK_AGENT_PUBLISH_HOURS` | `9,10,11,13,14,15` | Beijing-time hours allowed by the schedule guard. |
 
@@ -220,29 +224,15 @@ events, NAV, drawdown, and win rate for the strategy's full lifecycle. Open a
 strategy at `/strategies/<strategy-id>/portfolio`; the matching JSON endpoint is
 `/api/strategies/<strategy-id>/portfolio`.
 
-Set `STOCK_AGENT_PERFORMANCE_URL` in both recommendation and tracking jobs to
-append a Feishu-compatible Markdown link below every delivered report. Existing
-installations start accumulating history after this feature is deployed; the
-archive does not invent or reconstruct recommendations that were not persisted.
+Set `STOCK_AGENT_PUBLIC_URL` in both recommendation and tracking jobs to
+append a Feishu-compatible Markdown link below every delivered report.
+Recommendation and portfolio records are associated strictly by strategy ID;
+records are never remapped between strategy versions.
 
 Daily history downloads are cached per symbol and retried with exponential
 backoff. A fresh cache avoids the upstream request entirely; if refresh attempts
 fail, the most recent valid cache is returned so an already reproducible replay
 does not become unavailable during a provider outage.
-
-If a strategy is recreated with a new ID, reconcile legacy recommendation
-records only after backing up the archive:
-
-```bash
-PYTHONPATH=src python3 scripts/reconcile-recommendation-history.py --dry-run
-PYTHONPATH=src python3 scripts/reconcile-recommendation-history.py
-```
-
-The migration changes only orphaned records whose strategy name has exactly one
-current match, and preserves the prior value as `legacy_strategy_id`. When a
-legacy record used a different name, provide an audited mapping such as
-`--map OLD_ID=NEW_ID`; mappings whose target is not a current strategy are
-rejected.
 
 ## Hermes Cron
 
@@ -253,7 +243,7 @@ cd /path/to/internal-tools/apps/stock-agent
 STOCK_AGENT_MODE=ai \
 STOCK_AGENT_LLM_BASE_URL=http://127.0.0.1:8911/v1 \
 STOCK_AGENT_LLM_MODEL=your-model \
-PYTHONPATH=src python3 src/stock_agent.py
+PYTHONPATH=src python3 -m stock_recommender.cli
 ```
 
 Install regular runtime launchers into Hermes' allowed scripts directory:

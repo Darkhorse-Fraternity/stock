@@ -4,7 +4,6 @@ import math
 import re
 from typing import Callable, Iterable
 
-from .config import MAX_FLOAT_MARKET_CAP, MIN_FLOAT_MARKET_CAP
 from .data_sources import fetch_tick_rows
 from .parameters import PARAMETERS_BY_ID, load_strategy_config, parameter_value
 from .signal_engine import rank_signal_rows, select_ranked_signals
@@ -20,9 +19,6 @@ def filter_candidates(
     sector_filters: str | Iterable[object] | None = None,
 ) -> list[dict]:
     materialized = list(rows)
-    apply_legacy_market_cap = strategy is None and any(
-        number(row.get("float_market_cap"), default=0.0) > 0 for row in materialized
-    )
     strategy = strategy or load_strategy_config()
     prefixes = tuple(parameter_value(strategy, "stock_prefixes", ["0", "3", "6"]))
     exclude_st = bool(parameter_value(strategy, "exclude_st", True))
@@ -63,10 +59,6 @@ def filter_candidates(
             continue
         if not _matches_optional_numeric(strategy, "float_market_cap_max", row.get("float_market_cap"), "max"):
             continue
-        if apply_legacy_market_cap:
-            float_market_cap = number(row.get("float_market_cap"), default=0.0)
-            if not (MIN_FLOAT_MARKET_CAP <= float_market_cap <= MAX_FLOAT_MARKET_CAP):
-                continue
         if not _matches_optional_numeric(strategy, "total_market_cap_min", row.get("total_market_cap"), "min"):
             continue
         if not _matches_optional_numeric(strategy, "total_market_cap_max", row.get("total_market_cap"), "max"):

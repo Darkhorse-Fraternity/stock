@@ -146,23 +146,6 @@ class StrategyPortfolioTests(unittest.TestCase):
         )
         self.assertEqual(sum(len(events) for _, events in results), 11)
 
-    def test_legacy_daily_key_does_not_block_versioned_pipeline(self):
-        account = create_portfolio_account(self.strategy, now=self.t0)
-        account["committed_run_keys"].append("daily:2026-07-22")
-
-        updated, events = plan_daily_candidates(
-            self.strategy,
-            [self._candidate(1)],
-            now=self.t0,
-            account=account,
-        )
-
-        self.assertIn(
-            "daily:2026-07-22:strategy-r7:entry-pipeline-v1.0.0",
-            updated["committed_run_keys"],
-        )
-        self.assertEqual([event["type"] for event in events], ["PIPELINE_COMPLETED", "ORDER_INTENDED"])
-
     def test_each_strategy_has_an_independent_cash_and_slot_ledger(self):
         other = {**self.strategy, "id": "value", "name": "低估值", "revision": 2}
         plan_daily_candidates(self.strategy, [self._candidate(1)], now=self.t0, path=self.path)
@@ -367,13 +350,13 @@ class StrategyPortfolioTests(unittest.TestCase):
         message = format_action_notifications(
             account,
             events,
-            performance_url="https://stock.example.com/performance",
+            performance_url="https://stock.example.com/strategies/tech-ai/portfolio",
         )
         performance = build_strategy_performance(strategy_id="tech-ai", path=self.path, now=self.t0)
 
         self.assertIn("科技 AI", message)
         self.assertIn("v7", message)
-        self.assertIn("strategy_id=tech-ai", message)
+        self.assertIn("/strategies/tech-ai/portfolio", message)
         self.assertEqual(performance["strategy"]["id"], "tech-ai")
         self.assertEqual(performance["summary"]["position_count"], 0)
         self.assertEqual(len(performance["orders"]), 1)

@@ -16,7 +16,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 APP_DIR="${STOCK_AGENT_APP_DIR:-$DEFAULT_APP_DIR}"
-if [ ! -f "$APP_DIR/src/stock_agent.py" ]; then
+if [ ! -f "$APP_DIR/src/stock_recommender/cli.py" ]; then
   echo "Set STOCK_AGENT_APP_DIR to the stock-agent checkout path" >&2
   exit 2
 fi
@@ -38,7 +38,7 @@ exec env \
   STOCK_AGENT_STATE_PATH="${STOCK_AGENT_STATE_PATH:-/tmp/stock-agent-daily-selection.json}" \
   STOCK_AGENT_HISTORY_PATH="${STOCK_AGENT_HISTORY_PATH:-$APP_DIR/data/recommendation_history.json}" \
   STOCK_AGENT_PORTFOLIO_PATH="${STOCK_AGENT_PORTFOLIO_PATH:-$APP_DIR/data/strategy_portfolios.json}" \
-  STOCK_AGENT_PERFORMANCE_URL="${STOCK_AGENT_PERFORMANCE_URL:-http://127.0.0.1:8765/performance}" \
+  STOCK_AGENT_PUBLIC_URL="${STOCK_AGENT_PUBLIC_URL:-http://127.0.0.1:8765}" \
   STOCK_AGENT_ENABLE_TICK="${STOCK_AGENT_ENABLE_TICK:-0}" \
   STOCK_AGENT_TICK_LIMIT="${STOCK_AGENT_TICK_LIMIT:-2}" \
   STOCK_AGENT_TRACKING_LIMIT="${STOCK_AGENT_TRACKING_LIMIT:-3}" \
@@ -46,4 +46,4 @@ exec env \
   STOCK_AGENT_PUBLISH_HOURS="${STOCK_AGENT_PUBLISH_HOURS:-8}" \
   STOCK_AGENT_DELIVERY_RUN=1 \
   PYTHONPATH=src \
-  "$PYTHON_BIN" src/stock_agent.py
+  "$PYTHON_BIN" -m stock_recommender.cli

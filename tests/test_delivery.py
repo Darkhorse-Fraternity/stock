@@ -8,12 +8,12 @@ from stock_recommender.parameters import default_strategy_config, normalize_stra
 
 
 class DeliveryTests(unittest.TestCase):
-    def test_legacy_strategy_keeps_existing_delivery_enabled(self):
-        with patch.dict(os.environ, {"STOCK_AGENT_DEFAULT_DELIVERY_ENABLED": "1", "STOCK_AGENT_DEFAULT_DELIVERY_TARGET": "oc_current"}):
-            strategy = normalize_strategy_config({"name": "旧策略", "parameters": {}})
+    def test_missing_delivery_uses_disabled_current_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            strategy = normalize_strategy_config({"name": "当前策略", "parameters": {}})
 
-        self.assertTrue(strategy["delivery"]["enabled"])
-        self.assertEqual(strategy["delivery"]["target"], "oc_current")
+        self.assertFalse(strategy["delivery"]["enabled"])
+        self.assertEqual(strategy["delivery"]["target"], "")
 
     def test_new_strategy_defaults_to_delivery_disabled(self):
         delivery = default_strategy_config()["delivery"]

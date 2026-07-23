@@ -95,5 +95,5 @@ Hermes 可通过以下环境变量同步三个现有任务：
 
 - 默认账本：`data/strategy_portfolios.json`，可用 `STOCK_AGENT_PORTFOLIO_PATH` 覆盖。
 - 策略 API：`/api/strategies/{strategy_id}/portfolio`。
-- 策略页面：`/strategies/{strategy_id}/portfolio`；兼容入口 `/performance?strategy_id=...` 也返回同一策略账本视图。
+- 策略页面：`/strategies/{strategy_id}/portfolio`。
 - 页面展示当前净值、累计收益、最大回撤、退出胜率、当前持仓、订单、退出记录和事件账本。
