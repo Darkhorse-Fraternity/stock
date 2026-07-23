@@ -290,17 +290,16 @@ class BacktestTests(unittest.TestCase):
             self.assertEqual(revision["parent_strategy_id"], live["id"])
             self.assertEqual(revision["lifecycle"]["stage"], "draft")
 
-    def test_legacy_active_strategy_migrates_to_paper(self):
+    def test_active_strategy_without_lifecycle_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "legacy.json"
-            strategy = create_strategy("旧活动策略", path=path)
+            path = Path(directory) / "invalid.json"
+            create_strategy("无生命周期策略", path=path)
             payload = load_strategy_store(path=path)
             payload["strategies"][0].pop("lifecycle", None)
             path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-            migrated = load_strategy_config(path=path)
-
-            self.assertEqual(migrated["lifecycle"]["stage"], "paper")
+            with self.assertRaisesRegex(StrategyLifecycleError, "lifecycle"):
+                load_strategy_config(path=path)
 
 
 if __name__ == "__main__":

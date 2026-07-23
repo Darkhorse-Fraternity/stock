@@ -13,6 +13,26 @@ from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME, candidates_with
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
+    def test_removed_compatibility_routes_return_not_found(self):
+        for path in ("/api/config", "/api/performance", "/performance"):
+            with self.subTest(path=path):
+                captured = {}
+                handler = AdminHandler.__new__(AdminHandler)
+                handler.path = path
+                handler.send_error = lambda status, *args: captured.update(status=status)
+                handler.do_GET()
+                self.assertEqual(captured["status"], 404)
+
+        for method, path in (("do_PUT", "/api/config"), ("do_POST", "/api/config/reset")):
+            with self.subTest(method=method, path=path):
+                captured = {}
+                handler = AdminHandler.__new__(AdminHandler)
+                handler.path = path
+                handler._read_json = lambda: {}
+                handler.send_error = lambda status, *args: captured.update(status=status)
+                getattr(handler, method)()
+                self.assertEqual(captured["status"], 404)
+
     def test_strategy_portfolio_api_and_page_are_served(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "strategies.json"

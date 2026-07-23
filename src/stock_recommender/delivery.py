@@ -34,7 +34,7 @@ def delivery_cron(config: dict) -> str:
 
 
 def should_deliver_report(report: str, config: dict) -> bool:
-    delivery = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
+    delivery = normalize_report_delivery(config.get("delivery"))
     if not delivery["enabled"]:
         return False
     if strategy_runtime_issues(config, execution_kind="scheduled", mode="report"):

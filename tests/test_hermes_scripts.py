@@ -57,9 +57,9 @@ class HermesScriptRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             app_dir = root / "relocated-stock-agent"
-            source_dir = app_dir / "src"
-            source_dir.mkdir(parents=True)
-            (source_dir / "stock_agent.py").write_text("", encoding="utf-8")
+            package_dir = app_dir / "src" / "stock_recommender"
+            package_dir.mkdir(parents=True)
+            (package_dir / "cli.py").write_text("", encoding="utf-8")
 
             fake_python = root / "fake-python"
             fake_python.write_text(
@@ -96,12 +96,12 @@ class HermesScriptRegressionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             app_dir = root / "stock-agent"
-            source_dir = app_dir / "src"
+            package_dir = app_dir / "src" / "stock_recommender"
             scripts_dir = app_dir / "scripts"
             runtime_dir = root / "hermes" / "scripts"
-            source_dir.mkdir(parents=True)
+            package_dir.mkdir(parents=True)
             runtime_dir.mkdir(parents=True)
-            (source_dir / "stock_agent.py").write_text("", encoding="utf-8")
+            (package_dir / "cli.py").write_text("", encoding="utf-8")
 
             fake_python = root / "fake-python"
             fake_python.write_text(

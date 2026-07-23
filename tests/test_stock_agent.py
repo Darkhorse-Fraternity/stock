@@ -6,7 +6,16 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-import stock_agent
+from stock_recommender.cli import main
+from stock_recommender.context import extract_market_payload, generate_agent_context
+from stock_recommender.data_sources import fetch_board_quotes, fetch_sina_fallback_quotes, fetch_watchlist_quotes
+from stock_recommender.parameters import default_strategy_config
+from stock_recommender.recommendation import RecommendationOutput
+from stock_recommender.reports import build_conservative_report, format_recommendation_snapshot, generate_ai_report, generate_report
+from stock_recommender.schedule import parse_publish_hours, should_publish_now
+from stock_recommender.selection import analyze_candidates, evaluate_tick_ignition, filter_candidates, select_agent_candidates
+from stock_recommender.tracking import generate_saved_tracking_report, load_daily_selection, save_daily_selection
+from stock_recommender.universe import parse_watchlist
 from recommendation_fixtures import make_recommendation_plan
 from stock_recommender.recommendation import recommendation_tracking_entries
 
@@ -64,10 +73,10 @@ class StockAgentTests(unittest.TestCase):
         self.history_patch.stop()
 
     def test_parse_watchlist_supports_compact_and_json_formats(self):
-        compact = stock_agent.parse_watchlist(
+        compact = parse_watchlist(
             "sh600519:贵州茅台:白酒，000858:五粮液:白酒;300750.SZ:宁德时代:新能源"
         )
-        mapped = stock_agent.parse_watchlist(
+        mapped = parse_watchlist(
             '{"600519": {"name": "贵州茅台", "sector": "白酒"}, "300750": "新能源"}'
         )
 
@@ -85,7 +94,7 @@ class StockAgentTests(unittest.TestCase):
             '0,0,0,0,0,0,0,0,0,0,2026-07-17,10:00:00,00";'
         ).encode("gb18030")
 
-        quotes, error = stock_agent.fetch_watchlist_quotes(
+        quotes, error = fetch_watchlist_quotes(
             [{"symbol": "600519", "name": "茅台观察", "sector": "白酒"}],
             urlopen_func=lambda request, timeout: (seen_requests.append(request.full_url) or FakeBytesResponse(raw)),
         )
@@ -110,7 +119,7 @@ class StockAgentTests(unittest.TestCase):
             },
         ]
 
-        filtered = stock_agent.filter_candidates(rows, sector_filters=["新能源"])
+        filtered = filter_candidates(rows, sector_filters=["新能源"])
 
         self.assertEqual([row["symbol"] for row in filtered], ["300750"])
 
@@ -152,7 +161,7 @@ class StockAgentTests(unittest.TestCase):
                 },
             ], None
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             watchlist=[
                 {"symbol": "600519", "sector": "白酒"},
                 {"symbol": "300750", "sector": "新能源"},
@@ -161,7 +170,7 @@ class StockAgentTests(unittest.TestCase):
             board_fetcher=board_fetcher,
             watchlist_fetcher=watchlist_fetcher,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
 
         self.assertFalse(board_called)
         self.assertEqual(payload["universe_type"], "watchlist")
@@ -178,19 +187,19 @@ class StockAgentTests(unittest.TestCase):
             fallback_called = True
             return [{"symbol": "300130", "price": 10, "turnover": 1}], None
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             watchlist=["600519"],
             watchlist_fetcher=lambda entries: ([], "watchlist timeout"),
             fallback_fetcher=fallback_fetcher,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
 
         self.assertFalse(fallback_called)
         self.assertEqual(payload["candidates"], [])
         self.assertEqual(payload["fetch_error"], "watchlist timeout")
 
     def test_watchlist_report_displays_sector_filter(self):
-        report = stock_agent.generate_report(
+        report = generate_report(
             watchlist=[{"symbol": "600519", "sector": "白酒"}],
             sector_filters=["白酒"],
             watchlist_fetcher=lambda entries: (
@@ -223,11 +232,11 @@ class StockAgentTests(unittest.TestCase):
             "STOCK_AGENT_OUTPUT": "",
         }
         plan = make_recommendation_plan([], now=datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc))
-        output = stock_agent.RecommendationOutput(report="test report", plan=plan)
+        output = RecommendationOutput(report="test report", plan=plan)
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
             "stock_recommender.cli.generate_report_result", return_value=output
         ) as generate_report:
-            stock_agent.main()
+            main()
 
         kwargs = generate_report.call_args.kwargs
         self.assertEqual([item["symbol"] for item in kwargs["watchlist"]], ["600519", "300750"])
@@ -242,14 +251,14 @@ class StockAgentTests(unittest.TestCase):
         monday_301pm = datetime(2026, 7, 20, 7, 1, tzinfo=timezone.utc)
         saturday_10am = datetime(2026, 7, 18, 2, 0, tzinfo=timezone.utc)
 
-        self.assertFalse(stock_agent.should_publish_now(monday_9am))
-        self.assertTrue(stock_agent.should_publish_now(monday_930am))
-        self.assertTrue(stock_agent.should_publish_now(monday_10am))
-        self.assertFalse(stock_agent.should_publish_now(monday_noon))
-        self.assertTrue(stock_agent.should_publish_now(monday_1pm))
-        self.assertFalse(stock_agent.should_publish_now(monday_301pm))
-        self.assertFalse(stock_agent.should_publish_now(saturday_10am))
-        self.assertEqual(stock_agent.parse_publish_hours("9,10,15"), (9, 10, 15))
+        self.assertFalse(should_publish_now(monday_9am))
+        self.assertTrue(should_publish_now(monday_930am))
+        self.assertTrue(should_publish_now(monday_10am))
+        self.assertFalse(should_publish_now(monday_noon))
+        self.assertTrue(should_publish_now(monday_1pm))
+        self.assertFalse(should_publish_now(monday_301pm))
+        self.assertFalse(should_publish_now(saturday_10am))
+        self.assertEqual(parse_publish_hours("9,10,15"), (9, 10, 15))
 
     def test_cli_schedule_guard_skips_without_generating_report(self):
         env = {
@@ -260,7 +269,7 @@ class StockAgentTests(unittest.TestCase):
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
             "stock_recommender.cli.should_publish_now", return_value=False
         ), mock.patch("stock_recommender.cli.generate_report_result") as generate_report:
-            stock_agent.main()
+            main()
 
         generate_report.assert_not_called()
 
@@ -270,7 +279,7 @@ class StockAgentTests(unittest.TestCase):
             [{"symbol": "300130", "name": "新国都", "price": 18.03}],
             now=generated_at,
         )
-        recommendation = stock_agent.RecommendationOutput(report="test report", plan=plan)
+        recommendation = RecommendationOutput(report="test report", plan=plan)
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "selection.json")
             history_path = str(Path(directory) / "history.json")
@@ -288,14 +297,14 @@ class StockAgentTests(unittest.TestCase):
             ), mock.patch(
                 "stock_recommender.cli.generate_report_result", return_value=recommendation
             ):
-                stock_agent.main()
+                main()
 
             payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
 
         self.assertEqual(payload["symbols"], ["300130"])
 
     def test_recommendation_snapshot_contains_volume_turnover_and_change(self):
-        snapshot = stock_agent.format_recommendation_snapshot(
+        snapshot = format_recommendation_snapshot(
             [
                 {
                     "symbol": "300130",
@@ -331,11 +340,11 @@ class StockAgentTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "selection.json"
-            saved = stock_agent.save_daily_selection(state_path, plan, now=recommendation_time)
+            saved = save_daily_selection(state_path, plan, now=recommendation_time)
 
             self.assertEqual(saved, ["300130"])
-            self.assertEqual(stock_agent.load_daily_selection(state_path, now=recommendation_time), ["300130"])
-            self.assertEqual(stock_agent.load_daily_selection(state_path, now=next_day), [])
+            self.assertEqual(load_daily_selection(state_path, now=recommendation_time), ["300130"])
+            self.assertEqual(load_daily_selection(state_path, now=next_day), [])
 
     def test_saved_tracking_report_only_fetches_morning_recommendations(self):
         recommendation_time = datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc)
@@ -374,8 +383,8 @@ class StockAgentTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "selection.json"
-            stock_agent.save_daily_selection(state_path, plan, now=recommendation_time)
-            report = stock_agent.generate_saved_tracking_report(
+            save_daily_selection(state_path, plan, now=recommendation_time)
+            report = generate_saved_tracking_report(
                 state_path=state_path,
                 now=tracking_time,
                 quote_fetcher=quote_fetcher,
@@ -410,7 +419,7 @@ class StockAgentTests(unittest.TestCase):
             }
         }
 
-        quotes, error = stock_agent.fetch_board_quotes(
+        quotes, error = fetch_board_quotes(
             "BK0800",
             limit=10,
             page_size=10,
@@ -450,7 +459,7 @@ class StockAgentTests(unittest.TestCase):
                 }
             )
 
-        quotes, error = stock_agent.fetch_board_quotes(
+        quotes, error = fetch_board_quotes(
             "BK0809",
             limit=2,
             page_size=1,
@@ -472,7 +481,7 @@ class StockAgentTests(unittest.TestCase):
             '2026-07-09,15:35:45,00,D|2900|52287.000";'
         ).encode("gb18030")
 
-        quotes, error = stock_agent.fetch_sina_fallback_quotes(
+        quotes, error = fetch_sina_fallback_quotes(
             symbols=["300130"],
             board_name="AI智能体",
             urlopen_func=lambda request, timeout: (seen_requests.append(request.full_url) or FakeBytesResponse(raw)),
@@ -513,12 +522,12 @@ class StockAgentTests(unittest.TestCase):
                 }
             ], None
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             board_fetcher=board_fetcher,
             fallback_fetcher=fallback_fetcher,
             candidate_limit=1,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
 
         self.assertIsNone(payload["fetch_error"])
         self.assertEqual(payload["source"], ["新浪财经实时行情（AI智能体备用股池）"])
@@ -532,7 +541,7 @@ class StockAgentTests(unittest.TestCase):
             {"symbol": "600000", "name": "空成交", "price": 1.0, "turnover": 0},
         ]
 
-        filtered = stock_agent.filter_candidates(rows)
+        filtered = filter_candidates(rows)
 
         self.assertEqual([row["symbol"] for row in filtered], ["300130"])
 
@@ -540,7 +549,7 @@ class StockAgentTests(unittest.TestCase):
         def timeout_fetcher(board_code, **kwargs):
             raise socket.timeout("slow")
 
-        report = stock_agent.generate_report(
+        report = generate_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=timeout_fetcher,
             fallback_fetcher=lambda **kwargs: ([], "sina timeout"),
@@ -570,7 +579,7 @@ class StockAgentTests(unittest.TestCase):
                 }
             ], None
 
-        report = stock_agent.generate_report(
+        report = generate_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=board_fetcher,
         )
@@ -579,14 +588,18 @@ class StockAgentTests(unittest.TestCase):
         self.assertIn("更新时间：06月22日 09:00", report)
         self.assertIn("数据来源：东方财富 AI智能体(BK0809)", report)
 
-    def test_filter_candidates_applies_float_market_cap_when_present(self):
+    def test_filter_candidates_applies_explicit_float_market_cap_parameters(self):
         rows = [
             {"symbol": "603956", "name": "威派格", "price": 5.3, "turnover": 100000000, "float_market_cap": 3020503316},
             {"symbol": "600186", "name": "莲花控股", "price": 15.6, "turnover": 2200000000, "float_market_cap": 27910557340},
             {"symbol": "600000", "name": "未知市值", "price": 10.0, "turnover": 100000000},
         ]
 
-        filtered = stock_agent.filter_candidates(rows)
+        strategy = default_strategy_config()
+        strategy["parameters"]["float_market_cap_min"] = {"enabled": True, "value": 2_000_000_000}
+        strategy["parameters"]["float_market_cap_max"] = {"enabled": True, "value": 10_000_000_000}
+
+        filtered = filter_candidates(rows, strategy=strategy)
 
         self.assertEqual([row["symbol"] for row in filtered], ["603956"])
 
@@ -600,7 +613,7 @@ class StockAgentTests(unittest.TestCase):
             {"time": "09:38:10", "price": 10.24, "volume": 500},
         ])
 
-        signal = stock_agent.evaluate_tick_ignition(ticks)
+        signal = evaluate_tick_ignition(ticks)
 
         self.assertTrue(signal["confirmed"])
         self.assertGreaterEqual(signal["price_change_10s"], 2.0)
@@ -614,7 +627,7 @@ class StockAgentTests(unittest.TestCase):
             {"time": "09:38:10", "price": 10.0, "volume": 1000},
         ]
 
-        signal = stock_agent.evaluate_tick_ignition(ticks)
+        signal = evaluate_tick_ignition(ticks)
 
         self.assertFalse(signal["confirmed"])
         self.assertLess(signal["price_change_10s"], 2.0)
@@ -641,8 +654,8 @@ class StockAgentTests(unittest.TestCase):
                 }
             ], None
 
-        context = stock_agent.generate_agent_context(board_fetcher=board_fetcher)
-        payload = stock_agent.extract_market_payload(context)
+        context = generate_agent_context(board_fetcher=board_fetcher)
+        payload = extract_market_payload(context)
         candidate = payload["candidates"][0]
 
         self.assertEqual(candidate["float_market_cap_cny"], 3020503316)
@@ -682,12 +695,12 @@ class StockAgentTests(unittest.TestCase):
                 {"time": "09:38:10", "price": 10.24, "volume": 500},
             ]
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             board_fetcher=board_fetcher,
             enable_tick=True,
             tick_fetcher=tick_fetcher,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
 
         self.assertTrue(payload["candidates"][0]["ignition_signal"]["confirmed"])
         self.assertGreaterEqual(payload["candidates"][0]["ignition_signal"]["volume_ratio"], 8.0)
@@ -717,12 +730,12 @@ class StockAgentTests(unittest.TestCase):
         def tick_fetcher(symbol):
             raise TimeoutError("tick timeout")
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             board_fetcher=board_fetcher,
             enable_tick=True,
             tick_fetcher=tick_fetcher,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
         signal = payload["candidates"][0]["ignition_signal"]
 
         self.assertFalse(signal["confirmed"])
@@ -763,13 +776,13 @@ class StockAgentTests(unittest.TestCase):
                 {"time": "09:38:10", "price": 10.24, "volume": 500},
             ]
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             board_fetcher=board_fetcher,
             enable_tick=True,
             tick_fetcher=tick_fetcher,
             tick_limit=1,
         )
-        payload = stock_agent.extract_market_payload(context)
+        payload = extract_market_payload(context)
 
         self.assertEqual(seen, ["603956"])
         self.assertIsNotNone(payload["candidates"][0]["ignition_signal"])
@@ -805,7 +818,7 @@ class StockAgentTests(unittest.TestCase):
             ],
         }
 
-        report = stock_agent.build_conservative_report(payload, "测试风控")
+        report = build_conservative_report(payload, "测试风控")
 
         self.assertIn("今日情绪：强", report)
         self.assertIn("总仓位框架：8成", report)
@@ -841,7 +854,7 @@ class StockAgentTests(unittest.TestCase):
                 }
             ], None
 
-        context = stock_agent.generate_agent_context(
+        context = generate_agent_context(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=board_fetcher,
             candidate_limit=1,
@@ -878,7 +891,7 @@ class StockAgentTests(unittest.TestCase):
             self.assertIn("300130", context)
             return "AI最终推荐：新国都（300130），观望或轻仓。"
 
-        report = stock_agent.generate_ai_report(
+        report = generate_ai_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=board_fetcher,
             llm_client=fake_llm,
@@ -913,7 +926,7 @@ class StockAgentTests(unittest.TestCase):
                 }
             ], None
 
-        report = stock_agent.generate_ai_report(
+        report = generate_ai_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             llm_client=broken_llm,
             board_fetcher=board_fetcher,
@@ -954,7 +967,7 @@ class StockAgentTests(unittest.TestCase):
             called = True
             return "should not happen"
 
-        report = stock_agent.generate_ai_report(
+        report = generate_ai_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=lambda board_code, **kwargs: ([], "remote disconnected"),
             fallback_fetcher=lambda **kwargs: ([], "sina disconnected"),
@@ -987,7 +1000,7 @@ class StockAgentTests(unittest.TestCase):
         def unsafe_llm(context, **kwargs):
             return "推荐新国都，建议重仓试错。"
 
-        report = stock_agent.generate_ai_report(
+        report = generate_ai_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=board_fetcher,
             llm_client=unsafe_llm,
@@ -1019,7 +1032,7 @@ class StockAgentTests(unittest.TestCase):
         def hallucinating_llm(context, **kwargs):
             return "推荐 999999 幻觉股票，建议观望。"
 
-        report = stock_agent.generate_ai_report(
+        report = generate_ai_report(
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             board_fetcher=board_fetcher,
             llm_client=hallucinating_llm,
@@ -1044,8 +1057,8 @@ class StockAgentTests(unittest.TestCase):
                 "inverse_volatility": index,
                 "drawdown": -index / 100,
             }
-        analyses = stock_agent.analyze_candidates(rows)
-        selected = stock_agent.select_agent_candidates(analyses, limit=3)
+        analyses = analyze_candidates(rows)
+        selected = select_agent_candidates(analyses, limit=3)
 
         self.assertIn("C", [row["symbol"] for row in selected])
         self.assertIn("A", [row["symbol"] for row in selected])

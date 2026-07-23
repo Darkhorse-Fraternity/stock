@@ -1,9 +1,11 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 from stock_recommender.parameters import (
     PARAMETER_CATALOG,
+    StrategyLifecycleError,
     activate_strategy,
     create_strategy,
     deactivate_strategy,
@@ -120,17 +122,38 @@ class ParameterCatalogTests(unittest.TestCase):
             self.assertEqual(copied["description"], "高成长")
             self.assertEqual([item["id"] for item in store["strategies"]], [copied["id"]])
 
-    def test_legacy_single_strategy_file_is_migrated_in_memory(self):
+    def test_single_strategy_file_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "legacy.json"
+            path = Path(directory) / "unsupported.json"
             config = default_strategy_config()
-            config["name"] = "旧策略"
-            path.write_text(__import__("json").dumps(config, ensure_ascii=False), encoding="utf-8")
+            path.write_text(json.dumps(config, ensure_ascii=False), encoding="utf-8")
 
-            store = load_strategy_store(path=path)
+            with self.assertRaisesRegex(StrategyLifecycleError, "strategies"):
+                load_strategy_store(path=path)
 
-            self.assertEqual(store["strategies"][0]["name"], "旧策略")
-            self.assertEqual(store["active_strategy_id"], store["strategies"][0]["id"])
+    def test_store_rejects_missing_lifecycle_and_invalid_active_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategies.json"
+            strategy = create_strategy("严格策略", path=path)
+            payload = load_strategy_store(path=path)
+            payload["strategies"][0].pop("lifecycle")
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(StrategyLifecycleError, "lifecycle"):
+                load_strategy_store(path=path)
+
+            payload["strategies"][0]["lifecycle"] = strategy["lifecycle"]
+            payload["active_strategy_id"] = "missing"
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(StrategyLifecycleError, "active_strategy_id"):
+                load_strategy_store(path=path)
+
+    def test_store_rejects_malformed_json_instead_of_starting_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategies.json"
+            path.write_text('{"version": 5,', encoding="utf-8")
+
+            with self.assertRaisesRegex(StrategyLifecycleError, "JSON"):
+                load_strategy_store(path=path)
 
     def test_available_saved_parameters_affect_filtering(self):
         config = default_strategy_config()

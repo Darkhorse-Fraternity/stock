@@ -204,9 +204,6 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return payload as T
 }
 
-export const getConfig = () => api<ConfigPayload>("/api/config")
-export const saveConfig = (config: StrategyConfig) => api<ConfigPayload>("/api/config", { method: "PUT", body: JSON.stringify(config) })
-export const resetConfig = () => api<ConfigPayload>("/api/config/reset", { method: "POST", body: "{}" })
 export const convertStrategy = (strategy: string) => api<StrategyDraft>("/api/strategy/convert", { method: "POST", body: JSON.stringify({ strategy }) })
 export const chatStrategy = (messages: ChatMessage[], strategyId: string) => api<StrategyChatResponse>("/api/strategy/chat", { method: "POST", body: JSON.stringify({ messages, strategy_id: strategyId }) })
 export const getStrategies = () => api<StrategyLibrary>("/api/strategies")

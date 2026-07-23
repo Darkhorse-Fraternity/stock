@@ -148,6 +148,7 @@ DELIVERY_CHANNELS = {"feishu", "telegram", "discord", "signal", "origin", "local
 DELIVERY_FREQUENCIES = {"daily", "weekdays"}
 STRATEGY_STAGES = {"draft", "backtesting", "paper", "live", "paused", "archived"}
 LOCKED_STRATEGY_STAGES = {"live", "archived"}
+STRATEGY_STORE_VERSION = 5
 
 
 class StrategyLifecycleError(ValueError):
@@ -165,11 +166,11 @@ def _environment_int(name: str, default: int) -> int:
         return default
 
 
-def default_report_delivery(*, legacy: bool = False) -> dict:
+def default_report_delivery() -> dict:
     channel = os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_CHANNEL", "feishu").strip().lower()
     frequency = os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_FREQUENCY", "weekdays").strip().lower()
     return {
-        "enabled": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_ENABLED", "1" if legacy else "0") == "1",
+        "enabled": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_ENABLED", "0") == "1",
         "channel": channel if channel in DELIVERY_CHANNELS else "feishu",
         "target": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_TARGET", "")[:200],
         "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 8))),
@@ -180,8 +181,8 @@ def default_report_delivery(*, legacy: bool = False) -> dict:
     }
 
 
-def normalize_report_delivery(value: object, *, legacy: bool = False) -> dict:
-    normalized = default_report_delivery(legacy=legacy)
+def normalize_report_delivery(value: object) -> dict:
+    normalized = default_report_delivery()
     if not isinstance(value, dict):
         return normalized
     channel = str(value.get("channel") or normalized["channel"]).strip().lower()
@@ -492,7 +493,7 @@ def normalize_portfolio_config(value: object) -> dict:
 
 def default_strategy_config() -> dict:
     return {
-        "version": 5,
+        "version": STRATEGY_STORE_VERSION,
         "id": None,
         "revision": 1,
         "parent_strategy_id": None,
@@ -540,7 +541,7 @@ def normalize_strategy_config(config: dict | None) -> dict:
         normalized["validation"]["maximum_drawdown_pct"],
         normalized["portfolio"]["halt_drawdown_pct"],
     )
-    normalized["delivery"] = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
+    normalized["delivery"] = normalize_report_delivery(config.get("delivery"))
     provided = config.get("parameters")
     if not isinstance(provided, dict):
         return normalized
@@ -575,7 +576,7 @@ def _normalize_value(definition: dict, value: Any) -> Any:
 
 
 def default_strategy_store() -> dict:
-    return {"version": 5, "active_strategy_id": None, "strategies": []}
+    return {"version": STRATEGY_STORE_VERSION, "active_strategy_id": None, "strategies": []}
 
 
 def _timestamp() -> str:
@@ -584,44 +585,70 @@ def _timestamp() -> str:
 
 def _normalize_strategy_store(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
-        return default_strategy_store()
+        raise StrategyLifecycleError("策略配置必须是对象")
+    if payload.get("version") != STRATEGY_STORE_VERSION:
+        raise StrategyLifecycleError(
+            f"不支持的策略配置版本，仅接受 version={STRATEGY_STORE_VERSION}"
+        )
     if not isinstance(payload.get("strategies"), list):
-        if isinstance(payload.get("parameters"), dict):
-            legacy = normalize_strategy_config(payload)
-            legacy["id"] = legacy.get("id") or "legacy-default"
-            legacy["created_at"] = legacy.get("created_at") or legacy.get("updated_at")
-            legacy["lifecycle"].update({"stage": "paper", "stage_updated_at": legacy.get("updated_at")})
-            return {"version": 5, "active_strategy_id": legacy["id"], "strategies": [legacy]}
-        return default_strategy_store()
+        raise StrategyLifecycleError("策略配置缺少 strategies 列表")
 
     configured_active_id = payload.get("active_strategy_id")
     strategies = []
     used_ids = set()
-    for index, item in enumerate(payload["strategies"]):
+    for item in payload["strategies"]:
         if not isinstance(item, dict):
-            continue
-        had_lifecycle = isinstance(item.get("lifecycle"), dict)
-        strategy = normalize_strategy_config(item)
-        strategy_id = strategy.get("id") or f"strategy-{index + 1}"
+            raise StrategyLifecycleError("strategies 只能包含策略对象")
+        if item.get("version") != STRATEGY_STORE_VERSION:
+            raise StrategyLifecycleError(
+                f"策略版本不受支持，仅接受 version={STRATEGY_STORE_VERSION}"
+            )
+        strategy_id = item.get("id")
+        if not isinstance(strategy_id, str) or not strategy_id.strip():
+            raise StrategyLifecycleError("策略必须包含非空 id")
+        if strategy_id != strategy_id.strip():
+            raise StrategyLifecycleError("策略 id 不能包含首尾空白")
         if strategy_id in used_ids:
-            strategy_id = f"{strategy_id}-{index + 1}"
+            raise StrategyLifecycleError(f"策略 id 重复: {strategy_id}")
+        required_sections = (
+            "lifecycle",
+            "signal",
+            "allocation",
+            "validation",
+            "portfolio",
+            "delivery",
+            "parameters",
+        )
+        missing_sections = [
+            section for section in required_sections if not isinstance(item.get(section), dict)
+        ]
+        if missing_sections:
+            raise StrategyLifecycleError(
+                f"策略 {strategy_id} 缺少配置段: {', '.join(missing_sections)}"
+            )
+        strategy = normalize_strategy_config(item)
         strategy["id"] = strategy_id
-        if not had_lifecycle and strategy_id == configured_active_id:
-            strategy["lifecycle"].update({"stage": "paper", "stage_updated_at": strategy.get("updated_at")})
         used_ids.add(strategy_id)
         strategies.append(strategy)
-    active_strategy_id = configured_active_id
-    if active_strategy_id is not None and active_strategy_id not in used_ids:
-        active_strategy_id = strategies[0]["id"] if strategies else None
-    return {"version": 5, "active_strategy_id": active_strategy_id, "strategies": strategies}
+    if configured_active_id is not None:
+        if not isinstance(configured_active_id, str) or configured_active_id not in used_ids:
+            raise StrategyLifecycleError("active_strategy_id 必须指向现有策略")
+    return {
+        "version": STRATEGY_STORE_VERSION,
+        "active_strategy_id": configured_active_id,
+        "strategies": strategies,
+    }
 
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
     config_path = Path(path) if path is not None else strategy_config_path()
     try:
-        return _normalize_strategy_store(json.loads(config_path.read_text(encoding="utf-8")))
-    except (OSError, json.JSONDecodeError):
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return default_strategy_store()
+    except json.JSONDecodeError as exc:
+        raise StrategyLifecycleError(f"策略配置 JSON 无法解析: {exc.msg}") from exc
+    return _normalize_strategy_store(payload)
 
 
 def save_strategy_store(store: dict, path: str | Path | None = None) -> dict:

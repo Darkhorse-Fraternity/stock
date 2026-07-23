@@ -31,7 +31,7 @@ if command -v realpath >/dev/null 2>&1; then
   APP_DIR=$(realpath "$APP_DIR")
 fi
 
-if [ ! -f "$APP_DIR/src/stock_agent.py" ]; then
+if [ ! -f "$APP_DIR/src/stock_recommender/cli.py" ]; then
   echo "Hermes workdir is not a stock-agent checkout: $APP_DIR" >&2
   echo "Re-run install-hermes-launchers.sh or set STOCK_AGENT_APP_DIR" >&2
   exit 2

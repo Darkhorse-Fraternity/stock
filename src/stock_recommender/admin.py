@@ -7,7 +7,7 @@ import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from .backtest import BacktestInProgressError, get_backtest, list_backtests, start_backtest
 from .delivery import pause_hermes_delivery, sync_active_strategy_delivery, sync_hermes_delivery
@@ -78,9 +78,6 @@ class AdminHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         request = urlparse(self.path)
         path = request.path
-        if path == "/api/config":
-            self._send_json(catalog_payload())
-            return
         if path == "/api/strategies":
             self._send_json(strategy_library_payload())
             return
@@ -94,10 +91,6 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json(health_payload())
-            return
-        if path == "/api/performance":
-            strategy_id = (parse_qs(request.query).get("strategy_id") or [None])[0]
-            self._send_json(build_strategy_performance(strategy_id=strategy_id))
             return
         run_id = self._run_route(path)
         if run_id:
@@ -130,7 +123,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         if path == "/":
             self._send_file(WEB_ROOT / "index.html")
             return
-        if path in {"/performance", "/performance/"} or self._portfolio_page_route(path):
+        if self._portfolio_page_route(path):
             self._send_file(WEB_ROOT / "performance.html")
             return
         static_path = (WEB_ROOT / path.lstrip("/")).resolve()
@@ -246,23 +239,12 @@ class AdminHandler(BaseHTTPRequestHandler):
         except StrategyLifecycleError as exc:
             self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
             return
-        if path == "/api/config/reset":
-            try:
-                existing = load_strategy_config()
-                reset = default_strategy_config()
-                reset.update({key: existing.get(key) for key in ["id", "name", "description", "created_at", "delivery"]})
-                saved = save_strategy_config(reset)
-            except (ValueError, OSError, StrategyLifecycleError) as exc:
-                self._send_json({"error": str(exc)}, status=HTTPStatus.CONFLICT)
-                return
-            self._send_json(_catalog_with_delivery_sync(saved, previous=existing))
-            return
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_PUT(self) -> None:
         path = urlparse(self.path).path
         strategy_id, action = self._strategy_route(path)
-        if path != "/api/config" and not (strategy_id and action is None):
+        if not (strategy_id and action is None):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
         try:

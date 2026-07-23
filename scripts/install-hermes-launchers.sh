@@ -14,7 +14,7 @@ if [ ! -f "$RUNTIME_LAUNCHER" ]; then
   echo "Runtime launcher is missing: $RUNTIME_LAUNCHER" >&2
   exit 2
 fi
-if [ ! -f "$APP_DIR/src/stock_agent.py" ]; then
+if [ ! -f "$APP_DIR/src/stock_recommender/cli.py" ]; then
   echo "Stock-agent checkout is invalid: $APP_DIR" >&2
   exit 2
 fi

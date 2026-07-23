@@ -37,7 +37,7 @@ class PortfolioCliTests(unittest.TestCase):
             environment = {
                 "STOCK_AGENT_MODE": "track",
                 "STOCK_AGENT_OUTPUT": str(output),
-                "STOCK_AGENT_PERFORMANCE_URL": "https://stock.example.com/performance",
+                "STOCK_AGENT_PUBLIC_URL": "https://stock.example.com",
                 "STOCK_AGENT_SCHEDULE_GUARD": "0",
             }
             stream = io.StringIO()
@@ -47,7 +47,7 @@ class PortfolioCliTests(unittest.TestCase):
             report = output.read_text(encoding="utf-8")
         self.assertIn("策略持仓每小时报告", report)
         self.assertIn("科技 AI · v4", report)
-        self.assertIn("strategy_id=tech-ai", report)
+        self.assertIn("https://stock.example.com/strategies/tech-ai/portfolio", report)
         self.assertEqual(stream.getvalue().strip(), report.strip())
 
     def test_risk_mode_is_silent_when_no_action_occurs(self):
