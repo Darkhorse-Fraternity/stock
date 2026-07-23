@@ -4,17 +4,13 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=stock-agent
-Group=stock-agent
-WorkingDirectory=/opt/stock-agent
-StateDirectory=stock-agent
+WorkingDirectory=%h/internal-tools/apps/stock-agent
 Environment=PYTHONDONTWRITEBYTECODE=1
-Environment=PYTHONPATH=/opt/stock-agent/src
-Environment=STOCK_AGENT_CONFIG=/var/lib/stock-agent/strategy_config.json
-EnvironmentFile=-/etc/stock-agent/stock-agent.env
+Environment=PYTHONPATH=src
+EnvironmentFile=-%h/internal-tools/apps/stock-agent/.env
 ExecStart=/usr/bin/python3 -m stock_recommender.admin --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=3
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=default.target

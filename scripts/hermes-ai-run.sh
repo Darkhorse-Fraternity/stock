@@ -1,7 +1,25 @@
 #!/bin/sh
 set -eu
 
-APP_DIR="${STOCK_AGENT_APP_DIR:-/opt/stock-agent}"
+SCRIPT_PATH=$0
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_PATH=$(realpath "$SCRIPT_PATH")
+fi
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$SCRIPT_PATH")" && pwd)
+DEFAULT_APP_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+ENV_FILE="${STOCK_AGENT_ENV_FILE:-$DEFAULT_APP_DIR/.env}"
+
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  . "$ENV_FILE"
+  set +a
+fi
+
+APP_DIR="${STOCK_AGENT_APP_DIR:-$DEFAULT_APP_DIR}"
+if [ ! -f "$APP_DIR/src/stock_agent.py" ]; then
+  echo "Set STOCK_AGENT_APP_DIR to the stock-agent checkout path" >&2
+  exit 2
+fi
 
 cd "$APP_DIR"
 
@@ -15,10 +33,17 @@ exec env \
   STOCK_AGENT_CANDIDATE_LIMIT="${STOCK_AGENT_CANDIDATE_LIMIT:-6}" \
   STOCK_AGENT_LLM_BASE_URL="${STOCK_AGENT_LLM_BASE_URL:-http://127.0.0.1:8911/v1}" \
   STOCK_AGENT_LLM_MODEL="${STOCK_AGENT_LLM_MODEL:-your-model}" \
-  STOCK_AGENT_LLM_TIMEOUT="${STOCK_AGENT_LLM_TIMEOUT:-120}" \
+  STOCK_AGENT_LLM_TIMEOUT="${STOCK_AGENT_LLM_TIMEOUT:-60}" \
   STOCK_AGENT_OUTPUT="${STOCK_AGENT_OUTPUT:-/tmp/stock-agent-ai-report.md}" \
-  STOCK_AGENT_ENABLE_TICK="${STOCK_AGENT_ENABLE_TICK:-1}" \
+  STOCK_AGENT_STATE_PATH="${STOCK_AGENT_STATE_PATH:-/tmp/stock-agent-daily-selection.json}" \
+  STOCK_AGENT_HISTORY_PATH="${STOCK_AGENT_HISTORY_PATH:-$APP_DIR/data/recommendation_history.json}" \
+  STOCK_AGENT_PORTFOLIO_PATH="${STOCK_AGENT_PORTFOLIO_PATH:-$APP_DIR/data/strategy_portfolios.json}" \
+  STOCK_AGENT_PERFORMANCE_URL="${STOCK_AGENT_PERFORMANCE_URL:-http://127.0.0.1:8765/performance}" \
+  STOCK_AGENT_ENABLE_TICK="${STOCK_AGENT_ENABLE_TICK:-0}" \
   STOCK_AGENT_TICK_LIMIT="${STOCK_AGENT_TICK_LIMIT:-2}" \
+  STOCK_AGENT_TRACKING_LIMIT="${STOCK_AGENT_TRACKING_LIMIT:-3}" \
+  STOCK_AGENT_SCHEDULE_GUARD="${STOCK_AGENT_SCHEDULE_GUARD:-0}" \
+  STOCK_AGENT_PUBLISH_HOURS="${STOCK_AGENT_PUBLISH_HOURS:-8}" \
   STOCK_AGENT_DELIVERY_RUN=1 \
   PYTHONPATH=src \
   "$PYTHON_BIN" src/stock_agent.py

@@ -2,6 +2,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 from stock_recommender.context import extract_market_payload, generate_agent_context
@@ -15,6 +16,14 @@ from stock_recommender.strategy_runs import (
 
 
 class StrategyExecutionTests(unittest.TestCase):
+    @staticmethod
+    def _history(symbol):
+        start = date(2026, 1, 1)
+        return [
+            {"date": start + timedelta(days=index), "open": 10 + index / 10, "close": 10 + index / 10, "volume": 1000 + index}
+            for index in range(100)
+        ]
+
     def test_context_uses_explicit_strategy_instead_of_active_strategy(self):
         strategy = default_strategy_config()
         strategy["parameters"]["change_pct_min"] = {"enabled": True, "value": 5}
@@ -34,6 +43,7 @@ class StrategyExecutionTests(unittest.TestCase):
             board_fetcher=lambda *args, **kwargs: (rows, None),
             candidate_limit=3,
             strategy=strategy,
+            history_fetcher=self._history,
         )
 
         self.assertEqual(extract_market_payload(context)["candidate_count"], 0)
@@ -57,11 +67,12 @@ class StrategyExecutionTests(unittest.TestCase):
             board_fetcher=lambda *args, **kwargs: (rows, None),
             candidate_limit=1,
             strategy=strategy,
+            history_fetcher=self._history,
         )
 
         candidate = extract_market_payload(context)["candidates"][0]
         self.assertEqual(candidate["risk_hint"], "高")
-        self.assertIn("强势拉升", candidate["machine_reasons"][0])
+        self.assertIn("超过追高阈值", candidate["machine_reasons"][0])
 
     def test_run_is_persisted_and_returns_report(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -12,6 +12,9 @@ class ArchitectureTests(unittest.TestCase):
         reports = importlib.import_module("stock_recommender.reports")
         llm = importlib.import_module("stock_recommender.llm")
         cli = importlib.import_module("stock_recommender.cli")
+        universe = importlib.import_module("stock_recommender.universe")
+        schedule = importlib.import_module("stock_recommender.schedule")
+        tracking = importlib.import_module("stock_recommender.tracking")
 
         self.assertIs(stock_agent.fetch_board_quotes, data_sources.fetch_board_quotes)
         self.assertIs(stock_agent.fetch_sina_fallback_quotes, data_sources.fetch_sina_fallback_quotes)
@@ -20,6 +23,10 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIs(stock_agent.generate_ai_report, reports.generate_ai_report)
         self.assertIs(stock_agent.call_llm_analysis, llm.call_llm_analysis)
         self.assertIs(stock_agent.main, cli.main)
+        self.assertIs(stock_agent.parse_watchlist, universe.parse_watchlist)
+        self.assertIs(stock_agent.filter_rows_by_sector, universe.filter_rows_by_sector)
+        self.assertIs(stock_agent.should_publish_now, schedule.should_publish_now)
+        self.assertIs(stock_agent.generate_saved_tracking_report, tracking.generate_saved_tracking_report)
 
 
 if __name__ == "__main__":

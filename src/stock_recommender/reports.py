@@ -2,98 +2,147 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Callable
+from typing import Callable, Iterable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
-from .context import extract_market_payload, generate_agent_context, prepare_candidates
-from .data_sources import fallback_quotes, fetch_board_quotes, fetch_sina_fallback_quotes
+from .context import collect_recommendation_plan, extract_market_payload, generate_agent_context_from_plan, recommendation_context_payload
 from .llm import call_llm_analysis
-from .parameters import chase_risk_threshold, load_strategy_config
-from .selection import analyze, filter_candidates
-from .utils import beijing_now, number
+from .market_regime import normalize_market_regime_decision
+from .parameters import chase_risk_threshold, normalize_portfolio_config
+from .recommendation import RecommendationOutput, RecommendationPlan
+from .universe import normalize_sector_filters, normalize_watchlist
+from .utils import number
 
 
-def generate_report(
-    *,
-    now: datetime | None = None,
-    board_code: str = DEFAULT_BOARD_CODE,
-    board_name: str = DEFAULT_BOARD_NAME,
-    top_n: int = 3,
-    board_fetcher: Callable | None = None,
-    fallback_fetcher: Callable | None = None,
-    history_fetcher: Callable | None = None,
-    financial_fetcher: Callable | None = None,
-    enrich_limit: int | None = None,
-    strategy: dict | None = None,
-) -> str:
-    report_time = beijing_now(now)
-    fetcher = board_fetcher or fetch_board_quotes
-    try:
-        rows, error = fetcher(board_code, board_name=board_name)
-    except Exception as exc:
-        rows, error = [], str(exc)
+def append_performance_link(report: str, url: str) -> str:
+    target = str(url or "").strip()
+    if not target or target in report:
+        return report
+    return f"{report.rstrip()}\n\n📊 [查看策略表现]({target})"
 
-    strategy = strategy or load_strategy_config()
-    filtered, enrichment_error = prepare_candidates(
-        rows,
-        strategy=strategy,
-        history_fetcher=history_fetcher,
-        financial_fetcher=financial_fetcher,
-        enrich_limit=enrich_limit,
+
+def decorate_strategy_output(report: str, strategy: dict | None) -> str:
+    if not strategy or not strategy.get("id"):
+        return report
+    stage = strategy.get("lifecycle", {}).get("stage", "draft")
+    labels = {
+        "draft": "🧪 **草稿策略输出（不构成正式推荐）**",
+        "backtesting": "🧪 **回测中策略输出（不构成正式推荐）**",
+        "paper": "🧪 **模拟盘观察（非实盘推荐）**",
+        "live": "✅ **已通过门禁的实盘策略**",
+        "paused": "⏸️ **已暂停策略输出**",
+        "archived": "📦 **已归档策略输出**",
+    }
+    version = (
+        f"使用策略：{strategy.get('name') or strategy.get('id')} ({strategy.get('id')}) · "
+        f"策略版本：v{strategy.get('revision', 1)} · {stage} · "
+        f"信号：{strategy.get('signal', {}).get('model', 'factor_rank_v1')} @ "
+        f"{strategy.get('signal', {}).get('run_time', '08:00')}"
     )
-    if enrichment_error:
-        error = enrichment_error
-    if not rows:
-        fallback = fallback_fetcher or fetch_sina_fallback_quotes
-        try:
-            fallback_rows, fallback_error = fallback(board_name=board_name)
-        except Exception as exc:
-            fallback_rows, fallback_error = [], str(exc)
-        filtered, enrichment_error = prepare_candidates(
-            fallback_rows,
-            strategy=strategy,
-            history_fetcher=history_fetcher,
-            financial_fetcher=financial_fetcher,
-            enrich_limit=enrich_limit,
-        )
-        if fallback_rows and not enrichment_error:
-            error = None
-        elif not fallback_rows:
-            filtered = fallback_quotes(report_time, error or fallback_error or "未获得有效行情")
-        elif enrichment_error:
-            error = enrichment_error
+    return f"{labels.get(stage, labels['draft'])}\n{version}\n\n{report}"
 
-    if not filtered:
-        return "\n".join(
+
+def format_volume_hands(value: float) -> str:
+    volume = number(value)
+    if volume >= 100_000_000:
+        return f"{volume / 100_000_000:.2f} 亿手"
+    if volume >= 10_000:
+        return f"{volume / 10_000:.2f} 万手"
+    return f"{volume:.0f} 手"
+
+
+def format_recommendation_snapshot(rows: Iterable[dict], *, limit: int = 3, generated_at: str = "") -> str:
+    selected = list(rows)[: max(0, limit)]
+    if not selected:
+        return ""
+    lines = ["📈 **推荐股每小时成交与涨跌跟踪**"]
+    if generated_at:
+        lines.append(f"更新时间：{generated_at}")
+    for item in selected:
+        percent = number(item.get("change_percent", item.get("percent")))
+        price = number(item.get("price"))
+        volume = number(item.get("volume_hands", item.get("volume")))
+        turnover = number(item.get("turnover_cny", item.get("turnover")))
+        signal_score = number(item.get("signal_score", item.get("score")), default=float("nan"))
+        score_text = f"，信号分 {signal_score:.2f}/100" if signal_score == signal_score else ""
+        features = item.get("signal_features") or {}
+        momentum = number(features.get("momentum20"), default=float("nan"))
+        trend = number(features.get("trend"), default=float("nan"))
+        factor_text = (
+            f"，20日动量 {momentum * 100:+.2f}%，趋势 {trend:.0f}/2"
+            if momentum == momentum and trend == trend
+            else ""
+        )
+        lines.append(
+            f"- {item.get('name') or item.get('symbol')} ({item.get('symbol')})："
+            f"最新价 ¥{price:.2f}，涨跌幅 {percent:+.2f}%；"
+            f"成交量 {format_volume_hands(volume)}，成交额 {format_cny(turnover)}{score_text}{factor_text}"
+        )
+    return "\n".join(lines)
+
+
+def format_market_regime_summary(decision: dict) -> str:
+    normalized = normalize_market_regime_decision(decision)
+    breadth = (
+        normalized.get("breadth20_pct"),
+        normalized.get("breadth60_pct"),
+        normalized.get("trend_breadth_pct"),
+    )
+    if all(value is not None for value in breadth):
+        detail = f"20日/60日/趋势广度 {breadth[0]:.1f}%/{breadth[1]:.1f}%/{breadth[2]:.1f}%"
+    else:
+        detail = f"有效样本 {normalized['sample_size']} 只"
+    return (
+        f"🧭 **板块状态**：{normalized['label']}（{normalized['state']}） · "
+        f"目标仓位 {normalized['target_exposure_pct']:.0f}% · {detail} · "
+        f"模型 {normalized['model']}"
+    )
+
+
+def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:
+    current_strategy = strategy
+    report_time = plan.generated_at
+    eligible = list(plan.candidates)
+    error = plan.fetch_error
+    market_regime = plan.market_regime
+
+    if not plan.selected_candidates:
+        return decorate_strategy_output("\n".join(
             [
-                f"📊 **股票每日推荐** ({report_time.strftime('%Y 年%m月%d日')})",
+                f"📊 **策略运行报告** ({report_time.strftime('%Y 年%m月%d日')})",
                 "",
-                "当前策略没有匹配股票。",
-                f"数据状态：{error or '行情正常，筛选条件未命中'}",
+                format_market_regime_summary(market_regime),
+                "",
+                "本次没有匹配股票，不新增持仓；既有持仓继续由退出 Pipeline 管理。",
+                f"数据状态：{error or market_regime['reason']}",
                 "",
                 "仅供参考，不构成投资建议。",
             ]
-        )
+        ), current_strategy)
 
-    analyses = [analyze(row, strategy=strategy) for row in filtered]
-    analyses.sort(key=lambda item: (item["score"], number(item.get("percent"))), reverse=True)
-    top = analyses[:top_n]
+    top = list(plan.selected_candidates)
     avg_score = sum(item["score"] for item in top) / len(top)
-    sources = sorted({item["source"] for item in top})
+    sources = list(plan.sources)
+    universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}板块"
+    filter_label = f"（板块：{'、'.join(plan.sector_filters)}）" if plan.sector_filters else ""
 
     report = [
-        f"📊 **股票每日推荐** ({report_time.strftime('%Y 年%m月%d日')})",
+        f"📊 **策略运行报告** ({report_time.strftime('%Y 年%m月%d日')})",
         "=" * 30,
         "",
-        f"🎯 **{board_name}板块精选 {len(top)} 只值得关注的股票**",
+        f"🎯 **{universe_label}{filter_label}精选 {len(top)} 只值得关注的股票**",
+        "",
+        format_market_regime_summary(market_regime),
         "",
     ]
 
     for index, stock in enumerate(top, 1):
+        sector_line = f"  🏷️ **板块**: {stock.get('sector')}" if stock.get("sector") else None
         report.extend(
             [
                 f"{stock['rating_emoji']} **【推荐 #{index}】{stock['name']} ({stock['symbol']})**",
-                f"  🎯 **评级**: {stock['rating']} (评分：{stock['score']}/100)",
+                f"  🎯 **评级**: {stock['rating']} (factor_rank_v1：{number(stock['score']):.1f}/100)",
+                *([sector_line] if sector_line else []),
                 f"  💰 **最新价**: ¥{number(stock.get('price')):.2f}",
                 f"  📊 **涨跌幅**: {number(stock.get('percent')):.2f}% ({number(stock.get('change')):+.2f})",
                 f"  🔄 **换手率**: {number(stock.get('turnover_rate')):.2f}%",
@@ -106,6 +155,14 @@ def generate_report(
         for reason in stock["reasons"][:5]:
             report.append(f"    • {reason}")
         report.extend(["", "  " + "─" * 28, ""])
+
+    snapshot = format_recommendation_snapshot(
+        top,
+        limit=len(top),
+        generated_at=report_time.strftime("%m月%d日 %H:%M"),
+    )
+    if snapshot:
+        report.extend([snapshot, ""])
 
     if avg_score >= 80:
         sentiment, position = "🟢 题材热度较高，注意追高风险", "中等仓位"
@@ -129,22 +186,135 @@ def generate_report(
             "📌 **数据说明**",
             f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
             f"  • 数据来源：{'；'.join(sources)}",
-            "  • 任务频率：北京时间每个自然日 09:00 播报一次",
+            "  • 信号口径：北京时间 08:00 运行，仅使用前一交易日收盘前数据",
+            "  • 任务频率：北京时间工作日 08:00 推荐；开市期间整点跟踪持仓股",
             "",
             "=" * 30,
         ]
     )
-    return "\n".join(report)
+    return decorate_strategy_output("\n".join(report), current_strategy)
 
 
-def generate_ai_report(
+def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:
+    """Render deterministic Pipeline output without delegating decisions to the LLM."""
+    portfolio = normalize_portfolio_config((strategy or {}).get("portfolio"))
+    report_time = plan.generated_at
+    selected = list(plan.selected_candidates)
+    universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}板块"
+    filter_label = f"（板块：{'、'.join(plan.sector_filters)}）" if plan.sector_filters else ""
+
+    report = [
+        f"📋 **确定性策略入场计划** ({report_time.strftime('%Y 年%m月%d日')})",
+        "",
+        format_market_regime_summary(plan.market_regime),
+        "",
+        f"候选范围：{universe_label}{filter_label}",
+    ]
+    if not selected:
+        report.extend(
+            [
+                "策略动作：本次不新增持仓；既有持仓继续由退出 Pipeline 管理。",
+                f"数据状态：{plan.fetch_error or plan.market_regime['reason']}",
+                "",
+            ]
+        )
+    else:
+        report.extend(["策略动作：候选进入组合 Pipeline，实际成交以容量、风控与撮合结果为准。", ""])
+        for index, stock in enumerate(selected, 1):
+            reason_text = "；".join(str(reason) for reason in stock.get("reasons") or []) or "满足当前策略筛选条件"
+            report.extend(
+                [
+                    f"{index}. **{stock['name']} ({stock['symbol']})**",
+                    (
+                        f"   参考价 ¥{number(stock.get('price')):.2f} · "
+                        f"当日涨跌 {number(stock.get('percent', stock.get('change_percent'))):+.2f}% · "
+                        f"信号分 {number(stock.get('score', stock.get('signal_score'))):.1f}/100"
+                    ),
+                    f"   入选依据：{reason_text}",
+                ]
+            )
+        report.append("")
+
+    report.extend(
+        [
+            "🧩 **组合 Pipeline 与退出规则**",
+            (
+                f"  • 容量：每策略最多持有 {portfolio['max_positions']} 只；"
+                f"目标单股仓位 {portfolio['target_weight_pct']:g}%"
+            ),
+            (
+                f"  • 退出：止损 {portfolio['stop_loss_pct']:g}%；"
+                f"盈利达到 {portfolio['trailing_activation_pct']:g}% 后启用追踪止盈，"
+                f"回撤 {portfolio['trailing_drawdown_pct']:g}% 退出"
+            ),
+            f"  • 信号失效：连续 {portfolio['signal_invalid_days']} 个交易日后退出或替换",
+            "  • 执行：A 股 T+1；订单还会经过组合容量、风险准入、费用、滑点与成交量限制",
+            "",
+            "📌 **数据与任务说明**",
+            f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
+            f"  • 数据来源：{'；'.join(plan.sources) or '暂无有效行情源'}",
+            "  • 信号口径：北京时间工作日 08:00 运行，仅使用前一交易日收盘前数据",
+            "  • 持仓跟踪：开市期间整点汇报成交量、涨跌幅与退出动作",
+            "",
+            "仅供策略验证，不构成投资建议。",
+        ]
+    )
+    return decorate_strategy_output("\n".join(report), strategy)
+
+
+def generate_report_result(
+    *,
+    now: datetime | None = None,
+    board_code: str = DEFAULT_BOARD_CODE,
+    board_name: str = DEFAULT_BOARD_NAME,
+    top_n: int = 3,
+    board_fetcher: Callable | None = None,
+    fallback_fetcher: Callable | None = None,
+    history_fetcher: Callable | None = None,
+    financial_fetcher: Callable | None = None,
+    enrich_limit: int | None = None,
+    strategy: dict | None = None,
+    watchlist: str | Iterable[object] | None = None,
+    sector_filters: str | Iterable[object] | None = None,
+    watchlist_fetcher: Callable | None = None,
+) -> RecommendationOutput:
+    watchlist_entries = normalize_watchlist(watchlist)
+    sectors = normalize_sector_filters(sector_filters)
+    plan = collect_recommendation_plan(
+        now=now,
+        board_code=board_code,
+        board_name=board_name,
+        candidate_limit=top_n,
+        selection_limit=top_n,
+        board_fetcher=board_fetcher,
+        fallback_fetcher=fallback_fetcher,
+        history_fetcher=history_fetcher,
+        financial_fetcher=financial_fetcher,
+        enrich_limit=enrich_limit,
+        strategy=strategy,
+        watchlist=watchlist_entries if watchlist is not None else None,
+        sector_filters=sectors if sector_filters is not None else None,
+        watchlist_fetcher=watchlist_fetcher,
+    )
+    return RecommendationOutput(report=render_report(plan, strategy=strategy), plan=plan)
+
+
+def generate_report(**kwargs) -> str:
+    return generate_report_result(**kwargs).report
+
+
+def generate_ai_report_result(
     *,
     now: datetime | None = None,
     board_code: str = DEFAULT_BOARD_CODE,
     board_name: str = DEFAULT_BOARD_NAME,
     candidate_limit: int = 5,
+    tracking_limit: int = 3,
     board_fetcher: Callable | None = None,
     fallback_fetcher: Callable | None = None,
+    watchlist: str | Iterable[object] | None = None,
+    sector_filters: str | Iterable[object] | None = None,
+    watchlist_fetcher: Callable | None = None,
     enable_tick: bool = False,
     tick_fetcher: Callable | None = None,
     tick_limit: int = 2,
@@ -157,12 +327,15 @@ def generate_ai_report(
     llm_api_key: str = "ollama",
     llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
     strategy: dict | None = None,
-) -> str:
-    context = generate_agent_context(
+) -> RecommendationOutput:
+    current_strategy = strategy
+    selection_limit = int((current_strategy or {}).get("validation", {}).get("top_n", min(3, candidate_limit)))
+    plan = collect_recommendation_plan(
         now=now,
         board_code=board_code,
         board_name=board_name,
         candidate_limit=candidate_limit,
+        selection_limit=selection_limit,
         board_fetcher=board_fetcher,
         fallback_fetcher=fallback_fetcher,
         enable_tick=enable_tick,
@@ -171,22 +344,39 @@ def generate_ai_report(
         history_fetcher=history_fetcher,
         financial_fetcher=financial_fetcher,
         enrich_limit=enrich_limit,
-        strategy=strategy,
+        strategy=current_strategy,
+        watchlist=watchlist,
+        sector_filters=sector_filters,
+        watchlist_fetcher=watchlist_fetcher,
     )
-    payload = extract_market_payload(context) or {}
+    context = generate_agent_context_from_plan(plan, strategy=current_strategy)
+    payload = recommendation_context_payload(plan)
+    market_regime = plan.market_regime
+    regime_summary = format_market_regime_summary(market_regime)
     if payload.get("fetch_error") or any("估算兜底" in source for source in payload.get("source", [])):
-        return "\n".join(
+        report = decorate_strategy_output("\n".join(
             [
                 "⚠️ **实时行情不可用**",
+                "",
+                regime_summary,
                 "",
                 f"数据源错误：{payload.get('fetch_error') or 'unknown'}",
                 "今日不生成股票推荐，避免基于兜底数据误导交易判断。",
                 "",
                 "仅供参考，不构成投资建议。",
             ]
-        )
+        ), current_strategy)
+        return RecommendationOutput(report=report, plan=plan)
     if not payload.get("candidates"):
-        return "⚪ **当前策略无匹配股票**\n\n行情数据正常，但没有股票同时满足已启用条件。\n\n仅供参考，不构成投资建议。"
+        report = decorate_strategy_output(
+            (
+                f"⚪ **本次不新增持仓**\n\n{regime_summary}\n\n"
+                "板块状态或个股绝对动量未通过；既有持仓继续由退出 Pipeline 管理。"
+                "\n\n仅供参考，不构成投资建议。"
+            ),
+            current_strategy,
+        )
+        return RecommendationOutput(report=report, plan=plan)
     client = llm_client or call_llm_analysis
     try:
         analysis = client(
@@ -196,22 +386,33 @@ def generate_ai_report(
             api_key=llm_api_key,
             timeout=llm_timeout,
         )
-        guarded = apply_risk_guard(context, analysis, strategy=strategy)
-        return guarded
-    except Exception as exc:
-        fallback = generate_report(
-            now=now,
-            board_code=board_code,
-            board_name=board_name,
-            top_n=min(3, candidate_limit),
-            board_fetcher=board_fetcher,
-            fallback_fetcher=fallback_fetcher,
-            history_fetcher=history_fetcher,
-            financial_fetcher=financial_fetcher,
-            enrich_limit=enrich_limit,
-            strategy=strategy,
+        guarded = apply_risk_guard(context, analysis, strategy=current_strategy)
+        by_symbol = {str(item.get("symbol")): item for item in payload.get("candidates") or []}
+        snapshot_rows = [
+            by_symbol[symbol]
+            for symbol in payload.get("portfolio_candidates") or []
+            if symbol in by_symbol
+        ][:tracking_limit]
+        snapshot = format_recommendation_snapshot(
+            snapshot_rows,
+            limit=tracking_limit,
+            generated_at=payload.get("generated_at") or "",
         )
-        return f"⚠️ AI 分析失败：{exc}\n\n以下为脚本兜底报告：\n\n{fallback}"
+        explained = f"{regime_summary}\n\n{guarded}"
+        result = f"{explained}\n\n{snapshot}" if snapshot else explained
+        report = decorate_strategy_output(result, current_strategy)
+        return RecommendationOutput(report=report, plan=plan)
+    except Exception:
+        fallback = render_strategy_plan_report(plan, strategy=current_strategy)
+        report = (
+            "ℹ️ **AI 解说暂不可用**（策略计算、组合风控与执行 Pipeline 不受影响）\n\n"
+            f"{fallback}"
+        )
+        return RecommendationOutput(report=report, plan=plan)
+
+
+def generate_ai_report(**kwargs) -> str:
+    return generate_ai_report_result(**kwargs).report
 
 
 def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = None) -> str:
@@ -224,6 +425,9 @@ def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = Non
     unknown_symbols = mentioned_symbols - known_symbols
     if unknown_symbols:
         return build_conservative_report(payload, "数据一致性校验失败：AI 输出包含非候选股票代码", strategy=strategy)
+    required_symbols = set(payload.get("portfolio_candidates") or [])
+    if not required_symbols.issubset(mentioned_symbols):
+        return build_conservative_report(payload, "AI 未完整解释策略已确定的入池股票", strategy=strategy)
 
     has_high_risk = any(number(item.get("change_percent")) >= chase_risk_threshold(strategy) for item in candidates)
     unsafe_position = any(term in analysis for term in ["重仓", "中仓", "满仓", "30-40", "30%", "40%"])
@@ -316,7 +520,7 @@ def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict, 
         [
             f"### {item['name']} ({item['symbol']})",
             "**入选理由**",
-            f"- 来自今日 {item.get('board_name', 'AI智能体')} 热点股池，实时数据源为{source}。",
+            f"- 来自今日 {item.get('board_name', DEFAULT_BOARD_NAME)} 科技 AI 热点股池，实时数据源为{source}。",
             f"- 涨幅 {pct:.2f}%，换手率 {turnover_rate:.2f}%，成交额 {format_cny(turnover)}，机器信号分 {score:.0f}/100。",
             f"- 流通市值 {format_cny(float_market_cap)}，用于执行 20-100 亿中小盘筛选。",
             f"- 价格位置：{position_summary}。",
@@ -344,7 +548,10 @@ def build_conservative_report(payload: dict, reason: str, *, strategy: dict | No
     threshold = chase_risk_threshold(strategy)
     high_risk = [item for item in candidates if number(item.get("change_percent")) >= threshold]
     moderate = [item for item in candidates if 0 <= number(item.get("change_percent")) < threshold]
-    selected = (high_risk[:3] + moderate[:2])[:5]
+    by_symbol = {str(item.get("symbol")): item for item in candidates}
+    selected = [by_symbol[symbol] for symbol in payload.get("portfolio_candidates") or [] if symbol in by_symbol]
+    if not selected:
+        selected = (high_risk[:3] + moderate[:2])[:5]
     sentiment = market_sentiment_profile(candidates, strategy=strategy)
     lines = [
         "⚠️ **系统风控修正**",
@@ -359,7 +566,7 @@ def build_conservative_report(payload: dict, reason: str, *, strategy: dict | No
         lines.extend(["暂无可解释候选。", "", "仅供参考，不构成投资建议。"])
         return "\n".join(lines)
     for item in selected:
-        item.setdefault("board_name", payload.get("board_name") or "AI智能体")
+        item.setdefault("board_name", payload.get("board_name") or DEFAULT_BOARD_NAME)
         append_candidate_explanation(lines, item, sentiment, strategy=strategy)
     lines.extend(
         [

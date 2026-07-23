@@ -49,9 +49,11 @@ import {
   startStrategyRun,
   syncStrategyDelivery,
   type ConfigPayload,
+  type AllocationConfig,
   type ChatMessage,
   type Parameter,
   type ParameterStatus,
+  type PortfolioConfig,
   type ReportDelivery,
   type StrategyDraft,
   type StrategyChatResponse,
@@ -77,6 +79,14 @@ const channelCopy: Record<ReportDelivery["channel"], string> = {
   signal: "Signal",
   origin: "任务来源",
   local: "仅本地",
+}
+const lifecycleCopy: Record<StrategySummary["lifecycle"]["stage"], string> = {
+  draft: "草稿",
+  backtesting: "回测中",
+  paper: "模拟盘",
+  live: "实盘",
+  paused: "已暂停",
+  archived: "已归档",
 }
 
 function deliveryTime(delivery: ReportDelivery) {
@@ -443,6 +453,98 @@ function StrategyRunSheet({
   )
 }
 
+function PortfolioNumberField({
+  label,
+  description,
+  value,
+  suffix,
+  step = 1,
+  disabled = false,
+  onChange,
+}: {
+  label: string
+  description: string
+  value: number
+  suffix?: string
+  step?: number
+  disabled?: boolean
+  onChange: (value: number) => void
+}) {
+  return (
+    <label className="grid gap-2 rounded-md border bg-muted/15 p-4">
+      <span><span className="block text-sm font-medium">{label}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{description}</span></span>
+      <span className="flex items-center gap-2"><Input disabled={disabled} type="number" step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /><span className="min-w-10 text-xs text-muted-foreground">{suffix}</span></span>
+    </label>
+  )
+}
+
+function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllocationChange }: { portfolio: PortfolioConfig; allocation: AllocationConfig; strategyId: string; onChange: (patch: Partial<PortfolioConfig>) => void; onAllocationChange: (patch: Partial<AllocationConfig>) => void }) {
+  const field = (key: keyof PortfolioConfig) => (value: number) => onChange({ [key]: value } as Partial<PortfolioConfig>)
+  const allocationField = (key: keyof AllocationConfig) => (value: number) => onAllocationChange({ [key]: value } as Partial<AllocationConfig>)
+  const performanceUrl = `/strategies/${encodeURIComponent(strategyId)}/portfolio`
+  return (
+    <div className="max-w-5xl space-y-5">
+      <section className="overflow-hidden rounded-lg border bg-background shadow-xs">
+        <div className="flex flex-col justify-between gap-4 border-b px-5 py-4 sm:flex-row sm:items-center sm:px-6">
+          <div className="flex items-start gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><ShieldCheck className="size-4" /></div><div><h3 className="text-sm font-semibold">板块状态与仓位预算</h3><p className="mt-1 text-xs text-muted-foreground">{allocation.model} · 板块广度 → 目标仓位 → 个股绝对动量</p></div></div>
+          <Switch aria-label="启用板块状态控制" checked={allocation.enabled} onCheckedChange={(enabled) => onAllocationChange({ enabled })} />
+        </div>
+        <div className={cn("space-y-5 px-5 py-5 sm:px-6", !allocation.enabled && "opacity-55")}>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField label="多数广度阈值" description="20日、60日和趋势广度达到该比例才算通过" value={allocation.breadth_threshold_pct} suffix="%" step={1} onChange={allocationField("breadth_threshold_pct")} />
+            <PortfolioNumberField label="强势目标仓位" description="三项广度信号全部通过" value={allocation.risk_on_exposure_pct} suffix="%" step={5} onChange={allocationField("risk_on_exposure_pct")} />
+            <PortfolioNumberField label="震荡目标仓位" description="三项广度信号中两项通过" value={allocation.neutral_exposure_pct} suffix="%" step={5} onChange={allocationField("neutral_exposure_pct")} />
+            <PortfolioNumberField disabled label="弱势目标仓位" description="少于两项通过时保留现金" value={allocation.risk_off_exposure_pct} suffix="%" onChange={allocationField("risk_off_exposure_pct")} />
+            <PortfolioNumberField label="个股20日动量" description="低于该绝对收益率的股票不得入场" value={allocation.minimum_candidate_momentum20_pct} suffix="%" step={0.5} onChange={allocationField("minimum_candidate_momentum20_pct")} />
+            <PortfolioNumberField label="个股趋势门槛" description="0 至 2；至少满足一层均线趋势" value={allocation.minimum_candidate_trend} suffix="/2" step={1} onChange={allocationField("minimum_candidate_trend")} />
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="flex items-center justify-between gap-4 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">弱市退出</span><span className="mt-1 block text-xs text-muted-foreground">状态转为弱势或数据不足时生成退出单</span></span><Switch checked={allocation.exit_on_risk_off} onCheckedChange={(exit_on_risk_off) => onAllocationChange({ exit_on_risk_off })} /></label>
+            <label className="flex items-center justify-between gap-4 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">按目标仓位再平衡</span><span className="mt-1 block text-xs text-muted-foreground">状态降级时先退出信号最弱的持仓</span></span><Switch checked={allocation.rebalance_to_target_exposure} onCheckedChange={(rebalance_to_target_exposure) => onAllocationChange({ rebalance_to_target_exposure })} /></label>
+          </div>
+        </div>
+      </section>
+      <section className="overflow-hidden rounded-lg border bg-background shadow-xs">
+        <div className="flex flex-col justify-between gap-4 border-b px-5 py-4 sm:flex-row sm:items-center sm:px-6">
+          <div className="flex items-start gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><Database className="size-4" /></div><div><h3 className="text-sm font-semibold">策略持仓 Pipeline</h3><p className="mt-1 text-xs text-muted-foreground">信号 → 意图 → 风控 → 模拟成交 → 持仓 → 退出 → 账本</p></div></div>
+          <div className="flex items-center gap-3"><Button asChild size="sm" variant="outline"><a href={performanceUrl} target="_blank" rel="noreferrer">查看策略表现</a></Button><Switch aria-label="启用策略持仓" checked={portfolio.enabled} onCheckedChange={(enabled) => onChange({ enabled })} /></div>
+        </div>
+        <div className={cn("space-y-6 px-5 py-5 sm:px-6", !portfolio.enabled && "opacity-55")}>
+          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">组合与入场</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField disabled label="最大持仓" description="硬上限；每只股票占用一个独立槽位" value={portfolio.max_positions} suffix="只" onChange={field("max_positions")} />
+            <PortfolioNumberField label="初始资金" description="每个策略独立的模拟账户本金" value={portfolio.initial_cash} suffix="元" step={10000} onChange={field("initial_cash")} />
+            <PortfolioNumberField label="目标权重" description="按下单前冻结净值计算，未用资金保留现金" value={portfolio.target_weight_pct} suffix="%" step={0.5} onChange={field("target_weight_pct")} />
+            <PortfolioNumberField label="信号失效" description="连续多少次日评估无效后退出" value={portfolio.signal_invalid_days} suffix="天" onChange={field("signal_invalid_days")} />
+          </div></div>
+          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">退出与替换</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField label="固定止损" description="相对含费成本触发退出" value={portfolio.stop_loss_pct} suffix="%" step={0.5} onChange={field("stop_loss_pct")} />
+            <PortfolioNumberField label="追踪止盈激活" description="从成本上涨到该幅度后开始追踪峰值" value={portfolio.trailing_activation_pct} suffix="%" step={0.5} onChange={field("trailing_activation_pct")} />
+            <PortfolioNumberField label="峰值回撤退出" description="追踪激活后相对峰值的退出距离" value={portfolio.trailing_drawdown_pct} suffix="%" step={0.5} onChange={field("trailing_drawdown_pct")} />
+            <PortfolioNumberField label="替换分差" description="新候选至少高出当前持仓的信号分" value={portfolio.replacement_score_delta} suffix="分" step={0.01} onChange={field("replacement_score_delta")} />
+          </div></div>
+          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">组合回撤闸门</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField label="预警线" description="停止新开仓并限制组合暴露" value={portfolio.warning_drawdown_pct} suffix="%" step={0.5} onChange={field("warning_drawdown_pct")} />
+            <PortfolioNumberField label="只减仓线" description="退出全部当前可卖持仓" value={portfolio.derisk_drawdown_pct} suffix="%" step={0.5} onChange={field("derisk_drawdown_pct")} />
+            <PortfolioNumberField label="人工暂停线" description="暂停信号与新订单，保留风控执行" value={portfolio.halt_drawdown_pct} suffix="%" step={0.5} onChange={field("halt_drawdown_pct")} />
+            <PortfolioNumberField label="预警最大暴露" description="预警状态允许的最高股票仓位" value={portfolio.warning_max_exposure_pct} suffix="%" step={1} onChange={field("warning_max_exposure_pct")} />
+          </div></div>
+          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">模拟成交成本</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField label="佣金率" description="买卖双边；另计最低佣金" value={portfolio.commission_rate_pct} suffix="%" step={0.001} onChange={field("commission_rate_pct")} />
+            <PortfolioNumberField label="最低佣金" description="单笔最低佣金金额" value={portfolio.minimum_commission_cny} suffix="元" step={1} onChange={field("minimum_commission_cny")} />
+            <PortfolioNumberField label="卖出印花税" description="仅卖出方向计费" value={portfolio.stamp_duty_rate_pct} suffix="%" step={0.001} onChange={field("stamp_duty_rate_pct")} />
+            <PortfolioNumberField label="滑点" description="在下一可执行行情基础上的保守偏移" value={portfolio.slippage_bps} suffix="bps" step={1} onChange={field("slippage_bps")} />
+          </div></div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="grid gap-2 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">基准代码</span><span className="mt-1 block text-xs text-muted-foreground">用于对比策略超额收益</span></span><Input value={portfolio.benchmark_symbol} onChange={(event) => onChange({ benchmark_symbol: event.target.value })} /></label>
+            <label className="grid gap-2 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">基准名称</span><span className="mt-1 block text-xs text-muted-foreground">策略表现页显示名称</span></span><Input value={portfolio.benchmark_name} onChange={(event) => onChange({ benchmark_name: event.target.value })} /></label>
+          </div>
+        </div>
+      </section>
+      <p className="text-xs leading-6 text-muted-foreground">订单不会使用产生信号的同一时点价格成交；买入遵守整手与 T+1，卖出受可卖数量、涨跌停和成交量参与率约束。策略版本变化会撤销旧版本未成交订单。</p>
+    </div>
+  )
+}
+
 function DeliverySettings({
   delivery,
   isActive,
@@ -544,6 +646,16 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
     setDirty(true)
   }
 
+  const updatePortfolio = (patch: Partial<PortfolioConfig>) => {
+    setConfig((current) => ({ ...current, portfolio: { ...current.portfolio, ...patch } }))
+    setDirty(true)
+  }
+
+  const updateAllocation = (patch: Partial<AllocationConfig>) => {
+    setConfig((current) => ({ ...current, allocation: { ...current.allocation, ...patch } }))
+    setDirty(true)
+  }
+
   const activeCount = parameters.filter((item) => item.enabled).length
   const effectiveCount = parameters.filter((item) => item.enabled && item.status !== "planned").length
   const plannedActiveCount = parameters.filter((item) => item.enabled && item.status === "planned").length
@@ -621,8 +733,10 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   }
 
   const groups = initialData.groups
-  const navItems = [{ id: "all", label: "全部参数", description: "完整参数目录" }, ...groups, { id: "delivery", label: "报告推送", description: "定时与接收渠道" }]
+  const navItems = [{ id: "all", label: "全部参数", description: "完整参数目录" }, ...groups, { id: "portfolio", label: "持仓 Pipeline", description: "组合、退出与风控" }, { id: "delivery", label: "报告推送", description: "定时与接收渠道" }]
   const deliveryView = activeGroup === "delivery"
+  const portfolioView = activeGroup === "portfolio"
+  const settingsView = deliveryView || portfolioView
 
   return (
     <div className="min-h-screen bg-muted/25 text-foreground">
@@ -635,11 +749,12 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
         <nav className="p-3">
           <p className="px-2 pb-2 pt-1 text-[11px] font-medium text-muted-foreground">策略配置</p>
           {navItems.map((group) => {
-            const count = group.id === "delivery" ? 0 : group.id === "all" ? parameters.length : parameters.filter((item) => item.group === group.id).length
-            const enabled = group.id === "delivery" ? 0 : group.id === "all" ? activeCount : parameters.filter((item) => item.group === group.id && item.enabled).length
+            const special = group.id === "delivery" || group.id === "portfolio"
+            const count = special ? 0 : group.id === "all" ? parameters.length : parameters.filter((item) => item.group === group.id).length
+            const enabled = special ? 0 : group.id === "all" ? activeCount : parameters.filter((item) => item.group === group.id && item.enabled).length
             return (
               <button key={group.id} className={cn("mb-0.5 flex w-full items-center justify-between rounded-md px-2.5 py-2 text-left text-sm transition-colors", activeGroup === group.id ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground" : "text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground")} onClick={() => { setActiveGroup(group.id); setMobileNavOpen(false) }}>
-                <span>{group.label}</span>{group.id === "delivery" ? <BellRing className={cn("size-3.5", config.delivery.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : <span className="font-mono text-[10px] text-muted-foreground">{enabled}/{count}</span>}
+                <span>{group.label}</span>{group.id === "delivery" ? <BellRing className={cn("size-3.5", config.delivery.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : group.id === "portfolio" ? <Database className={cn("size-3.5", config.portfolio.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : <span className="font-mono text-[10px] text-muted-foreground">{enabled}/{count}</span>}
               </button>
             )
           })}
@@ -661,7 +776,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
           <div className="flex min-w-0 items-center gap-2 sm:gap-3">
             <Button size="icon" variant="ghost" className="lg:hidden" onClick={() => setMobileNavOpen(true)}><Menu /></Button>
             <Button size="icon" variant="ghost" className="hidden lg:inline-flex" onClick={onBack}><ArrowLeft /><span className="sr-only">返回策略库</span></Button>
-            <div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-sm font-semibold">{config.name}</h1>{isActive && <Badge variant="success" className="hidden sm:inline-flex">使用中</Badge>}</div><p className="truncate text-xs text-muted-foreground">{dirty ? "有未保存修改" : config.updated_at ? `更新于 ${new Date(config.updated_at).toLocaleString("zh-CN")}` : "尚未保存"}</p></div>
+            <div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-sm font-semibold">{config.name}</h1>{isActive && <Badge variant="success" className="hidden sm:inline-flex">使用中</Badge>}</div><p className="truncate text-xs text-muted-foreground">{config.signal.model} · {config.signal.run_time} · {dirty ? "有未保存修改" : config.updated_at ? `更新于 ${new Date(config.updated_at).toLocaleString("zh-CN")}` : "尚未保存"}</p></div>
           </div>
           <div className="flex items-center gap-1 sm:gap-2">
             {!isActive && <Button variant="outline" size="sm" disabled={activateMutation.isPending} onClick={() => activateMutation.mutate()}><ShieldCheck />启用策略</Button>}
@@ -675,8 +790,8 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
         <main className="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8">
           <section className="mb-6 border-b pb-6">
             <div className="flex flex-col justify-between gap-4 md:flex-row md:items-end">
-              <div><div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground"><ShieldCheck className="size-3.5" />{isActive ? "当前使用" : "未使用"}</div><h2 className="text-xl font-semibold tracking-tight">{deliveryView ? "报告推送" : "筛选参数"}</h2><p className="mt-1.5 text-sm text-muted-foreground">{deliveryView ? "配置报告的推送时间、渠道和通知范围。" : "已接入参数会直接参与过滤；待接入参数用于保存下一版策略意图。"}</p></div>
-              {!deliveryView && <div className="grid grid-cols-3 divide-x rounded-lg border bg-background px-1 shadow-xs">
+              <div><div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground"><ShieldCheck className="size-3.5" />{isActive ? "当前使用" : "未使用"}</div><h2 className="text-xl font-semibold tracking-tight">{deliveryView ? "报告推送" : portfolioView ? "持仓 Pipeline" : "筛选参数"}</h2><p className="mt-1.5 text-sm text-muted-foreground">{deliveryView ? "配置报告的推送时间、渠道和通知范围。" : portfolioView ? "配置每个策略独立的模拟组合、退出规则、回撤闸门和成交成本。" : "已接入参数会直接参与过滤；待接入参数用于保存下一版策略意图。"}</p></div>
+              {!settingsView && <div className="grid grid-cols-3 divide-x rounded-lg border bg-background px-1 shadow-xs">
                 <div className="px-4 py-2.5"><div className="font-mono text-lg font-semibold tabular-nums">{activeCount}</div><div className="text-[11px] text-muted-foreground">已启用</div></div>
                 <div className="px-4 py-2.5"><div className="font-mono text-lg font-semibold tabular-nums text-emerald-700">{effectiveCount}</div><div className="text-[11px] text-muted-foreground">实际生效</div></div>
                 <div className="px-4 py-2.5"><div className="font-mono text-lg font-semibold tabular-nums text-amber-700">{plannedActiveCount}</div><div className="text-[11px] text-muted-foreground">等待数据</div></div>
@@ -684,7 +799,9 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
             </div>
           </section>
 
-          {deliveryView ? (
+          {portfolioView ? (
+            <PortfolioSettings portfolio={config.portfolio} allocation={config.allocation} strategyId={config.id!} onChange={updatePortfolio} onAllocationChange={updateAllocation} />
+          ) : deliveryView ? (
             <DeliverySettings
               delivery={config.delivery}
               isActive={isActive}
@@ -810,7 +927,11 @@ function StrategyRow({ strategy, onEdit, onUsageChange, usagePending, onDuplicat
     <div className="flex flex-col gap-4 rounded-lg border bg-background p-4 shadow-xs sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-3">
         <div className={cn("mt-0.5 grid size-9 shrink-0 place-items-center rounded-md", strategy.is_active ? "bg-emerald-50 text-emerald-700" : "bg-muted text-muted-foreground")}><SlidersHorizontal className="size-4" /></div>
-        <div className="min-w-0"><h3 className="truncate font-medium">{strategy.name}</h3><p className="mt-1 truncate text-xs text-muted-foreground">{strategy.description || "暂无说明"}</p></div>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2"><h3 className="truncate font-medium">{strategy.name}</h3><Badge variant={strategy.lifecycle.stage === "live" ? "success" : strategy.lifecycle.stage === "paper" ? "info" : "secondary"}>{lifecycleCopy[strategy.lifecycle.stage]}</Badge><span className="font-mono text-[10px] text-muted-foreground">v{strategy.revision}</span></div>
+          <p className="mt-1 truncate text-xs text-muted-foreground">{strategy.description || "暂无说明"}</p>
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground">{strategy.signal.model} · {strategy.signal.run_time} · 前一交易日收盘数据</p>
+        </div>
       </div>
       <div className="flex items-center gap-5 text-xs text-muted-foreground"><span><strong className="mr-1 font-mono text-foreground">{strategy.active_parameters}</strong>参数</span><span className="hidden items-center gap-1.5 lg:flex"><BellRing className="size-3.5" />{deliverySummary(strategy.delivery)}</span><span>{strategy.updated_at ? new Date(strategy.updated_at).toLocaleDateString("zh-CN") : "未更新"}</span></div>
       <div className="flex w-full flex-wrap items-center justify-end gap-1 self-stretch sm:w-auto sm:flex-nowrap sm:self-auto">

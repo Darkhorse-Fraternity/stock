@@ -6,17 +6,31 @@ from typing import Callable, Iterable
 
 from .config import MAX_FLOAT_MARKET_CAP, MIN_FLOAT_MARKET_CAP
 from .data_sources import fetch_tick_rows
-from .parameters import PARAMETERS_BY_ID, chase_risk_threshold, load_strategy_config, parameter_value
+from .parameters import PARAMETERS_BY_ID, load_strategy_config, parameter_value
+from .signal_engine import rank_signal_rows, select_ranked_signals
+from .universe import row_matches_sector
 from .utils import number
 
 
-def filter_candidates(rows: Iterable[dict], strategy: dict | None = None, *, include_enriched: bool = True) -> list[dict]:
+def filter_candidates(
+    rows: Iterable[dict],
+    strategy: dict | None = None,
+    *,
+    include_enriched: bool = True,
+    sector_filters: str | Iterable[object] | None = None,
+) -> list[dict]:
+    materialized = list(rows)
+    apply_legacy_market_cap = strategy is None and any(
+        number(row.get("float_market_cap"), default=0.0) > 0 for row in materialized
+    )
     strategy = strategy or load_strategy_config()
     prefixes = tuple(parameter_value(strategy, "stock_prefixes", ["0", "3", "6"]))
     exclude_st = bool(parameter_value(strategy, "exclude_st", True))
     exclude_suspended = bool(parameter_value(strategy, "exclude_suspended", True))
     candidates = []
-    for row in rows:
+    for row in materialized:
+        if not row_matches_sector(row, sector_filters):
+            continue
         symbol = str(row.get("symbol") or "")
         name = str(row.get("name") or "")
         if prefixes and not symbol.startswith(prefixes):
@@ -49,6 +63,10 @@ def filter_candidates(rows: Iterable[dict], strategy: dict | None = None, *, inc
             continue
         if not _matches_optional_numeric(strategy, "float_market_cap_max", row.get("float_market_cap"), "max"):
             continue
+        if apply_legacy_market_cap:
+            float_market_cap = number(row.get("float_market_cap"), default=0.0)
+            if not (MIN_FLOAT_MARKET_CAP <= float_market_cap <= MAX_FLOAT_MARKET_CAP):
+                continue
         if not _matches_optional_numeric(strategy, "total_market_cap_min", row.get("total_market_cap"), "min"):
             continue
         if not _matches_optional_numeric(strategy, "total_market_cap_max", row.get("total_market_cap"), "max"):
@@ -257,92 +275,15 @@ def price_position(row: dict) -> dict:
 
 
 def analyze(row: dict, strategy: dict | None = None) -> dict:
-    percent = number(row.get("percent"))
-    turnover_rate = number(row.get("turnover_rate"))
-    turnover = number(row.get("turnover"))
-    pe = number(row.get("pe"))
-    score = 52
-    reasons: list[str] = []
-    risk_level = "中"
+    ranked = rank_signal_rows([row], strategy=strategy)
+    if not ranked:
+        raise ValueError("候选缺少 factor_rank_v1 所需的历史信号特征")
+    return ranked[0]
 
-    if percent >= chase_risk_threshold(strategy):
-        score += 24
-        risk_level = "高"
-        reasons.append(f"强势拉升 {percent:.2f}%，短线热度很高")
-    elif percent >= 3:
-        score += 16
-        reasons.append(f"上涨 {percent:.2f}%，题材动能偏强")
-    elif percent >= 0.5:
-        score += 8
-        reasons.append(f"温和上涨 {percent:.2f}%，走势相对稳健")
-    elif percent > -2:
-        score += 2
-        reasons.append(f"窄幅波动 {percent:.2f}%，适合继续观察")
-    else:
-        score -= 8
-        reasons.append(f"回调 {abs(percent):.2f}%，需要控制风险")
 
-    if turnover_rate >= 8:
-        score += 10
-        reasons.append(f"换手率 {turnover_rate:.2f}%，资金博弈活跃")
-    elif turnover_rate >= 2:
-        score += 5
-        reasons.append(f"换手率 {turnover_rate:.2f}%，流动性较好")
-
-    if turnover >= 1_000_000_000:
-        score += 8
-        reasons.append(f"成交额 {turnover / 100_000_000:.1f} 亿，关注度高")
-    elif turnover >= 200_000_000:
-        score += 4
-        reasons.append(f"成交额 {turnover / 100_000_000:.1f} 亿")
-
-    if 0 < pe <= 60:
-        score += 4
-        reasons.append(f"PE {pe:.2f}，估值未极端失真")
-    elif pe > 120 or pe < 0:
-        score -= 4
-        reasons.append(f"PE {pe:.2f}，估值/盈利质量需谨慎")
-
-    final_score = max(0, min(100, score))
-    if final_score >= 85:
-        rating, emoji = "强烈关注", "🔥"
-    elif final_score >= 72:
-        rating, emoji = "积极关注", "⭐"
-    elif final_score >= 60:
-        rating, emoji = "值得关注", "🌟"
-    else:
-        rating, emoji = "观察", "📊"
-
-    return {
-        **row,
-        "score": final_score,
-        "rating": rating,
-        "rating_emoji": emoji,
-        "reasons": reasons,
-        "risk_level": risk_level,
-    }
+def analyze_candidates(rows: Iterable[dict], strategy: dict | None = None) -> list[dict]:
+    return rank_signal_rows(rows, strategy=strategy)
 
 
 def select_agent_candidates(analyses: list[dict], limit: int, strategy: dict | None = None) -> list[dict]:
-    if limit <= 0:
-        return []
-    threshold = chase_risk_threshold(strategy)
-    hot = [item for item in analyses if number(item.get("percent")) >= threshold]
-    moderate = [item for item in analyses if 0 <= number(item.get("percent")) < threshold]
-    weak = [item for item in analyses if number(item.get("percent")) < 0]
-
-    selected: list[dict] = []
-
-    def add(items: list[dict], count: int) -> None:
-        for item in items:
-            if len(selected) >= limit or count <= 0:
-                return
-            if all(existing["symbol"] != item["symbol"] for existing in selected):
-                selected.append(item)
-                count -= 1
-
-    add(hot, min(2, limit))
-    add(moderate, max(1, limit - len(selected)))
-    add(weak, limit - len(selected))
-    add(analyses, limit - len(selected))
-    return selected[:limit]
+    return select_ranked_signals(analyses, limit, strategy=strategy)
