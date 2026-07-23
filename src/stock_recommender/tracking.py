@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 import re
 from datetime import datetime
@@ -10,49 +11,11 @@ from .data_sources import fetch_board_quotes, fetch_watchlist_quotes
 from .parameters import record_paper_session
 from .performance import upsert_recommendation_history
 from .portfolio import plan_daily_candidates
+from .recommendation import RecommendationPlan, recommendation_tracking_entries
 from .reports import format_recommendation_snapshot
+from .runtime import assert_strategy_runnable
 from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
-
-
-TRACKING_HEADER = "📈 **推荐股每小时成交与涨跌跟踪**"
-_SNAPSHOT_LINE = re.compile(
-    r"^- (?P<name>.+?) \((?P<symbol>\d{6})\)：最新价 ¥(?P<price>\d+(?:\.\d+)?)，涨跌幅 (?P<percent>[+-]?\d+(?:\.\d+)?)%；",
-    flags=re.M,
-)
-
-
-def extract_recommended_symbols(report: str) -> list[str]:
-    if TRACKING_HEADER not in report:
-        return []
-    section = report.split(TRACKING_HEADER, 1)[1]
-    symbols: list[str] = []
-    for symbol in re.findall(r"^\s*- .*?\((\d{6})\)：", section, flags=re.M):
-        if symbol not in symbols:
-            symbols.append(symbol)
-    return symbols
-
-
-def extract_recommendation_entries(report: str) -> list[dict]:
-    if TRACKING_HEADER not in report:
-        return []
-    section = report.split(TRACKING_HEADER, 1)[1]
-    entries = []
-    for match in _SNAPSHOT_LINE.finditer(section):
-        price = number(match.group("price"))
-        entries.append(
-            {
-                "symbol": match.group("symbol"),
-                "name": match.group("name").strip(),
-                "entry_price": price,
-                "initial_change_pct": number(match.group("percent")),
-                "max_observed_price": price,
-                "min_observed_price": price,
-                "last_price": price,
-                "last_volume": None,
-            }
-        )
-    return entries
 
 
 def _average_change(rows: list[dict]) -> float | None:
@@ -70,40 +33,27 @@ def _save_state(target: Path, payload: dict) -> None:
 
 def save_daily_selection(
     path: str | Path,
-    report: str,
+    plan: RecommendationPlan,
     *,
     now: datetime | None = None,
     strategy: dict | None = None,
-    board_code: str = "BK0800",
-    board_name: str = "人工智能",
     benchmark_fetcher: Callable | None = None,
     history_path: str | Path | None = None,
     portfolio_path: str | Path | None = None,
 ) -> list[str]:
-    entries = extract_recommendation_entries(report)
-    symbols = [item["symbol"] for item in entries] or extract_recommended_symbols(report)
-    if not symbols:
+    if strategy and strategy.get("id"):
+        assert_strategy_runnable(strategy, execution_kind="scheduled", mode="report")
+    entries = recommendation_tracking_entries(plan)
+    symbols = [item["symbol"] for item in entries]
+    market_regime = deepcopy(plan.market_regime)
+    if not symbols and not (strategy or {}).get("id"):
         return []
-    if not entries:
-        entries = [
-            {
-                "symbol": symbol,
-                "name": symbol,
-                "entry_price": 0.0,
-                "initial_change_pct": 0.0,
-                "max_observed_price": 0.0,
-                "min_observed_price": 0.0,
-                "last_price": 0.0,
-                "last_volume": None,
-            }
-            for symbol in symbols
-        ]
-    current = beijing_now(now)
+    current = beijing_now(now or plan.generated_at)
     benchmark_change = None
     benchmark_error = None
     if benchmark_fetcher is not None:
         try:
-            rows, benchmark_error = benchmark_fetcher(board_code, board_name=board_name)
+            rows, benchmark_error = benchmark_fetcher(plan.board_code, board_name=plan.board_name)
             benchmark_change = _average_change(rows)
         except Exception as exc:
             benchmark_error = str(exc)
@@ -119,11 +69,14 @@ def save_daily_selection(
         "strategy_name": (strategy or {}).get("name"),
         "strategy_revision": (strategy or {}).get("revision", 1),
         "strategy_stage": lifecycle.get("stage", "draft"),
-        "board_code": board_code,
-        "board_name": board_name,
+        "signal_model": (strategy or {}).get("signal", {}).get("model"),
+        "signal_data_cutoff": (strategy or {}).get("signal", {}).get("data_cutoff"),
+        "board_code": plan.board_code,
+        "board_name": plan.board_name,
         "benchmark_mode": "board_constituent_equal_weight",
         "benchmark_initial_change_pct": benchmark_change,
         "benchmark_error": benchmark_error,
+        "market_regime": market_regime,
     }
     _save_state(target, payload)
     if payload["strategy_id"] and payload["strategy_stage"] == "paper":
@@ -134,7 +87,13 @@ def save_daily_selection(
             _save_state(target, payload)
     if payload["strategy_id"] and (strategy or {}).get("portfolio", {}).get("enabled", True):
         try:
-            account, events = plan_daily_candidates(strategy or {}, entries, now=current, path=portfolio_path)
+            account, events = plan_daily_candidates(
+                strategy or {},
+                entries,
+                now=current,
+                path=portfolio_path,
+                market_regime=market_regime,
+            )
             payload["portfolio_account_id"] = account.get("id")
             payload["portfolio_event_ids"] = [event.get("id") for event in events]
             _save_state(target, payload)
@@ -302,7 +261,7 @@ def generate_saved_tracking_report(
             benchmark_line,
             *detail_lines,
             "",
-            "仅跟踪今日 09:35 生成的模拟观察名单，不重新选股。",
+            "仅跟踪今日 08:00 基于前一交易日收盘数据生成的策略持仓，不重新选股。",
             "仅供策略验证，不构成投资建议。",
         ]
     )

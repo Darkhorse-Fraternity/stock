@@ -21,7 +21,7 @@ from stock_recommender.backtest import (
     start_backtest,
     walk_forward_windows,
 )
-from stock_recommender.context import collect_analyzed_candidates, extract_market_payload, generate_agent_context
+from stock_recommender.context import collect_analyzed_candidates, collect_recommendation_plan, extract_market_payload, generate_agent_context
 from stock_recommender.data_sources import (
     akshare_symbol,
     fallback_quotes,
@@ -51,14 +51,17 @@ from stock_recommender.reports import (
     format_recommendation_snapshot,
     format_volume_hands,
     generate_ai_report,
+    generate_ai_report_result,
     generate_report,
+    generate_report_result,
     ignition_signal_summary,
     market_sentiment_profile,
     price_position_summary,
-    select_snapshot_candidates,
 )
+from stock_recommender.recommendation import RecommendationOutput, RecommendationPlan, build_recommendation_plan
 from stock_recommender.selection import (
     analyze,
+    analyze_candidates,
     attach_ignition_signals,
     evaluate_tick_ignition,
     filter_candidates,
@@ -66,12 +69,10 @@ from stock_recommender.selection import (
     select_agent_candidates,
     tick_seconds,
 )
+from stock_recommender.signal_engine import SIGNAL_MODEL_ID, extract_signal_features, rank_signal_rows, signal_contract
 from stock_recommender.cli import main
 from stock_recommender.schedule import DEFAULT_PUBLISH_HOURS, is_market_open, is_weekday, parse_publish_hours, should_publish_now
 from stock_recommender.tracking import (
-    TRACKING_HEADER,
-    extract_recommendation_entries,
-    extract_recommended_symbols,
     generate_saved_tracking_report,
     load_daily_selection,
     load_daily_selection_state,
@@ -100,7 +101,8 @@ __all__ = [
     "MAX_FLOAT_MARKET_CAP",
     "MIN_FLOAT_MARKET_CAP",
     "STATIC_FALLBACK",
-    "TRACKING_HEADER",
+    "RecommendationOutput",
+    "RecommendationPlan",
     "PipelineContractError",
     "PipelineRunner",
     "PipelineStage",
@@ -111,6 +113,7 @@ __all__ = [
     "deflated_sharpe_probability",
     "akshare_symbol",
     "analyze",
+    "analyze_candidates",
     "append_candidate_explanation",
     "apply_risk_guard",
     "attach_ignition_signals",
@@ -119,9 +122,9 @@ __all__ = [
     "call_llm_analysis",
     "candidate_action",
     "collect_analyzed_candidates",
+    "collect_recommendation_plan",
     "evaluate_tick_ignition",
     "evaluate_approval_gate",
-    "extract_recommendation_entries",
     "extract_market_payload",
     "fallback_quotes",
     "fetch_board_quotes",
@@ -138,7 +141,9 @@ __all__ = [
     "generate_saved_tracking_report",
     "generate_agent_context",
     "generate_ai_report",
+    "generate_ai_report_result",
     "generate_report",
+    "generate_report_result",
     "get_backtest",
     "ignition_signal_summary",
     "main",
@@ -154,8 +159,11 @@ __all__ = [
     "price_position",
     "price_position_summary",
     "select_agent_candidates",
-    "select_snapshot_candidates",
-    "extract_recommended_symbols",
+    "SIGNAL_MODEL_ID",
+    "extract_signal_features",
+    "rank_signal_rows",
+    "signal_contract",
+    "build_recommendation_plan",
     "load_daily_selection",
     "load_daily_selection_state",
     "load_portfolio_account",

@@ -1,10 +1,11 @@
+import json
 import tempfile
 import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-from stock_recommender.backtest import get_backtest, run_walk_forward_backtest, start_backtest, walk_forward_windows
+from stock_recommender.backtest import get_backtest, load_backtest_dataset_file, run_walk_forward_backtest, start_backtest, walk_forward_windows
 from stock_recommender.parameters import (
     StrategyLifecycleError,
     create_strategy,
@@ -16,6 +17,7 @@ from stock_recommender.parameters import (
     save_strategy_config,
     transition_strategy_stage,
 )
+from stock_recommender.portfolio_backtest import normalize_universe_snapshots, universe_for_day
 
 
 def synthetic_dataset(days=240, *, point_in_time=True):
@@ -36,6 +38,12 @@ def synthetic_dataset(days=240, *, point_in_time=True):
                     "high": price * 1.01,
                     "low": price * 0.99,
                     "volume": 100000 + offset * (100 + index),
+                    "open_volume": 100000 + offset * (100 + index),
+                    "close_volume": 100000 + offset * (100 + index),
+                    "entry_price": price,
+                    "exit_price": price * (1 + growth / 2),
+                    "upper_limit": price * 1.1,
+                    "lower_limit": price * 0.9,
                 }
             )
         panel[symbol] = rows
@@ -46,9 +54,17 @@ def synthetic_dataset(days=240, *, point_in_time=True):
     return {
         "panel": panel,
         "benchmark": benchmark,
+        "universe_by_date": {
+            (start + timedelta(days=offset)).isoformat(): list(panel)
+            for offset in range(days)
+        },
         "metadata": {
             "point_in_time_complete": point_in_time,
+            "benchmark_complete": True,
             "strategy_parity_complete": True,
+            "execution_data_complete": True,
+            "execution_price_mode": "intraday_0935_1500",
+            "corporate_actions_complete": True,
             "parameter_trials": 1,
         },
     }
@@ -76,6 +92,19 @@ def compact_validation(strategy):
 
 
 class BacktestTests(unittest.TestCase):
+    def test_point_in_time_universe_never_uses_future_snapshot(self):
+        snapshots = normalize_universe_snapshots(
+            {
+                "2026-01-01": ["600001"],
+                "2026-02-01": ["600002"],
+            }
+        )
+
+        symbols, covered = universe_for_day(snapshots, date(2026, 1, 31), {"600999"})
+
+        self.assertTrue(covered)
+        self.assertEqual(symbols, {"600001"})
+
     def test_walk_forward_uses_ordered_non_overlapping_test_windows(self):
         days = [date(2024, 1, 1) + timedelta(days=index) for index in range(140)]
         windows = walk_forward_windows(days, {"train_days": 70, "validation_days": 10, "gap_days": 2, "test_days": 20})
@@ -94,7 +123,12 @@ class BacktestTests(unittest.TestCase):
         self.assertGreater(result["metrics"]["mean_excess_return_pct"], 0)
         self.assertLess(result["metrics"]["stressed_mean_excess_return_pct"], result["metrics"]["mean_excess_return_pct"])
         self.assertTrue(result["approval_gate"]["passed"])
-        self.assertEqual(result["method"], "rolling_walk_forward_fixed_factor_rank")
+        self.assertEqual(result["method"], "rolling_walk_forward_portfolio_pipeline_v1")
+        self.assertEqual(result["metadata"]["signal_model"], "factor_rank_v1")
+        self.assertEqual(result["execution"]["data_cutoff"], "previous_trading_day_close")
+        self.assertEqual(result["execution"]["exit"], "shared_portfolio_pipeline")
+        self.assertLessEqual(result["metrics"]["maximum_positions_observed"], 10)
+        self.assertGreater(result["metrics"]["maximum_drawdown_pct"], -100)
 
     def test_current_constituent_dataset_cannot_pass_live_gate(self):
         strategy = compact_validation(load_strategy_config(path=Path("/missing")))
@@ -114,6 +148,93 @@ class BacktestTests(unittest.TestCase):
 
         self.assertFalse(check["passed"])
         self.assertFalse(result["approval_gate"]["passed"])
+
+    def test_missing_benchmark_or_execution_data_cannot_pass_gate(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset()
+        dataset["metadata"]["benchmark_complete"] = False
+        dataset["metadata"]["execution_data_complete"] = False
+
+        result = run_walk_forward_backtest(dataset, strategy)
+        checks = {item["id"]: item for item in result["approval_gate"]["checks"]}
+
+        self.assertFalse(checks["benchmark"]["passed"])
+        self.assertFalse(checks["execution_data"]["passed"])
+        self.assertFalse(result["approval_gate"]["passed"])
+
+    def test_missing_corporate_actions_cannot_pass_gate(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset()
+        dataset["metadata"]["corporate_actions_complete"] = False
+
+        result = run_walk_forward_backtest(dataset, strategy)
+        check = next(item for item in result["approval_gate"]["checks"] if item["id"] == "corporate_actions")
+
+        self.assertFalse(check["passed"])
+        self.assertFalse(result["approval_gate"]["passed"])
+
+    def test_execution_capability_claim_is_verified_against_rows(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset()
+        for rows in dataset["panel"].values():
+            for row in rows:
+                row.pop("open_volume", None)
+
+        result = run_walk_forward_backtest(dataset, strategy)
+        check = next(item for item in result["approval_gate"]["checks"] if item["id"] == "execution_data")
+
+        self.assertFalse(check["passed"])
+        self.assertFalse(result["approval_gate"]["passed"])
+
+    def test_missing_point_in_time_membership_cannot_pass_gate(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset()
+        dataset.pop("universe_by_date")
+
+        result = run_walk_forward_backtest(dataset, strategy)
+        check = next(item for item in result["approval_gate"]["checks"] if item["id"] == "point_in_time")
+
+        self.assertFalse(check["passed"])
+        self.assertFalse(result["approval_gate"]["passed"])
+
+    def test_explicit_point_in_time_period_does_not_require_a_full_walk_forward_window(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset(days=240)
+        dataset["evaluation_period"] = {"start": "2024-07-20", "end": "2024-08-10"}
+
+        result = run_walk_forward_backtest(dataset, strategy)
+
+        self.assertEqual(result["method"], "point_in_time_holdout_portfolio_pipeline_v1")
+        self.assertEqual(result["metrics"]["folds"], 1)
+        self.assertGreater(result["metrics"]["oos_events"], 0)
+
+    def test_daily_proxy_prices_remain_usable_when_exact_execution_fields_are_absent(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        dataset = synthetic_dataset(days=240)
+        dataset["evaluation_period"] = {"start": "2024-07-20", "end": "2024-08-10"}
+        dataset["metadata"]["execution_data_complete"] = False
+        dataset["metadata"]["execution_price_mode"] = "daily_open_close_proxy"
+        for rows in dataset["panel"].values():
+            for row in rows:
+                row.pop("entry_price", None)
+                row.pop("exit_price", None)
+
+        result = run_walk_forward_backtest(dataset, strategy)
+
+        self.assertNotEqual(result["metrics"]["cumulative_return_pct"], 0)
+        check = next(item for item in result["approval_gate"]["checks"] if item["id"] == "execution_data")
+        self.assertFalse(check["passed"])
+
+    def test_local_dataset_contract_loads_without_production_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "point-in-time.json"
+            expected = synthetic_dataset(days=5)
+            path.write_text(json.dumps(expected, ensure_ascii=False), encoding="utf-8")
+
+            loaded = load_backtest_dataset_file(path)
+
+        self.assertEqual(set(loaded["panel"]), set(expected["panel"]))
+        self.assertEqual(loaded["metadata"]["source"], "local_point_in_time_dataset")
 
     def test_async_backtest_persists_result_and_moves_strategy_to_paper(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -175,7 +296,7 @@ class BacktestTests(unittest.TestCase):
             strategy = create_strategy("旧活动策略", path=path)
             payload = load_strategy_store(path=path)
             payload["strategies"][0].pop("lifecycle", None)
-            path.write_text(__import__("json").dumps(payload, ensure_ascii=False), encoding="utf-8")
+            path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
             migrated = load_strategy_config(path=path)
 

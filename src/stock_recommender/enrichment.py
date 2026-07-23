@@ -9,6 +9,7 @@ from typing import Callable, Iterable
 
 from .market_history import fetch_daily_history_with_cache
 from .parameters import load_strategy_config
+from .signal_engine import extract_signal_features, normalize_signal_history
 
 
 TECHNICAL_PARAMETER_IDS = {
@@ -308,27 +309,38 @@ def enrich_candidates(
     history_fetcher: Callable[[str], list[dict]] | None = None,
     financial_fetcher: Callable[[str], dict] | None = None,
     limit: int | None = None,
+    signal_cutoff: date | datetime | str | None = None,
 ) -> list[dict]:
     current = strategy or load_strategy_config()
     needs_technical = _requires(current, TECHNICAL_PARAMETER_IDS)
     needs_financial = _requires(current, FINANCIAL_PARAMETER_IDS)
     candidates = [dict(row) for row in rows]
-    if not needs_technical and not needs_financial:
-        return candidates
 
-    maximum = limit if limit is not None else int(os.getenv("STOCK_AGENT_ENRICH_LIMIT", "12"))
+    maximum = limit if limit is not None else int(os.getenv("STOCK_AGENT_SIGNAL_UNIVERSE_LIMIT", "30"))
     target_count = min(len(candidates), max(0, maximum))
     history_client = history_fetcher or fetch_daily_history
     financial_client = financial_fetcher or fetch_financial_record
+    signal_config = current.get("signal", {})
+    minimum_history_rows = int(signal_config.get("minimum_history_rows", 61))
 
     def enrich(index: int) -> tuple[int, dict]:
         row = dict(candidates[index])
         errors = []
-        if needs_technical:
-            try:
-                row.update(calculate_technical_indicators(history_client(row["symbol"])))
-            except Exception as exc:
-                errors.append(f"technical: {exc}")
+        try:
+            history = history_client(row["symbol"])
+            signal_history = normalize_signal_history(history, cutoff=signal_cutoff)
+            features = extract_signal_features(
+                signal_history,
+                minimum_rows=minimum_history_rows,
+            )
+            if features is None:
+                errors.append(f"signal: 有效历史不足 {minimum_history_rows} 行")
+            else:
+                row["signal_features"] = features
+            if needs_technical:
+                row.update(calculate_technical_indicators(signal_history))
+        except Exception as exc:
+            errors.append(f"signal: {exc}")
         if needs_financial:
             try:
                 record = financial_client(row["symbol"])

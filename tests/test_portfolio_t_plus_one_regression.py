@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 from stock_recommender.parameters import default_strategy_config
 from stock_recommender.portfolio import monitor_portfolio, plan_daily_candidates
+from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME, candidates_with_positive_momentum
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -36,16 +37,20 @@ class PortfolioTPlusOneRegressionTests(unittest.TestCase):
         # Found by /qa on 2026-07-22.
         # Report: .gstack/qa-reports/qa-report-stock-agent-2026-07-22.md
         strategy = default_strategy_config()
-        strategy.update({"id": "tech-ai", "name": "科技 AI", "revision": 7, "stage": "paper"})
+        strategy.update({"id": "tech-ai", "name": "科技 AI", "revision": 7})
+        strategy["lifecycle"]["stage"] = "paper"
         t0 = datetime(2026, 7, 22, 8, 0, tzinfo=SHANGHAI)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "portfolio.json"
             plan_daily_candidates(
                 strategy,
-                [{"symbol": "600001", "name": "测试1", "price": 10.0, "score": 0.99}],
+                candidates_with_positive_momentum(
+                    [{"symbol": "600001", "name": "测试1", "price": 10.0, "score": 0.99}]
+                ),
                 now=t0,
                 path=path,
+                market_regime=FULL_EXPOSURE_MARKET_REGIME,
             )
             monitor_portfolio(
                 strategy,

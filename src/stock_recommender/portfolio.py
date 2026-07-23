@@ -18,8 +18,10 @@ except ImportError:  # pragma: no cover
     fcntl = None
 
 from .data_sources import fetch_watchlist_quotes
+from .market_regime import allocation_config, normalize_market_regime_decision
 from .parameters import load_strategy_config, normalize_portfolio_config
-from .portfolio_pipeline import run_entry_pipeline
+from .portfolio_pipeline import ENTRY_PIPELINE_VERSION, run_entry_pipeline
+from .runtime import assert_strategy_runnable
 from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
 
@@ -122,6 +124,10 @@ def _new_account(strategy: dict, now: datetime) -> dict:
         "strategy_name": strategy.get("name") or "股票策略",
         "strategy_revision": int(strategy.get("revision") or 1),
         "strategy_stage": strategy.get("lifecycle", {}).get("stage", "draft"),
+        "signal_model": strategy.get("signal", {}).get("model", "factor_rank_v1"),
+        "signal_time": strategy.get("signal", {}).get("run_time", "08:00"),
+        "last_market_regime": None,
+        "target_exposure_pct": 100.0,
         "created_at": _timestamp(now),
         "updated_at": _timestamp(now),
         "initial_cash": initial_cash,
@@ -158,6 +164,14 @@ def _new_account(strategy: dict, now: datetime) -> dict:
     )
     _append_nav(account, now)
     return account
+
+
+def create_portfolio_account(strategy: dict, *, now: datetime | None = None) -> dict:
+    """Create an isolated in-memory account for replay and simulation."""
+    current = beijing_now(now)
+    if not strategy.get("id"):
+        raise ValueError("策略必须先保存后才能创建持仓账户")
+    return deepcopy(_new_account(strategy, current))
 
 
 def _append_event(
@@ -207,6 +221,19 @@ def _mutate_account(
         store["accounts"][strategy["id"]] = account
         _write_store_unlocked(target, store)
         return deepcopy(account), deepcopy(events)
+
+
+def _mutate_in_memory(
+    account: dict,
+    strategy: dict,
+    now: datetime,
+    mutation: Callable[[dict], list[dict]],
+) -> tuple[dict, list[dict]]:
+    if str(account.get("strategy_id") or "") != str(strategy.get("id") or ""):
+        raise ValueError("回放账户与策略不匹配")
+    events = mutation(account)
+    account["updated_at"] = _timestamp(now)
+    return account, events
 
 
 def load_portfolio_account(
@@ -307,6 +334,8 @@ def _activate_strategy(account: dict, strategy: dict, now: datetime) -> list[dic
     changed = revision != int(account.get("strategy_revision") or 1) or config != account.get("portfolio_config")
     account["strategy_name"] = strategy.get("name") or account.get("strategy_name")
     account["strategy_stage"] = strategy.get("lifecycle", {}).get("stage", "draft")
+    account["signal_model"] = strategy.get("signal", {}).get("model", "factor_rank_v1")
+    account["signal_time"] = strategy.get("signal", {}).get("run_time", "08:00")
     if not changed:
         account["portfolio_config"] = config
         return []
@@ -348,7 +377,13 @@ def _estimated_buy_reservation(account: dict, price: float) -> tuple[int, float]
     config = account["portfolio_config"]
     nav = number(account.get("latest_nav"), default=number(account.get("initial_cash")))
     available = max(0.0, number(account.get("cash")) - number(account.get("reserved_cash")))
-    budget = min(nav * number(config["target_weight_pct"]) / 100, available)
+    current_exposure = sum(
+        int(number(position.get("quantity"))) * number(position.get("current_price"))
+        for position in account.get("positions", {}).values()
+    ) + number(account.get("reserved_cash"))
+    exposure_budget = nav * number(account.get("target_exposure_pct"), default=100.0) / 100
+    remaining_exposure = max(0.0, exposure_budget - current_exposure)
+    budget = min(nav * number(config["target_weight_pct"]) / 100, available, remaining_exposure)
     worst_price = price * 1.10
     commission_rate = number(config["commission_rate_pct"]) / 100
     transfer_rate = number(config["transfer_fee_rate_pct"]) / 100
@@ -485,46 +520,28 @@ def _expire_old_entries(account: dict, now: datetime) -> list[dict]:
     return events
 
 
-def _normalize_candidates(candidates: Iterable[dict]) -> list[dict]:
-    normalized: list[dict] = []
-    used: set[str] = set()
-    for rank, item in enumerate(candidates, 1):
-        symbol = str(item.get("symbol") or "").strip()
-        price = number(item.get("price"), default=number(item.get("entry_price")))
-        if len(symbol) != 6 or not symbol.isdigit() or symbol in used or price <= 0:
-            continue
-        used.add(symbol)
-        raw_score = item.get("score", item.get("signal_score"))
-        score = number(raw_score, default=max(0.0, 1.0 - (rank - 1) / 10))
-        if score > 1:
-            score /= 100
-        normalized.append(
-            {
-                "symbol": symbol,
-                "name": item.get("name") or symbol,
-                "price": price,
-                "score": min(1.0, max(0.0, score)),
-                "rank": rank,
-            }
-        )
-    normalized.sort(key=lambda item: (-item["score"], item["symbol"]))
-    return normalized
-
-
 def plan_daily_candidates(
     strategy: dict,
     candidates: Iterable[dict],
     *,
     now: datetime | None = None,
     path: str | Path | None = None,
+    account: dict | None = None,
+    market_regime: dict,
 ) -> tuple[dict, list[dict]]:
+    assert_strategy_runnable(strategy, execution_kind="scheduled", mode="report")
     current = beijing_now(now)
     raw_candidates = tuple(deepcopy(dict(item)) for item in candidates)
+    decision = normalize_market_regime_decision(market_regime, strategy)
 
     def mutation(account: dict) -> list[dict]:
         events = _activate_strategy(account, strategy, current)
         _roll_settlements(account, current)
-        run_key = f"daily:{current.date().isoformat()}"
+        run_key = (
+            f"daily:{current.date().isoformat()}:"
+            f"strategy-r{int(strategy.get('revision') or 1)}:"
+            f"entry-pipeline-v{ENTRY_PIPELINE_VERSION}"
+        )
         if run_key in account.setdefault("committed_run_keys", []):
             return events
         normalized, admitted_candidates, pipeline_trace = run_entry_pipeline(
@@ -533,7 +550,10 @@ def plan_daily_candidates(
             raw_candidates,
             run_id=run_key,
             as_of=_timestamp(current),
+            market_regime=decision,
         )
+        account["last_market_regime"] = deepcopy(decision)
+        account["target_exposure_pct"] = decision["target_exposure_pct"]
         account["last_pipeline_trace"] = deepcopy(pipeline_trace)
         pipeline_event = _append_event(
             account,
@@ -541,11 +561,52 @@ def plan_daily_candidates(
             "PIPELINE_COMPLETED",
             f"入场 Pipeline 已完成：{len(admitted_candidates)} 个候选通过",
             key=f"pipeline:{run_key}:{account.get('control_epoch', 1)}",
-            data={"run_id": run_key, "stages": pipeline_trace, "admitted": len(admitted_candidates)},
+            data={
+                "run_id": run_key,
+                "stages": pipeline_trace,
+                "admitted": len(admitted_candidates),
+                "market_regime": deepcopy(decision),
+            },
         )
         if pipeline_event:
             events.append(pipeline_event)
         events.extend(_expire_old_entries(account, current))
+        regime_config = allocation_config(strategy)
+        if decision["target_exposure_pct"] <= 0 and regime_config.get("exit_on_risk_off", True):
+            for order in list(_open_orders(account, "BUY")):
+                event = _cancel_order(account, order, current, f"MARKET_REGIME_{decision['state']}")
+                if event:
+                    events.append(event)
+            for position in sorted(
+                account.get("positions", {}).values(),
+                key=lambda item: (number(item.get("current_score")), item.get("symbol") or ""),
+            ):
+                events.extend(_trigger_exit(account, position, current, f"MARKET_REGIME_{decision['state']}"))
+        elif regime_config.get("rebalance_to_target_exposure", True):
+            nav = number(account.get("latest_nav"), default=number(account.get("initial_cash")))
+            target_value = nav * decision["target_exposure_pct"] / 100
+            projected_value = sum(
+                int(number(position.get("quantity")))
+                * number(position.get("current_price"), default=number(position.get("average_cost")))
+                for position in account.get("positions", {}).values()
+            ) + number(account.get("reserved_cash"))
+            if projected_value > target_value:
+                for order in list(_open_orders(account, "BUY")):
+                    released_cash = number(order.get("reserved_cash"))
+                    event = _cancel_order(account, order, current, f"MARKET_REGIME_{decision['state']}_REBALANCE")
+                    if event:
+                        events.append(event)
+                    projected_value -= released_cash
+                for position in sorted(
+                    account.get("positions", {}).values(),
+                    key=lambda item: (number(item.get("current_score")), item.get("symbol") or ""),
+                ):
+                    if projected_value <= target_value:
+                        break
+                    events.extend(_trigger_exit(account, position, current, f"MARKET_REGIME_{decision['state']}_REBALANCE"))
+                    projected_value -= int(number(position.get("quantity"))) * number(
+                        position.get("current_price"), default=number(position.get("average_cost"))
+                    )
         by_symbol = {item["symbol"]: item for item in normalized}
         for position in account.get("positions", {}).values():
             candidate = by_symbol.get(position["symbol"])
@@ -563,10 +624,13 @@ def plan_daily_candidates(
             [order for order in _open_orders(account, "BUY") if order.get("symbol") not in account.get("positions", {})]
         )
         max_positions = int(account["portfolio_config"]["max_positions"])
+        target_weight = max(0.01, number(account["portfolio_config"]["target_weight_pct"], default=10.0))
+        exposure_slots = max(0, int(decision["target_exposure_pct"] // target_weight))
+        effective_max_positions = min(max_positions, exposure_slots)
         current_symbols = set(account.get("positions", {})) | {order.get("symbol") for order in _open_orders(account, "BUY")}
         if account.get("trading_mode") == "RUNNING" and account["portfolio_config"].get("enabled", True):
             for candidate in admitted_candidates:
-                if occupied >= max_positions or candidate["symbol"] in current_symbols:
+                if occupied >= effective_max_positions or candidate["symbol"] in current_symbols:
                     continue
                 slot = _available_slot(account)
                 if slot is None:
@@ -593,8 +657,8 @@ def plan_daily_candidates(
                 current_symbols.add(candidate["symbol"])
                 occupied += 1
 
-        if account.get("trading_mode") == "RUNNING" and occupied >= max_positions and normalized:
-            new_candidate = next((item for item in normalized if item["symbol"] not in current_symbols), None)
+        if account.get("trading_mode") == "RUNNING" and effective_max_positions > 0 and occupied >= effective_max_positions and admitted_candidates:
+            new_candidate = next((item for item in admitted_candidates if item["symbol"] not in current_symbols), None)
             positions = [position for position in account.get("positions", {}).values() if position.get("sellable_quantity", 0) > 0]
             weakest = min(positions, key=lambda item: (number(item.get("current_score")), item["symbol"]), default=None)
             if new_candidate and weakest:
@@ -625,6 +689,8 @@ def plan_daily_candidates(
         _append_nav(account, current)
         return events
 
+    if account is not None:
+        return _mutate_in_memory(account, strategy, current, mutation)
     return _mutate_account(strategy, current, path, mutation)
 
 
@@ -961,6 +1027,7 @@ def process_market_snapshot(
     *,
     now: datetime | None = None,
     path: str | Path | None = None,
+    account: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     current = beijing_now(now)
     quote_map = {str(item.get("symbol")): deepcopy(item) for item in quotes if str(item.get("symbol") or "")}
@@ -989,6 +1056,8 @@ def process_market_snapshot(
         _append_nav(account, current)
         return events
 
+    if account is not None:
+        return _mutate_in_memory(account, strategy, current, mutation)
     return _mutate_account(strategy, current, path, mutation)
 
 
@@ -999,6 +1068,7 @@ def monitor_portfolio(
     path: str | Path | None = None,
     quote_fetcher: Callable | None = None,
 ) -> tuple[dict, list[dict], str | None]:
+    assert_strategy_runnable(strategy, execution_kind="scheduled", mode="risk")
     current = beijing_now(now)
     account = load_portfolio_account(strategy.get("id"), path=path)
     if account is None:
@@ -1062,9 +1132,12 @@ def format_portfolio_summary(account: dict, *, performance_url: str = "", quote_
     drawdown = number((account.get("nav_history") or [{}])[-1].get("drawdown_pct"))
     return_pct = (nav / initial - 1) * 100 if initial > 0 else 0.0
     positions = sorted(account.get("positions", {}).values(), key=lambda item: int(item.get("slot_id") or 0))
+    regime = normalize_market_regime_decision(account.get("last_market_regime"))
     lines = [
         "📊 **策略持仓每小时报告**",
         f"策略：{account.get('strategy_name')} · v{account.get('strategy_revision')} · {account.get('strategy_stage')}",
+        f"信号：{account.get('signal_model', 'factor_rank_v1')} @ {account.get('signal_time', '08:00')} · 前一交易日收盘数据",
+        f"板块：{regime['label']}（{regime['state']}） · 目标仓位 {regime['target_exposure_pct']:.0f}% · {regime['model']}",
         f"净值：¥{nav:,.2f}（累计 {return_pct:+.2f}%） · 现金 ¥{number(account.get('cash')):,.2f} · 回撤 {drawdown:.2f}%",
         f"风险：{account.get('risk_level')} / {account.get('trading_mode')} · 持仓 {len(positions)}/{account.get('portfolio_config', {}).get('max_positions', 10)}",
         "",
@@ -1159,6 +1232,11 @@ def build_strategy_performance(
             "name": projected.get("strategy_name"),
             "revision": projected.get("strategy_revision", 1),
             "stage": projected.get("strategy_stage", "draft"),
+            "signal_model": strategy.get("signal", {}).get("model", "factor_rank_v1"),
+            "signal_time": strategy.get("signal", {}).get("run_time", "08:00"),
+            "signal_data_cutoff": strategy.get("signal", {}).get("data_cutoff", "previous_trading_day_close"),
+            "allocation_model": strategy.get("allocation", {}).get("model", "trend_breadth_v1"),
+            "market_regime": deepcopy(projected.get("last_market_regime")),
             "risk_level": projected.get("risk_level", "NORMAL"),
             "trading_mode": projected.get("trading_mode", "RUNNING"),
             "benchmark_symbol": projected.get("portfolio_config", {}).get("benchmark_symbol", "000300"),
@@ -1176,6 +1254,7 @@ def build_strategy_performance(
             "unrealized_pnl": _round(unrealized),
             "position_count": len(positions),
             "max_positions": int(projected.get("portfolio_config", {}).get("max_positions", 10)),
+            "target_exposure_pct": number(projected.get("target_exposure_pct"), default=100.0),
             "closed_trade_count": len(closed),
             "win_rate_pct": _round(len(wins) / len(closed) * 100) if closed else None,
         },
@@ -1185,4 +1264,5 @@ def build_strategy_performance(
         "closed_trades": list(reversed(closed[-200:])),
         "events": list(reversed(projected.get("events", [])[-200:])),
         "config": deepcopy(projected.get("portfolio_config", {})),
+        "allocation": deepcopy(strategy.get("allocation", {})),
     }

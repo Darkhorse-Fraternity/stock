@@ -8,15 +8,27 @@ from zoneinfo import ZoneInfo
 from stock_recommender.parameters import default_strategy_config, normalize_portfolio_config
 from stock_recommender.portfolio import (
     build_strategy_performance,
+    create_portfolio_account,
     format_action_notifications,
     load_portfolio_account,
     monitor_portfolio,
-    plan_daily_candidates,
+    plan_daily_candidates as _plan_daily_candidates,
 )
 from stock_recommender.tracking import save_daily_selection
+from stock_recommender.runtime import StrategyRuntimeError
+from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME, candidates_with_positive_momentum, make_recommendation_plan
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
+
+
+def plan_daily_candidates(strategy, candidates, *, market_regime=None, **kwargs):
+    return _plan_daily_candidates(
+        strategy,
+        candidates_with_positive_momentum(candidates),
+        market_regime=market_regime or FULL_EXPOSURE_MARKET_REGIME,
+        **kwargs,
+    )
 
 
 class StrategyPortfolioTests(unittest.TestCase):
@@ -24,11 +36,19 @@ class StrategyPortfolioTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.path = Path(self.temp_dir.name) / "portfolio.json"
         self.strategy = default_strategy_config()
-        self.strategy.update({"id": "tech-ai", "name": "科技 AI", "revision": 7, "stage": "paper"})
+        self.strategy.update({"id": "tech-ai", "name": "科技 AI", "revision": 7})
+        self.strategy["lifecycle"]["stage"] = "paper"
         self.t0 = datetime(2026, 7, 22, 8, 0, tzinfo=SHANGHAI)
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_draft_strategy_cannot_write_portfolio(self):
+        draft = default_strategy_config()
+        draft["id"] = "draft-strategy"
+        with self.assertRaises(StrategyRuntimeError):
+            plan_daily_candidates(draft, [self._candidate(1)], now=self.t0, path=self.path)
+        self.assertFalse(self.path.exists())
 
     @staticmethod
     def _candidate(index, price=10.0, score=None):
@@ -83,10 +103,27 @@ class StrategyPortfolioTests(unittest.TestCase):
         self.assertEqual(len(events), 11)
         self.assertEqual(events[0]["type"], "PIPELINE_COMPLETED")
         self.assertEqual([stage["stage"] for stage in account["last_pipeline_trace"]], [
-            "candidate_normalization", "portfolio_capacity", "risk_admission",
+            "candidate_normalization", "market_regime", "portfolio_capacity", "risk_admission",
         ])
         self.assertEqual(len(repeated["orders"]), 10)
         self.assertEqual(repeated_events, [])
+
+    def test_in_memory_account_reuses_pipeline_without_writing_ledger(self):
+        candidates = [self._candidate(index) for index in range(3)]
+        isolated = create_portfolio_account(self.strategy, now=self.t0)
+
+        isolated, isolated_events = plan_daily_candidates(
+            self.strategy,
+            candidates,
+            now=self.t0,
+            account=isolated,
+        )
+
+        self.assertFalse(self.path.exists())
+        persisted, persisted_events = plan_daily_candidates(self.strategy, candidates, now=self.t0, path=self.path)
+        self.assertEqual([order["symbol"] for order in isolated["orders"]], [order["symbol"] for order in persisted["orders"]])
+        self.assertEqual([event["type"] for event in isolated_events], [event["type"] for event in persisted_events])
+        self.assertEqual(isolated["reserved_cash"], persisted["reserved_cash"])
 
     def test_concurrent_daily_runs_commit_once_without_corrupting_ledger(self):
         candidates = [self._candidate(index) for index in range(10)]
@@ -101,8 +138,30 @@ class StrategyPortfolioTests(unittest.TestCase):
 
         account = load_portfolio_account("tech-ai", path=self.path)
         self.assertEqual(len(account["orders"]), 10)
-        self.assertEqual(account["committed_run_keys"].count("daily:2026-07-22"), 1)
+        self.assertEqual(
+            account["committed_run_keys"].count(
+                "daily:2026-07-22:strategy-r7:entry-pipeline-v1.0.0"
+            ),
+            1,
+        )
         self.assertEqual(sum(len(events) for _, events in results), 11)
+
+    def test_legacy_daily_key_does_not_block_versioned_pipeline(self):
+        account = create_portfolio_account(self.strategy, now=self.t0)
+        account["committed_run_keys"].append("daily:2026-07-22")
+
+        updated, events = plan_daily_candidates(
+            self.strategy,
+            [self._candidate(1)],
+            now=self.t0,
+            account=account,
+        )
+
+        self.assertIn(
+            "daily:2026-07-22:strategy-r7:entry-pipeline-v1.0.0",
+            updated["committed_run_keys"],
+        )
+        self.assertEqual([event["type"] for event in events], ["PIPELINE_COMPLETED", "ORDER_INTENDED"])
 
     def test_each_strategy_has_an_independent_cash_and_slot_ledger(self):
         other = {**self.strategy, "id": "value", "name": "低估值", "revision": 2}
@@ -137,6 +196,53 @@ class StrategyPortfolioTests(unittest.TestCase):
         position = filled["positions"]["600001"]
         self.assertEqual(position["sellable_quantity"], 0)
         self.assertEqual(position["sellable_on"], "2026-07-23")
+
+    def test_explicit_market_regime_caps_entries_and_exits_in_risk_off(self):
+        candidates = [
+            {
+                **self._candidate(index),
+                "signal_features": {"momentum20": 0.05, "momentum60": 0.08, "trend": 2},
+            }
+            for index in range(10)
+        ]
+        neutral = {
+            "model": "trend_breadth_v1",
+            "state": "NEUTRAL",
+            "target_exposure_pct": 40,
+        }
+        account, _ = plan_daily_candidates(
+            self.strategy,
+            candidates,
+            now=self.t0,
+            path=self.path,
+            market_regime=neutral,
+        )
+        self.assertEqual(len([order for order in account["orders"] if order["side"] == "BUY"]), 4)
+        self.assertEqual(account["target_exposure_pct"], 40.0)
+
+        monitor_portfolio(
+            self.strategy,
+            now=self.t0 + timedelta(hours=2),
+            path=self.path,
+            quote_fetcher=self._quotes(10.0),
+        )
+        risk_off = {
+            "model": "trend_breadth_v1",
+            "state": "RISK_OFF",
+            "target_exposure_pct": 0,
+        }
+        account, events = plan_daily_candidates(
+            self.strategy,
+            [],
+            now=self.t0 + timedelta(days=1),
+            path=self.path,
+            market_regime=risk_off,
+        )
+
+        sell_orders = [order for order in account["orders"] if order["side"] == "SELL"]
+        self.assertEqual(len(sell_orders), 4)
+        self.assertTrue(all(order["reason"] == "MARKET_REGIME_RISK_OFF" for order in sell_orders))
+        self.assertIn("EXIT_TRIGGERED", [event["type"] for event in events])
 
     def test_stop_loss_creates_exit_then_fills_on_next_snapshot(self):
         plan_daily_candidates(self.strategy, [self._candidate(1)], now=self.t0, path=self.path)
@@ -273,12 +379,13 @@ class StrategyPortfolioTests(unittest.TestCase):
         self.assertEqual(len(performance["orders"]), 1)
 
     def test_daily_recommendation_is_committed_to_strategy_portfolio(self):
-        report = """📈 **推荐股每小时成交与涨跌跟踪**
-- 测试股票 (600001)：最新价 ¥10.00，涨跌幅 +1.00%；成交量 1000 手，成交额 100 万
-"""
+        plan = make_recommendation_plan(
+            [{"symbol": "600001", "name": "测试股票", "price": 10.0, "percent": 1.0, "score": 0.8}],
+            now=self.t0,
+        )
         symbols = save_daily_selection(
             Path(self.temp_dir.name) / "daily.json",
-            report,
+            plan,
             strategy=self.strategy,
             now=self.t0,
             portfolio_path=self.path,

@@ -3,8 +3,8 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from stock_recommender.reports import format_recommendation_snapshot
 from stock_recommender.tracking import generate_saved_tracking_report, load_daily_selection_state, save_daily_selection
+from recommendation_fixtures import make_recommendation_plan
 
 
 class TrackingMetricTests(unittest.TestCase):
@@ -12,17 +12,17 @@ class TrackingMetricTests(unittest.TestCase):
         recommendation_time = datetime(2026, 7, 20, 1, 35, tzinfo=timezone.utc)
         first_tracking_time = datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc)
         second_tracking_time = datetime(2026, 7, 20, 3, 0, tzinfo=timezone.utc)
-        report = format_recommendation_snapshot(
-            [{"symbol": "300001", "name": "测试科技", "price": 100, "percent": 2, "volume": 1000, "turnover": 100000}]
+        plan = make_recommendation_plan(
+            [{"symbol": "300001", "name": "测试科技", "price": 100, "percent": 2, "volume": 1000, "turnover": 100000}],
+            now=recommendation_time,
         )
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "selection.json"
             save_daily_selection(
                 path,
-                report,
+                plan,
                 now=recommendation_time,
-                board_name="人工智能",
                 benchmark_fetcher=lambda *args, **kwargs: ([{"percent": 2}], None),
             )
 

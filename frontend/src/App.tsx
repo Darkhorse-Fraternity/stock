@@ -49,6 +49,7 @@ import {
   startStrategyRun,
   syncStrategyDelivery,
   type ConfigPayload,
+  type AllocationConfig,
   type ChatMessage,
   type Parameter,
   type ParameterStatus,
@@ -78,6 +79,14 @@ const channelCopy: Record<ReportDelivery["channel"], string> = {
   signal: "Signal",
   origin: "任务来源",
   local: "仅本地",
+}
+const lifecycleCopy: Record<StrategySummary["lifecycle"]["stage"], string> = {
+  draft: "草稿",
+  backtesting: "回测中",
+  paper: "模拟盘",
+  live: "实盘",
+  paused: "已暂停",
+  archived: "已归档",
 }
 
 function deliveryTime(delivery: ReportDelivery) {
@@ -469,11 +478,32 @@ function PortfolioNumberField({
   )
 }
 
-function PortfolioSettings({ portfolio, strategyId, onChange }: { portfolio: PortfolioConfig; strategyId: string; onChange: (patch: Partial<PortfolioConfig>) => void }) {
+function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllocationChange }: { portfolio: PortfolioConfig; allocation: AllocationConfig; strategyId: string; onChange: (patch: Partial<PortfolioConfig>) => void; onAllocationChange: (patch: Partial<AllocationConfig>) => void }) {
   const field = (key: keyof PortfolioConfig) => (value: number) => onChange({ [key]: value } as Partial<PortfolioConfig>)
+  const allocationField = (key: keyof AllocationConfig) => (value: number) => onAllocationChange({ [key]: value } as Partial<AllocationConfig>)
   const performanceUrl = `/strategies/${encodeURIComponent(strategyId)}/portfolio`
   return (
     <div className="max-w-5xl space-y-5">
+      <section className="overflow-hidden rounded-lg border bg-background shadow-xs">
+        <div className="flex flex-col justify-between gap-4 border-b px-5 py-4 sm:flex-row sm:items-center sm:px-6">
+          <div className="flex items-start gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><ShieldCheck className="size-4" /></div><div><h3 className="text-sm font-semibold">板块状态与仓位预算</h3><p className="mt-1 text-xs text-muted-foreground">{allocation.model} · 板块广度 → 目标仓位 → 个股绝对动量</p></div></div>
+          <Switch aria-label="启用板块状态控制" checked={allocation.enabled} onCheckedChange={(enabled) => onAllocationChange({ enabled })} />
+        </div>
+        <div className={cn("space-y-5 px-5 py-5 sm:px-6", !allocation.enabled && "opacity-55")}>
+          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField label="多数广度阈值" description="20日、60日和趋势广度达到该比例才算通过" value={allocation.breadth_threshold_pct} suffix="%" step={1} onChange={allocationField("breadth_threshold_pct")} />
+            <PortfolioNumberField label="强势目标仓位" description="三项广度信号全部通过" value={allocation.risk_on_exposure_pct} suffix="%" step={5} onChange={allocationField("risk_on_exposure_pct")} />
+            <PortfolioNumberField label="震荡目标仓位" description="三项广度信号中两项通过" value={allocation.neutral_exposure_pct} suffix="%" step={5} onChange={allocationField("neutral_exposure_pct")} />
+            <PortfolioNumberField disabled label="弱势目标仓位" description="少于两项通过时保留现金" value={allocation.risk_off_exposure_pct} suffix="%" onChange={allocationField("risk_off_exposure_pct")} />
+            <PortfolioNumberField label="个股20日动量" description="低于该绝对收益率的股票不得入场" value={allocation.minimum_candidate_momentum20_pct} suffix="%" step={0.5} onChange={allocationField("minimum_candidate_momentum20_pct")} />
+            <PortfolioNumberField label="个股趋势门槛" description="0 至 2；至少满足一层均线趋势" value={allocation.minimum_candidate_trend} suffix="/2" step={1} onChange={allocationField("minimum_candidate_trend")} />
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <label className="flex items-center justify-between gap-4 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">弱市退出</span><span className="mt-1 block text-xs text-muted-foreground">状态转为弱势或数据不足时生成退出单</span></span><Switch checked={allocation.exit_on_risk_off} onCheckedChange={(exit_on_risk_off) => onAllocationChange({ exit_on_risk_off })} /></label>
+            <label className="flex items-center justify-between gap-4 rounded-md border bg-muted/15 p-4"><span><span className="block text-sm font-medium">按目标仓位再平衡</span><span className="mt-1 block text-xs text-muted-foreground">状态降级时先退出信号最弱的持仓</span></span><Switch checked={allocation.rebalance_to_target_exposure} onCheckedChange={(rebalance_to_target_exposure) => onAllocationChange({ rebalance_to_target_exposure })} /></label>
+          </div>
+        </div>
+      </section>
       <section className="overflow-hidden rounded-lg border bg-background shadow-xs">
         <div className="flex flex-col justify-between gap-4 border-b px-5 py-4 sm:flex-row sm:items-center sm:px-6">
           <div className="flex items-start gap-3"><div className="grid size-9 shrink-0 place-items-center rounded-md bg-primary/10 text-primary"><Database className="size-4" /></div><div><h3 className="text-sm font-semibold">策略持仓 Pipeline</h3><p className="mt-1 text-xs text-muted-foreground">信号 → 意图 → 风控 → 模拟成交 → 持仓 → 退出 → 账本</p></div></div>
@@ -621,6 +651,11 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
     setDirty(true)
   }
 
+  const updateAllocation = (patch: Partial<AllocationConfig>) => {
+    setConfig((current) => ({ ...current, allocation: { ...current.allocation, ...patch } }))
+    setDirty(true)
+  }
+
   const activeCount = parameters.filter((item) => item.enabled).length
   const effectiveCount = parameters.filter((item) => item.enabled && item.status !== "planned").length
   const plannedActiveCount = parameters.filter((item) => item.enabled && item.status === "planned").length
@@ -741,7 +776,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
           <div className="flex min-w-0 items-center gap-2 sm:gap-3">
             <Button size="icon" variant="ghost" className="lg:hidden" onClick={() => setMobileNavOpen(true)}><Menu /></Button>
             <Button size="icon" variant="ghost" className="hidden lg:inline-flex" onClick={onBack}><ArrowLeft /><span className="sr-only">返回策略库</span></Button>
-            <div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-sm font-semibold">{config.name}</h1>{isActive && <Badge variant="success" className="hidden sm:inline-flex">使用中</Badge>}</div><p className="truncate text-xs text-muted-foreground">{dirty ? "有未保存修改" : config.updated_at ? `更新于 ${new Date(config.updated_at).toLocaleString("zh-CN")}` : "尚未保存"}</p></div>
+            <div className="min-w-0"><div className="flex items-center gap-2"><h1 className="truncate text-sm font-semibold">{config.name}</h1>{isActive && <Badge variant="success" className="hidden sm:inline-flex">使用中</Badge>}</div><p className="truncate text-xs text-muted-foreground">{config.signal.model} · {config.signal.run_time} · {dirty ? "有未保存修改" : config.updated_at ? `更新于 ${new Date(config.updated_at).toLocaleString("zh-CN")}` : "尚未保存"}</p></div>
           </div>
           <div className="flex items-center gap-1 sm:gap-2">
             {!isActive && <Button variant="outline" size="sm" disabled={activateMutation.isPending} onClick={() => activateMutation.mutate()}><ShieldCheck />启用策略</Button>}
@@ -765,7 +800,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
           </section>
 
           {portfolioView ? (
-            <PortfolioSettings portfolio={config.portfolio} strategyId={config.id!} onChange={updatePortfolio} />
+            <PortfolioSettings portfolio={config.portfolio} allocation={config.allocation} strategyId={config.id!} onChange={updatePortfolio} onAllocationChange={updateAllocation} />
           ) : deliveryView ? (
             <DeliverySettings
               delivery={config.delivery}
@@ -892,7 +927,11 @@ function StrategyRow({ strategy, onEdit, onUsageChange, usagePending, onDuplicat
     <div className="flex flex-col gap-4 rounded-lg border bg-background p-4 shadow-xs sm:flex-row sm:items-center">
       <div className="flex min-w-0 flex-1 items-start gap-3">
         <div className={cn("mt-0.5 grid size-9 shrink-0 place-items-center rounded-md", strategy.is_active ? "bg-emerald-50 text-emerald-700" : "bg-muted text-muted-foreground")}><SlidersHorizontal className="size-4" /></div>
-        <div className="min-w-0"><h3 className="truncate font-medium">{strategy.name}</h3><p className="mt-1 truncate text-xs text-muted-foreground">{strategy.description || "暂无说明"}</p></div>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2"><h3 className="truncate font-medium">{strategy.name}</h3><Badge variant={strategy.lifecycle.stage === "live" ? "success" : strategy.lifecycle.stage === "paper" ? "info" : "secondary"}>{lifecycleCopy[strategy.lifecycle.stage]}</Badge><span className="font-mono text-[10px] text-muted-foreground">v{strategy.revision}</span></div>
+          <p className="mt-1 truncate text-xs text-muted-foreground">{strategy.description || "暂无说明"}</p>
+          <p className="mt-1 font-mono text-[10px] text-muted-foreground">{strategy.signal.model} · {strategy.signal.run_time} · 前一交易日收盘数据</p>
+        </div>
       </div>
       <div className="flex items-center gap-5 text-xs text-muted-foreground"><span><strong className="mr-1 font-mono text-foreground">{strategy.active_parameters}</strong>参数</span><span className="hidden items-center gap-1.5 lg:flex"><BellRing className="size-3.5" />{deliverySummary(strategy.delivery)}</span><span>{strategy.updated_at ? new Date(strategy.updated_at).toLocaleDateString("zh-CN") : "未更新"}</span></div>
       <div className="flex w-full flex-wrap items-center justify-end gap-1 self-stretch sm:w-auto sm:flex-nowrap sm:self-auto">

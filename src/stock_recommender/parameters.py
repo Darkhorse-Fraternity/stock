@@ -243,9 +243,110 @@ def normalize_strategy_lifecycle(value: object) -> dict:
     return normalized
 
 
+def default_signal_config() -> dict:
+    return {
+        "model": "factor_rank_v1",
+        "run_time": "08:00",
+        "data_cutoff": "previous_trading_day_close",
+        "minimum_history_rows": 61,
+        "max_hot_candidates": 2,
+        "factor_weights": {
+            "momentum20": 1.0,
+            "momentum60": 1.0,
+            "trend": 1.0,
+            "volume_ratio": 1.0,
+            "inverse_volatility": 1.0,
+            "drawdown": 1.0,
+        },
+    }
+
+
+def normalize_signal_config(value: object) -> dict:
+    normalized = default_signal_config()
+    if not isinstance(value, dict):
+        return normalized
+    run_time = str(value.get("run_time") or normalized["run_time"]).strip()
+    if re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", run_time):
+        normalized["run_time"] = run_time
+    for field, minimum, maximum in (
+        ("minimum_history_rows", 61, 2520),
+        ("max_hot_candidates", 0, 10),
+    ):
+        try:
+            normalized[field] = min(maximum, max(minimum, int(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    weights = value.get("factor_weights")
+    if isinstance(weights, dict):
+        for factor in normalized["factor_weights"]:
+            try:
+                normalized["factor_weights"][factor] = max(0.0, float(weights.get(factor, normalized["factor_weights"][factor])))
+            except (TypeError, ValueError):
+                pass
+    if not any(normalized["factor_weights"].values()):
+        normalized["factor_weights"] = default_signal_config()["factor_weights"]
+    return normalized
+
+
+def default_allocation_config() -> dict:
+    return {
+        "model": "trend_breadth_v1",
+        "enabled": True,
+        "minimum_universe_size": 1,
+        "breadth_threshold_pct": 50.0,
+        "risk_on_min_signals": 3,
+        "neutral_min_signals": 2,
+        "risk_on_exposure_pct": 100.0,
+        "neutral_exposure_pct": 40.0,
+        "risk_off_exposure_pct": 0.0,
+        "unknown_exposure_pct": 0.0,
+        "minimum_candidate_momentum20_pct": 0.0,
+        "minimum_candidate_trend": 1.0,
+        "exit_on_risk_off": True,
+        "rebalance_to_target_exposure": True,
+    }
+
+
+def normalize_allocation_config(value: object) -> dict:
+    normalized = default_allocation_config()
+    if not isinstance(value, dict):
+        return normalized
+    normalized["enabled"] = bool(value.get("enabled", normalized["enabled"]))
+    normalized["exit_on_risk_off"] = bool(value.get("exit_on_risk_off", normalized["exit_on_risk_off"]))
+    normalized["rebalance_to_target_exposure"] = bool(
+        value.get("rebalance_to_target_exposure", normalized["rebalance_to_target_exposure"])
+    )
+    for field, minimum, maximum in (
+        ("minimum_universe_size", 1, 5000),
+        ("risk_on_min_signals", 1, 3),
+        ("neutral_min_signals", 1, 3),
+    ):
+        try:
+            normalized[field] = min(maximum, max(minimum, int(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    for field, minimum, maximum in (
+        ("breadth_threshold_pct", 0.0, 100.0),
+        ("risk_on_exposure_pct", 0.0, 100.0),
+        ("neutral_exposure_pct", 0.0, 100.0),
+        ("risk_off_exposure_pct", 0.0, 100.0),
+        ("unknown_exposure_pct", 0.0, 100.0),
+        ("minimum_candidate_momentum20_pct", -100.0, 1000.0),
+        ("minimum_candidate_trend", 0.0, 2.0),
+    ):
+        try:
+            normalized[field] = min(maximum, max(minimum, float(value.get(field, normalized[field]))))
+        except (TypeError, ValueError):
+            pass
+    normalized["risk_on_min_signals"] = max(normalized["neutral_min_signals"], normalized["risk_on_min_signals"])
+    normalized["risk_on_exposure_pct"] = max(normalized["neutral_exposure_pct"], normalized["risk_on_exposure_pct"])
+    normalized["neutral_exposure_pct"] = max(normalized["risk_off_exposure_pct"], normalized["neutral_exposure_pct"])
+    return normalized
+
+
 def default_validation_config() -> dict:
     return {
-        "signal_time": "09:35",
+        "signal_time": "08:00",
         "holding_period_days": 3,
         "lookback_days": 60,
         "history_days_min": 756,
@@ -260,7 +361,7 @@ def default_validation_config() -> dict:
         "minimum_oos_months": 12,
         "minimum_positive_fold_ratio": 0.6,
         "minimum_dsr_probability": 0.95,
-        "maximum_drawdown_pct": 20.0,
+        "maximum_drawdown_pct": 15.0,
         "minimum_paper_sessions": 40,
         "last_backtest": None,
         "approval_gate": {"passed": False, "checks": [], "evaluated_at": None},
@@ -325,7 +426,7 @@ def default_portfolio_config() -> dict:
         "stop_loss_pct": 8.0,
         "trailing_activation_pct": 10.0,
         "trailing_drawdown_pct": 5.0,
-        "signal_invalid_days": 2,
+        "signal_invalid_days": 5,
         "replacement_score_delta": 0.10,
         "replacement_cost_multiple": 3.0,
         "warning_drawdown_pct": 12.0,
@@ -391,7 +492,7 @@ def normalize_portfolio_config(value: object) -> dict:
 
 def default_strategy_config() -> dict:
     return {
-        "version": 3,
+        "version": 5,
         "id": None,
         "revision": 1,
         "parent_strategy_id": None,
@@ -400,6 +501,8 @@ def default_strategy_config() -> dict:
         "created_at": None,
         "updated_at": None,
         "lifecycle": default_strategy_lifecycle(),
+        "signal": default_signal_config(),
+        "allocation": default_allocation_config(),
         "validation": default_validation_config(),
         "portfolio": default_portfolio_config(),
         "delivery": default_report_delivery(),
@@ -428,8 +531,15 @@ def normalize_strategy_config(config: dict | None) -> dict:
     normalized["created_at"] = config.get("created_at")
     normalized["updated_at"] = config.get("updated_at")
     normalized["lifecycle"] = normalize_strategy_lifecycle(config.get("lifecycle"))
+    normalized["signal"] = normalize_signal_config(config.get("signal"))
+    normalized["allocation"] = normalize_allocation_config(config.get("allocation"))
     normalized["validation"] = normalize_validation_config(config.get("validation"))
     normalized["portfolio"] = normalize_portfolio_config(config.get("portfolio"))
+    normalized["validation"]["signal_time"] = normalized["signal"]["run_time"]
+    normalized["validation"]["maximum_drawdown_pct"] = min(
+        normalized["validation"]["maximum_drawdown_pct"],
+        normalized["portfolio"]["halt_drawdown_pct"],
+    )
     normalized["delivery"] = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
     provided = config.get("parameters")
     if not isinstance(provided, dict):
@@ -465,7 +575,7 @@ def _normalize_value(definition: dict, value: Any) -> Any:
 
 
 def default_strategy_store() -> dict:
-    return {"version": 3, "active_strategy_id": None, "strategies": []}
+    return {"version": 5, "active_strategy_id": None, "strategies": []}
 
 
 def _timestamp() -> str:
@@ -481,7 +591,7 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             legacy["id"] = legacy.get("id") or "legacy-default"
             legacy["created_at"] = legacy.get("created_at") or legacy.get("updated_at")
             legacy["lifecycle"].update({"stage": "paper", "stage_updated_at": legacy.get("updated_at")})
-            return {"version": 3, "active_strategy_id": legacy["id"], "strategies": [legacy]}
+            return {"version": 5, "active_strategy_id": legacy["id"], "strategies": [legacy]}
         return default_strategy_store()
 
     configured_active_id = payload.get("active_strategy_id")
@@ -503,7 +613,7 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     active_strategy_id = configured_active_id
     if active_strategy_id is not None and active_strategy_id not in used_ids:
         active_strategy_id = strategies[0]["id"] if strategies else None
-    return {"version": 3, "active_strategy_id": active_strategy_id, "strategies": strategies}
+    return {"version": 5, "active_strategy_id": active_strategy_id, "strategies": strategies}
 
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
@@ -552,7 +662,7 @@ def save_strategy_config(config: dict, path: str | Path | None = None, strategy_
     for index, existing in enumerate(store["strategies"]):
         if existing["id"] != target_id:
             continue
-        changed_model = normalized["parameters"] != existing["parameters"] or normalized["portfolio"] != existing.get("portfolio") or any(
+        changed_model = normalized["signal"] != existing.get("signal") or normalized["allocation"] != existing.get("allocation") or normalized["parameters"] != existing["parameters"] or normalized["portfolio"] != existing.get("portfolio") or any(
             normalized["validation"].get(key) != existing["validation"].get(key)
             for key in default_validation_config()
             if key not in {"last_backtest", "approval_gate"}
@@ -818,6 +928,8 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
                 "approval_gate": deepcopy(strategy["validation"].get("approval_gate")),
                 "last_backtest": deepcopy(strategy["validation"].get("last_backtest")),
                 "minimum_paper_sessions": strategy["validation"].get("minimum_paper_sessions", 40),
+                "signal": deepcopy(strategy["signal"]),
+                "allocation": deepcopy(strategy["allocation"]),
                 "active_parameters": active_parameters,
                 "is_active": strategy["id"] == store["active_strategy_id"],
                 "delivery": deepcopy(strategy["delivery"]),

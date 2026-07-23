@@ -11,6 +11,7 @@ from stock_recommender.performance import (
 )
 from stock_recommender.reports import append_performance_link, format_recommendation_snapshot
 from stock_recommender.tracking import generate_saved_tracking_report, save_daily_selection
+from recommendation_fixtures import make_recommendation_plan
 
 
 class RecommendationPerformanceTests(unittest.TestCase):
@@ -234,13 +235,14 @@ class RecommendationPerformanceTests(unittest.TestCase):
     def test_tracking_updates_archived_recommendation(self):
         recommendation_time = datetime(2026, 7, 20, 1, 35, tzinfo=timezone.utc)
         tracking_time = datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc)
-        report = format_recommendation_snapshot(
-            [{"symbol": "300001", "name": "测试科技", "price": 100, "percent": 2, "volume": 1000, "turnover": 100000}]
+        plan = make_recommendation_plan(
+            [{"symbol": "300001", "name": "测试科技", "price": 100, "percent": 2, "volume": 1000, "turnover": 100000}],
+            now=recommendation_time,
         )
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "state.json"
             history_path = Path(directory) / "history.json"
-            save_daily_selection(state_path, report, now=recommendation_time, history_path=history_path)
+            save_daily_selection(state_path, plan, now=recommendation_time, history_path=history_path)
             generate_saved_tracking_report(
                 state_path=state_path,
                 history_path=history_path,

@@ -2,11 +2,13 @@ import json
 import socket
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 import stock_agent
+from recommendation_fixtures import make_recommendation_plan
+from stock_recommender.recommendation import recommendation_tracking_entries
 
 
 class FakeResponse:
@@ -38,6 +40,29 @@ class FakeBytesResponse:
 
 
 class StockAgentTests(unittest.TestCase):
+    def setUp(self):
+        def history(symbol):
+            numeric = int(symbol) if str(symbol).isdigit() else sum(ord(char) for char in str(symbol))
+            slope = 0.08 + (1_000_000 - numeric) / 100_000_000
+            start = date(2026, 2, 1)
+            return [
+                {
+                    "date": start + timedelta(days=index),
+                    "open": 10 + slope * index,
+                    "close": 10 + slope * index,
+                    "high": 10.2 + slope * index,
+                    "low": 9.8 + slope * index,
+                    "volume": 100_000 + index * 1_000,
+                }
+                for index in range(100)
+            ]
+
+        self.history_patch = mock.patch("stock_recommender.enrichment.fetch_daily_history", side_effect=history)
+        self.history_patch.start()
+
+    def tearDown(self):
+        self.history_patch.stop()
+
     def test_parse_watchlist_supports_compact_and_json_formats(self):
         compact = stock_agent.parse_watchlist(
             "sh600519:贵州茅台:白酒，000858:五粮液:白酒;300750.SZ:宁德时代:新能源"
@@ -192,12 +217,15 @@ class StockAgentTests(unittest.TestCase):
     def test_cli_passes_watchlist_and_sector_filters_to_report(self):
         env = {
             "STOCK_AGENT_MODE": "report",
+            "STOCK_AGENT_EXECUTION_KIND": "preview",
             "STOCK_AGENT_WATCHLIST": "600519:贵州茅台:白酒,300750:宁德时代:新能源",
             "STOCK_AGENT_SECTOR_FILTERS": "白酒",
             "STOCK_AGENT_OUTPUT": "",
         }
+        plan = make_recommendation_plan([], now=datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc))
+        output = stock_agent.RecommendationOutput(report="test report", plan=plan)
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
-            "stock_recommender.cli.generate_report", return_value="test report"
+            "stock_recommender.cli.generate_report_result", return_value=output
         ) as generate_report:
             stock_agent.main()
 
@@ -231,15 +259,18 @@ class StockAgentTests(unittest.TestCase):
         }
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
             "stock_recommender.cli.should_publish_now", return_value=False
-        ), mock.patch("stock_recommender.cli.generate_report") as generate_report:
+        ), mock.patch("stock_recommender.cli.generate_report_result") as generate_report:
             stock_agent.main()
 
         generate_report.assert_not_called()
 
     def test_cli_persists_recommendations_for_tracking_mode(self):
-        recommendation = stock_agent.format_recommendation_snapshot(
-            [{"symbol": "300130", "name": "新国都", "price": 18.03}]
+        generated_at = datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc)
+        plan = make_recommendation_plan(
+            [{"symbol": "300130", "name": "新国都", "price": 18.03}],
+            now=generated_at,
         )
+        recommendation = stock_agent.RecommendationOutput(report="test report", plan=plan)
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "selection.json")
             history_path = str(Path(directory) / "history.json")
@@ -249,8 +280,13 @@ class StockAgentTests(unittest.TestCase):
                 "STOCK_AGENT_HISTORY_PATH": history_path,
                 "STOCK_AGENT_OUTPUT": "",
             }
+            from stock_recommender.parameters import default_strategy_config
+            strategy = default_strategy_config()
+            strategy["lifecycle"]["stage"] = "paper"
             with mock.patch.dict("os.environ", env, clear=True), mock.patch(
-                "stock_recommender.cli.generate_report", return_value=recommendation
+                "stock_recommender.cli.load_strategy_config", return_value=strategy
+            ), mock.patch(
+                "stock_recommender.cli.generate_report_result", return_value=recommendation
             ):
                 stock_agent.main()
 
@@ -268,6 +304,7 @@ class StockAgentTests(unittest.TestCase):
                     "percent": -1.31,
                     "volume": 129661,
                     "turnover": 231676726.04,
+                    "signal_score": 82.5,
                 }
             ],
             generated_at="07月17日 10:00",
@@ -277,28 +314,24 @@ class StockAgentTests(unittest.TestCase):
         self.assertIn("涨跌幅 -1.31%", snapshot)
         self.assertIn("成交量 12.97 万手", snapshot)
         self.assertIn("成交额 2.3 亿", snapshot)
-
-    def test_tracking_snapshot_only_uses_symbols_recommended_by_ai(self):
-        candidates = [
-            {"symbol": "300130", "name": "新国都"},
-            {"symbol": "300750", "name": "宁德时代"},
-        ]
-
-        selected = stock_agent.select_snapshot_candidates("最终推荐：新国都（300130）", candidates)
-
-        self.assertEqual([item["symbol"] for item in selected], ["300130"])
-        self.assertEqual(stock_agent.select_snapshot_candidates("今日建议观望", candidates), [])
+        self.assertIn("信号分 82.50/100", snapshot)
+        plan = make_recommendation_plan(
+            [{"symbol": "300130", "name": "新国都", "price": 18.03, "signal_score": 82.5}],
+            now=datetime(2026, 7, 17, 2, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(recommendation_tracking_entries(plan)[0]["score"], 82.5)
 
     def test_daily_selection_is_saved_and_expires_next_day(self):
-        report = stock_agent.format_recommendation_snapshot(
-            [{"symbol": "300130", "name": "新国都", "price": 18.03}],
-        )
         recommendation_time = datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc)
         next_day = datetime(2026, 7, 21, 1, 30, tzinfo=timezone.utc)
+        plan = make_recommendation_plan(
+            [{"symbol": "300130", "name": "新国都", "price": 18.03}],
+            now=recommendation_time,
+        )
 
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "selection.json"
-            saved = stock_agent.save_daily_selection(state_path, report, now=recommendation_time)
+            saved = stock_agent.save_daily_selection(state_path, plan, now=recommendation_time)
 
             self.assertEqual(saved, ["300130"])
             self.assertEqual(stock_agent.load_daily_selection(state_path, now=recommendation_time), ["300130"])
@@ -307,11 +340,12 @@ class StockAgentTests(unittest.TestCase):
     def test_saved_tracking_report_only_fetches_morning_recommendations(self):
         recommendation_time = datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc)
         tracking_time = datetime(2026, 7, 20, 2, 0, tzinfo=timezone.utc)
-        initial_report = stock_agent.format_recommendation_snapshot(
+        plan = make_recommendation_plan(
             [
                 {"symbol": "300130", "name": "新国都", "price": 18.03},
                 {"symbol": "300750", "name": "宁德时代", "price": 300},
-            ]
+            ],
+            now=recommendation_time,
         )
 
         def quote_fetcher(entries):
@@ -340,7 +374,7 @@ class StockAgentTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             state_path = Path(directory) / "selection.json"
-            stock_agent.save_daily_selection(state_path, initial_report, now=recommendation_time)
+            stock_agent.save_daily_selection(state_path, plan, now=recommendation_time)
             report = stock_agent.generate_saved_tracking_report(
                 state_path=state_path,
                 now=tracking_time,
@@ -512,9 +546,10 @@ class StockAgentTests(unittest.TestCase):
             fallback_fetcher=lambda **kwargs: ([], "sina timeout"),
         )
 
-        self.assertIn("股票每日推荐** (2026 年06月22日)", report)
-        self.assertIn("数据来源：估算兜底", report)
-        self.assertIn("实时接口失败", report)
+        self.assertIn("策略运行报告** (2026 年06月22日)", report)
+        self.assertIn("本次没有匹配股票，不新增持仓", report)
+        self.assertIn("既有持仓继续由退出 Pipeline 管理", report)
+        self.assertIn("slow", report)
 
     def test_report_uses_board_rows_and_beijing_time(self):
         def board_fetcher(board_code, **kwargs):
@@ -817,7 +852,7 @@ class StockAgentTests(unittest.TestCase):
         self.assertIn('"symbol": "300130"', context)
         self.assertIn('"signal_score"', context)
         self.assertNotIn("【推荐 #1】", context)
-        self.assertIn("请基于以上数据", context)
+        self.assertIn("请解释 factor_rank_v1", context)
 
     def test_generate_ai_report_uses_llm_result(self):
         def board_fetcher(board_code, **kwargs):
@@ -849,7 +884,8 @@ class StockAgentTests(unittest.TestCase):
             llm_client=fake_llm,
         )
 
-        self.assertTrue(report.startswith("AI最终推荐：新国都（300130），观望或轻仓。"))
+        self.assertIn("AI最终推荐：新国都（300130），观望或轻仓。", report)
+        self.assertIn("板块状态", report)
         self.assertIn("推荐股每小时成交与涨跌跟踪", report)
         self.assertIn("涨跌幅 +14.28%", report)
         self.assertIn("成交量 100 手", report)
@@ -881,11 +917,34 @@ class StockAgentTests(unittest.TestCase):
             now=datetime(2026, 6, 22, 1, 0, tzinfo=timezone.utc),
             llm_client=broken_llm,
             board_fetcher=board_fetcher,
+            strategy={
+                "id": "strategy-ai-tech",
+                "name": "科技 AI",
+                "revision": 2,
+                "lifecycle": {"stage": "paper"},
+                "signal": {"model": "factor_rank_v1", "run_time": "08:00"},
+                "portfolio": {
+                    "max_positions": 10,
+                    "target_weight_pct": 10,
+                    "stop_loss_pct": 8,
+                    "trailing_activation_pct": 10,
+                    "trailing_drawdown_pct": 5,
+                },
+                "execution": {"t_plus_one": True},
+            },
         )
 
-        self.assertIn("AI 分析失败", report)
-        self.assertIn("脚本兜底报告", report)
-        self.assertIn("股票每日推荐", report)
+        self.assertIn("AI 解说暂不可用", report)
+        self.assertIn("确定性策略入场计划", report)
+        self.assertIn("新国都 (300130)", report)
+        self.assertIn("最多持有 10 只", report)
+        self.assertIn("目标单股仓位 10%", report)
+        self.assertIn("止损 8%", report)
+        self.assertIn("T+1", report)
+        self.assertIn("工作日 08:00", report)
+        self.assertNotIn("脚本兜底报告", report)
+        self.assertNotIn("股票每日推荐", report)
+        self.assertNotIn("slow model", report)
 
     def test_generate_ai_report_stops_when_market_data_unavailable(self):
         called = False
@@ -976,7 +1035,16 @@ class StockAgentTests(unittest.TestCase):
             {"symbol": "C", "name": "稳健1", "price": 1, "percent": 3, "turnover": 500_000_000, "turnover_rate": 4, "pe": 20, "source": "x"},
             {"symbol": "D", "name": "稳健2", "price": 1, "percent": 1, "turnover": 300_000_000, "turnover_rate": 3, "pe": 20, "source": "x"},
         ]
-        analyses = [stock_agent.analyze(row) for row in rows]
+        for index, row in enumerate(rows):
+            row["signal_features"] = {
+                "momentum20": 4 - index,
+                "momentum60": 4 - index,
+                "trend": 2,
+                "volume_ratio": 4 - index / 2,
+                "inverse_volatility": index,
+                "drawdown": -index / 100,
+            }
+        analyses = stock_agent.analyze_candidates(rows)
         selected = stock_agent.select_agent_candidates(analyses, limit=3)
 
         self.assertIn("C", [row["symbol"] for row in selected])

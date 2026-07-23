@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from stock_recommender.admin import AdminHandler
 from stock_recommender.parameters import create_strategy
 from stock_recommender.portfolio import plan_daily_candidates
+from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME, candidates_with_positive_momentum
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
@@ -17,16 +18,20 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
             config_path = Path(temp_dir) / "strategies.json"
             portfolio_path = Path(temp_dir) / "portfolios.json"
             environment = {
-                "STOCK_AGENT_CONFIG_PATH": str(config_path),
+                "STOCK_AGENT_CONFIG": str(config_path),
                 "STOCK_AGENT_PORTFOLIO_PATH": str(portfolio_path),
             }
             with patch.dict(os.environ, environment, clear=False):
                 strategy = create_strategy("科技 AI")
+                strategy["lifecycle"]["stage"] = "paper"
                 plan_daily_candidates(
                     strategy,
-                    [{"symbol": "600001", "name": "测试股票", "price": 10.0, "score": 0.8}],
+                    candidates_with_positive_momentum(
+                        [{"symbol": "600001", "name": "测试股票", "price": 10.0, "score": 0.8}]
+                    ),
                     now=datetime(2026, 7, 22, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
                     path=portfolio_path,
+                    market_regime=FULL_EXPOSURE_MARKET_REGIME,
                 )
                 captured = {}
                 handler = AdminHandler.__new__(AdminHandler)

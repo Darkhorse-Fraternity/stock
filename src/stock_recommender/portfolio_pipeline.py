@@ -3,8 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Iterable
 
+from .market_regime import filter_absolute_momentum, normalize_market_regime_decision
 from .pipeline import PipelineRunner, StageInput, StageOutput
 from .utils import number
+
+
+ENTRY_PIPELINE_VERSION = "1.0.0"
 
 
 def _fact(stage_input: StageInput, kind: str) -> dict:
@@ -42,6 +46,7 @@ class CandidateNormalizationStage:
                     "price": price,
                     "score": min(1.0, max(0.0, score)),
                     "rank": rank,
+                    "signal_features": dict(item.get("signal_features") or {}),
                 }
             )
         normalized.sort(key=lambda item: (-item["score"], item["symbol"]))
@@ -56,17 +61,52 @@ class CandidateNormalizationStage:
 @dataclass(frozen=True)
 class PortfolioCapacityStage:
     max_positions: int
+    target_weight_pct: float
     name: str = "portfolio_capacity"
     component_version: str = "1.0.0"
 
     def evaluate(self, stage_input: StageInput) -> StageOutput:
-        candidates = list(_fact(stage_input, "normalized_candidates").get("items") or [])
+        candidates = list(_fact(stage_input, "regime_candidates").get("items") or [])
+        allocation = _fact(stage_input, "market_regime")
         limit = max(1, min(10, int(self.max_positions)))
+        exposure = number(allocation.get("target_exposure_pct"), default=100.0)
+        target_weight = max(0.01, number(self.target_weight_pct, default=10.0))
+        exposure_limit = max(0, int(exposure // target_weight))
+        limit = min(limit, exposure_limit)
         return StageOutput(
             stage=self.name,
             component_version=self.component_version,
             facts=({"kind": "capacity_candidates", "items": candidates[:limit], "limit": limit},),
             diagnostics=({"input": len(candidates), "within_capacity": min(len(candidates), limit)},),
+        )
+
+
+@dataclass(frozen=True)
+class MarketRegimeStage:
+    strategy: dict
+    decision: dict
+    name: str = "market_regime"
+    component_version: str = "1.0.0"
+
+    def evaluate(self, stage_input: StageInput) -> StageOutput:
+        candidates = list(_fact(stage_input, "normalized_candidates").get("items") or [])
+        decision = normalize_market_regime_decision(self.decision, self.strategy)
+        admitted = filter_absolute_momentum(candidates, self.strategy, decision)
+        return StageOutput(
+            stage=self.name,
+            component_version=self.component_version,
+            facts=(
+                {"kind": "market_regime", **decision},
+                {"kind": "regime_candidates", "items": admitted},
+            ),
+            diagnostics=(
+                {
+                    "state": decision["state"],
+                    "target_exposure_pct": decision["target_exposure_pct"],
+                    "input": len(candidates),
+                    "absolute_momentum_admitted": len(admitted),
+                },
+            ),
         )
 
 
@@ -101,12 +141,15 @@ def run_entry_pipeline(
     *,
     run_id: str,
     as_of: str,
+    market_regime: dict,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     config = account["portfolio_config"]
+    decision = normalize_market_regime_decision(market_regime, strategy)
     runner = PipelineRunner(
         [
             CandidateNormalizationStage(tuple(dict(item) for item in candidates)),
-            PortfolioCapacityStage(int(config["max_positions"])),
+            MarketRegimeStage(strategy, decision),
+            PortfolioCapacityStage(int(config["max_positions"]), number(config["target_weight_pct"])),
             RiskAdmissionStage(bool(config.get("enabled", True)), str(account.get("trading_mode", "RUNNING"))),
         ]
     )

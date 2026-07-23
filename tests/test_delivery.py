@@ -46,6 +46,7 @@ class DeliveryTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
         strategy = default_strategy_config()
+        strategy["lifecycle"]["stage"] = "paper"
         strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8, "minute": 0, "frequency": "daily"})
         with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1", "STOCK_AGENT_HERMES_BIN": "hermes"}):
             result = sync_hermes_delivery(strategy, runner=runner)
@@ -75,6 +76,7 @@ class DeliveryTests(unittest.TestCase):
             return SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
         strategy = default_strategy_config()
+        strategy["lifecycle"]["stage"] = "paper"
         strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8, "minute": 0})
         environment = {
             "STOCK_AGENT_HERMES_JOB_ID": "daily-job",
@@ -98,11 +100,28 @@ class DeliveryTests(unittest.TestCase):
 
     def test_empty_and_error_reports_follow_delivery_policy(self):
         strategy = default_strategy_config()
+        strategy["lifecycle"]["stage"] = "paper"
         strategy["delivery"].update({"enabled": True, "push_on_empty": False, "push_on_error": False})
 
         self.assertFalse(should_deliver_report("当前策略无匹配股票", strategy))
         self.assertFalse(should_deliver_report("实时行情不可用", strategy))
         self.assertTrue(should_deliver_report("今日候选：测试股票", strategy))
+
+    def test_draft_strategy_is_paused_even_when_delivery_is_enabled(self):
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(command)
+            return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+        strategy = default_strategy_config()
+        strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test"})
+        with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1"}):
+            result = sync_hermes_delivery(strategy, runner=runner)
+
+        self.assertEqual(result["status"], "paused")
+        self.assertEqual(calls, [["hermes", "cron", "pause", "job-1"]])
+        self.assertIn("draft", result["message"])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ class PortfolioCliTests(unittest.TestCase):
     def setUp(self):
         self.strategy = default_strategy_config()
         self.strategy.update({"id": "tech-ai", "name": "科技 AI", "revision": 4})
+        self.strategy["lifecycle"]["stage"] = "paper"
         self.account = {
             "strategy_id": "tech-ai",
             "strategy_name": "科技 AI",

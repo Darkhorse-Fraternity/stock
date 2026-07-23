@@ -35,8 +35,11 @@ src/stock_recommender/
   universe.py      watchlist parsing, universe constraints, sector filters
   schedule.py      Beijing-time weekday and hourly publication guard
   tracking.py      daily recommendation state and intraday quote tracking
-  performance.py   rolling recommendation archive and 30-day performance API
-  backtest.py      fixed-factor rolling walk-forward evaluation and approval gate
+  recommendation.py structured recommendation plan shared by reports, tracking, and portfolio execution
+  performance.py   legacy recommendation archive and compatibility API
+  backtest.py      shared-signal rolling walk-forward orchestration and approval gate
+  portfolio_backtest.py  isolated in-memory replay using the live portfolio engine
+  market_regime.py  sector breadth, exposure budget, and absolute-momentum admission
   pipeline.py      composable strategy stages and execution context
   portfolio.py     per-strategy positions, orders, exits, and performance
   portfolio_pipeline.py  entry, risk, exit, and replacement orchestration
@@ -55,13 +58,14 @@ sessions. Live and archived configurations are immutable; create a revision to
 change their model parameters.
 
 The default gate uses roughly three years of history, purged rolling windows,
-transaction cost and slippage, doubled-cost stress, drawdown, positive-window
-ratio and Deflated Sharpe probability. Data built from today's constituents is
-explicitly marked as point-in-time incomplete and cannot pass the live gate,
-which prevents a convenient current-universe backtest from hiding survivorship
-bias. A separate strategy-parity check also blocks promotion when the historical
-evaluator does not reproduce every live signal. The LLM explains fixed strategy
-output; it does not choose factors or tune thresholds during the evaluation.
+the same T+1/order/exit/risk pipeline as paper trading, doubled-cost stress,
+liquidation NAV drawdown, positive-window ratio and Deflated Sharpe probability.
+Promotion also requires dated universe snapshots, an independent benchmark and
+historical execution-time volume/limit data. Data built from today's constituents
+is explicitly marked incomplete and cannot pass the live gate, which prevents a
+convenient current-universe backtest from hiding survivorship bias. The LLM
+explains fixed strategy output; it does not choose factors or tune thresholds
+during the evaluation.
 
 ## Local Test
 
@@ -168,29 +172,31 @@ recommendation instead of adding stocks outside the watchlist.
 | `STOCK_AGENT_LLM_TIMEOUT` | `60` | LLM request timeout in seconds. |
 | `STOCK_AGENT_TRACKING_LIMIT` | `3` | Maximum recommended stocks in the hourly volume/change tracking block. |
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
-| `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Rolling recommendation archive used by the 30-day performance page. |
+| `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Legacy recommendation audit archive; strategy performance uses the full portfolio ledger. |
 | `STOCK_AGENT_MARKET_HISTORY_CACHE_DIR` | `data/market_history_cache` | Per-symbol daily-history cache used by enrichment, backtests, and replay tools. |
 | `STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS` | `21600` | Fresh-cache lifetime; stale data remains available when the upstream source fails. |
 | `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `3` | Bounded daily-history download attempts. |
 | `STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS` | `1` | Initial exponential retry delay. |
 | `STOCK_AGENT_HISTORY_FETCH_WORKERS` | `2` | Maximum concurrent history downloads during a backtest. |
+| `STOCK_AGENT_BACKTEST_DATASET_PATH` | empty | Optional read-only point-in-time JSON dataset; when absent the current-universe exploratory loader is used and cannot pass the live gate. |
 | `STOCK_AGENT_PERFORMANCE_URL` | empty | Link appended to recommendation and tracking reports, for example `http://host:8765/performance`. |
 | `STOCK_AGENT_SCHEDULE_GUARD` | `0` | Set to `1` to skip publication outside configured weekday hours. Background scripts default to `1`. |
 | `STOCK_AGENT_PUBLISH_HOURS` | `9,10,11,13,14,15` | Beijing-time hours allowed by the schedule guard. |
 
 ## Weekday Hourly Tracking
 
-At 09:35, the recommendation job selects the day's stocks and saves their symbols
+At 08:00 Beijing time, the strategy ranks stocks from data strictly before the
+current trading day and saves the deterministic `factor_rank_v1` portfolio list
 to `STOCK_AGENT_STATE_PATH`. Later tracking jobs load that same list and fetch
 fresh quotes without running selection again. Each tracking report contains
 latest price, intraday change percentage, trading volume in hands, and turnover
 amount. It does not include unrelated stocks from the full board or watchlist.
 
 Configure two Hermes cron jobs in the `Asia/Shanghai` timezone. Generate and save
-the recommendation after the market opens:
+the strategy list before the market opens:
 
 ```cron
-35 9 * * 1-5  hermes-ai-run.sh
+0 8 * * 1-5  hermes-ai-run.sh
 ```
 
 Then publish the saved stocks' current volume and change at the full-hour market
@@ -264,7 +270,7 @@ The runtime launchers stay inside the allowed directory, read that pointer, and
 delegate to the matching versioned script. Re-run the installer after moving the
 checkout. The daily and tracking scripts
 share `/tmp/stock-agent-daily-selection.json` by default, so hourly tracking
-always follows the 09:35 recommendation list.
+always follows the 08:00 strategy portfolio list.
 
 Alternative setup is a Hermes agent-driven cron job:
 

@@ -5,6 +5,7 @@ import subprocess
 from typing import Callable
 
 from .parameters import load_strategy_config, normalize_report_delivery
+from .runtime import strategy_runtime_issues
 
 
 PLATFORM_CHANNELS = {"feishu", "telegram", "discord", "signal"}
@@ -36,6 +37,8 @@ def should_deliver_report(report: str, config: dict) -> bool:
     delivery = normalize_report_delivery(config.get("delivery"), legacy="delivery" not in config)
     if not delivery["enabled"]:
         return False
+    if strategy_runtime_issues(config, execution_kind="scheduled", mode="report"):
+        return False
     text = str(report or "")
     is_error = any(marker in text for marker in ["实时行情不可用", "AI 分析失败", "数据源错误", "执行失败"])
     is_empty = any(marker in text for marker in ["当前策略无匹配股票", "当前策略没有匹配股票"])
@@ -57,8 +60,9 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
         ("tracking", os.getenv("STOCK_AGENT_HERMES_TRACKING_JOB_ID", "").strip(), PORTFOLIO_TRACKING_CRON),
         ("risk", os.getenv("STOCK_AGENT_HERMES_RISK_JOB_ID", "").strip(), PORTFOLIO_RISK_CRON),
     ]
+    runtime_issues = strategy_runtime_issues(config, execution_kind="scheduled", mode="report") if delivery["enabled"] else []
     try:
-        if not delivery["enabled"]:
+        if not delivery["enabled"] or runtime_issues:
             paused = []
             for _, target_job_id, _ in [("daily", job_id, ""), *auxiliary_jobs]:
                 if not target_job_id:
@@ -67,7 +71,9 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
                 if completed.returncode != 0:
                     raise RuntimeError((completed.stderr or completed.stdout).strip())
                 paused.append(target_job_id)
-            return {"status": "paused", "job_id": job_id, "jobs": paused, "message": "策略通知任务已暂停"}
+            reason = "；".join(runtime_issues)
+            message = f"策略通知任务已暂停：{reason}" if reason else "策略通知任务已暂停"
+            return {"status": "paused", "job_id": job_id, "jobs": paused, "message": message}
 
         target = delivery_target(config)
         schedule = delivery_cron(config)

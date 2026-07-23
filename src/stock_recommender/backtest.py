@@ -22,6 +22,15 @@ from .parameters import (
     strategy_config_path,
     transition_strategy_stage,
 )
+from .portfolio_backtest import normalize_universe_snapshots, replay_portfolio_fold
+from .signal_engine import (
+    SIGNAL_MODEL_ID,
+    extract_signal_features,
+    rank_signal_rows,
+    score_feature_map,
+    select_ranked_signals,
+    signal_contract,
+)
 from .universe import normalize_watchlist
 from .utils import number
 
@@ -29,6 +38,7 @@ from .utils import number
 BACKTEST_LOCK = threading.Lock()
 ACTIVE_BACKTEST_IDS: set[str] = set()
 MAX_BACKTESTS = 30
+BACKTEST_DATASET_CONTRACT_VERSION = 2
 
 
 class BacktestInProgressError(RuntimeError):
@@ -75,53 +85,24 @@ def _normalize_history(rows: Iterable[dict]) -> dict[date, dict]:
             "high": number(row.get("high", row.get("最高")), default=close) or close,
             "low": number(row.get("low", row.get("最低")), default=close) or close,
             "volume": number(row.get("volume", row.get("成交量"))),
+            "turnover": number(row.get("turnover", row.get("成交额"))),
+            "name": row.get("name") or row.get("名称"),
+            "upper_limit": row.get("upper_limit", row.get("涨停价")),
+            "lower_limit": row.get("lower_limit", row.get("跌停价")),
+            "open_volume": row.get("open_volume"),
+            "close_volume": row.get("close_volume"),
+            "entry_price": row.get("entry_price"),
+            "exit_price": row.get("exit_price"),
         }
     return dict(sorted(normalized.items()))
 
 
 def _feature(history: list[dict]) -> dict | None:
-    if len(history) < 61:
-        return None
-    closes = [row["close"] for row in history]
-    volumes = [row["volume"] for row in history]
-    latest = closes[-1]
-    momentum20 = latest / closes[-21] - 1 if closes[-21] > 0 else 0.0
-    momentum60 = latest / closes[-61] - 1 if closes[-61] > 0 else 0.0
-    ma5 = statistics.fmean(closes[-5:])
-    ma20 = statistics.fmean(closes[-20:])
-    ma60 = statistics.fmean(closes[-60:])
-    returns = [current / previous - 1 for previous, current in zip(closes[-21:-1], closes[-20:]) if previous > 0]
-    volatility = statistics.pstdev(returns) * math.sqrt(252) if len(returns) >= 2 else 0.0
-    peak = max(closes[-60:])
-    drawdown = latest / peak - 1 if peak > 0 else 0.0
-    previous_volume = [value for value in volumes[-21:-1] if value > 0]
-    volume_ratio = volumes[-1] / statistics.fmean(previous_volume) if previous_volume and volumes[-1] > 0 else 1.0
-    return {
-        "momentum20": momentum20,
-        "momentum60": momentum60,
-        "trend": (1.0 if ma5 >= ma20 else 0.0) + (1.0 if ma20 >= ma60 else 0.0),
-        "volume_ratio": min(volume_ratio, 5.0),
-        "inverse_volatility": -volatility,
-        "drawdown": drawdown,
-    }
+    return extract_signal_features(history)
 
 
-def _percentile_ranks(values: list[tuple[str, float]]) -> dict[str, float]:
-    if not values:
-        return {}
-    ordered = sorted(values, key=lambda item: (item[1], item[0]))
-    denominator = max(1, len(ordered) - 1)
-    return {symbol: index / denominator for index, (symbol, _) in enumerate(ordered)}
-
-
-def _score_features(features: dict[str, dict]) -> list[tuple[str, float]]:
-    fields = ["momentum20", "momentum60", "trend", "volume_ratio", "inverse_volatility", "drawdown"]
-    ranks = {field: _percentile_ranks([(symbol, item[field]) for symbol, item in features.items()]) for field in fields}
-    return sorted(
-        ((symbol, statistics.fmean(ranks[field][symbol] for field in fields)) for symbol in features),
-        key=lambda item: (item[1], item[0]),
-        reverse=True,
-    )
+def _score_features(features: dict[str, dict], strategy: dict | None = None) -> list[tuple[str, float]]:
+    return score_feature_map(features, strategy=strategy)
 
 
 def walk_forward_windows(dates: list[date], validation: dict) -> list[dict]:
@@ -233,12 +214,17 @@ def evaluate_approval_gate(metrics: dict, validation: dict, metadata: dict) -> d
     add("cost_stress", metrics["stressed_mean_excess_return_pct"] > 0, metrics["stressed_mean_excess_return_pct"], "> 0", "双倍成本压力测试")
     add("drawdown", abs(metrics["maximum_drawdown_pct"]) <= validation["maximum_drawdown_pct"], metrics["maximum_drawdown_pct"], validation["maximum_drawdown_pct"], "最大回撤")
     add("dsr", metrics["dsr_probability"] >= validation["minimum_dsr_probability"], metrics["dsr_probability"], validation["minimum_dsr_probability"], "Deflated Sharpe 概率")
-    add("point_in_time", bool(metadata.get("point_in_time_complete")), bool(metadata.get("point_in_time_complete")), True, "历史时点成分与财报数据完整")
-    add("strategy_parity", bool(metadata.get("strategy_parity_complete")), bool(metadata.get("strategy_parity_complete")), True, "回测信号与线上策略逻辑一致")
+    add("point_in_time", bool(metadata.get("point_in_time_complete")), bool(metadata.get("point_in_time_complete")), True, "历史时点股票池覆盖完整")
+    add("benchmark", bool(metadata.get("benchmark_complete")), bool(metadata.get("benchmark_complete")), True, "独立基准行情覆盖完整")
+    strategy_parity = bool(metadata.get("strategy_parity_complete")) and metadata.get("signal_model") == SIGNAL_MODEL_ID
+    add("strategy_parity", strategy_parity, strategy_parity, True, "回测信号与线上信号逻辑一致")
+    add("execution_parity", bool(metadata.get("execution_parity_complete")), bool(metadata.get("execution_parity_complete")), True, "回测复用线上组合执行 Pipeline")
+    add("execution_data", bool(metadata.get("execution_data_complete")), bool(metadata.get("execution_data_complete")), True, "历史成交量、涨跌停与执行时点数据完整")
+    add("corporate_actions", bool(metadata.get("corporate_actions_complete")), bool(metadata.get("corporate_actions_complete")), True, "分红送转等公司行动处理完整")
     return {"passed": all(item["passed"] for item in checks), "checks": checks, "evaluated_at": _timestamp()}
 
 
-def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
+def _run_signal_event_backtest(dataset: dict, strategy: dict) -> dict:
     validation = strategy["validation"]
     panel = {str(symbol): _normalize_history(rows) for symbol, rows in (dataset.get("panel") or {}).items()}
     panel = {symbol: rows for symbol, rows in panel.items() if rows}
@@ -254,6 +240,7 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
     holding = int(validation["holding_period_days"])
     lookback = int(validation["lookback_days"])
     top_n = int(validation["top_n"])
+    minimum_history = max(61, int(strategy.get("signal", {}).get("minimum_history_rows", 61)), lookback)
     normal_cost = 2 * (float(validation["transaction_cost_bps"]) + float(validation["slippage_bps"])) / 10000
     stressed_cost = normal_cost * 2
     events = []
@@ -263,27 +250,40 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
         fold_events = []
         for signal_day in window["test_dates"]:
             signal_index = date_index[signal_day]
-            if signal_index < lookback or signal_index + holding >= len(all_dates):
+            if signal_index < minimum_history or signal_index + holding - 1 >= len(all_dates):
                 continue
-            entry_day = all_dates[signal_index + 1]
-            exit_day = all_dates[signal_index + holding]
+            entry_day = signal_day
+            exit_day = all_dates[signal_index + holding - 1]
             features = {}
             for symbol, history in panel.items():
-                available_dates = [day for day in all_dates[: signal_index + 1] if day in history]
-                if len(available_dates) < max(61, lookback):
+                available_dates = [day for day in all_dates[:signal_index] if day in history]
+                if len(available_dates) < minimum_history:
                     continue
                 if entry_day not in history or exit_day not in history:
                     continue
-                item = _feature([history[day] for day in available_dates[-max(61, lookback) :]])
+                item = extract_signal_features([history[day] for day in available_dates[-minimum_history:]], minimum_rows=minimum_history)
                 if item:
                     features[symbol] = item
-            selected = _score_features(features)[:top_n]
+            ranked = rank_signal_rows(
+                [
+                    {
+                        "symbol": symbol,
+                        "percent": item.get("latest_return", 0.0) * 100,
+                        "signal_features": item,
+                    }
+                    for symbol, item in features.items()
+                ],
+                strategy=strategy,
+            )
+            selected = select_ranked_signals(ranked, top_n, strategy=strategy)
             if not selected:
                 continue
             benchmark_return = _benchmark_return(benchmark, panel, entry_day, exit_day)
             stock_returns = []
             symbols = []
-            for symbol, score in selected:
+            for selected_row in selected:
+                symbol = selected_row["symbol"]
+                score = selected_row["score"]
                 entry_price = panel[symbol][entry_day]["open"]
                 exit_price = panel[symbol][exit_day]["close"]
                 if entry_price <= 0:
@@ -344,25 +344,203 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
         "parameter_trials": parameter_trials,
     }
     metadata = deepcopy(dataset.get("metadata") or {})
+    metadata["dataset_contract_version"] = BACKTEST_DATASET_CONTRACT_VERSION
+    metadata["signal_model"] = SIGNAL_MODEL_ID
+    metadata["allocation_model"] = strategy.get("allocation", {}).get("model", "trend_breadth_v1")
     approval_gate = evaluate_approval_gate(metrics, validation, metadata)
     return {
         "status": "succeeded",
         "strategy_id": strategy.get("id"),
         "strategy_revision": strategy.get("revision", 1),
         "generated_at": _timestamp(),
-        "method": "rolling_walk_forward_fixed_factor_rank",
+        "method": "rolling_walk_forward_factor_rank_v1",
         "execution": {
-            "signal_time": validation["signal_time"],
-            "entry": "next_trading_day_open_or_supplied_entry_price",
+            "signal_time": strategy.get("signal", {}).get("run_time", validation["signal_time"]),
+            "data_cutoff": "previous_trading_day_close",
+            "allocation_model": strategy.get("allocation", {}).get("model", "trend_breadth_v1"),
+            "entry": "signal_day_open_or_supplied_entry_price",
             "holding_period_days": holding,
             "transaction_cost_bps": validation["transaction_cost_bps"],
             "slippage_bps": validation["slippage_bps"],
         },
-        "metadata": metadata,
+        "metadata": {**metadata, "signal_contract": signal_contract(strategy)},
         "warnings": deepcopy(metadata.get("warnings") or []),
         "metrics": metrics,
         "folds": folds,
         "sample_events": events[:20],
+        "approval_gate": approval_gate,
+    }
+
+
+def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
+    validation = strategy["validation"]
+    panel = {str(symbol): _normalize_history(rows) for symbol, rows in (dataset.get("panel") or {}).items()}
+    panel = {symbol: rows for symbol, rows in panel.items() if rows}
+    if not panel:
+        raise BacktestDataError("没有可用的历史行情")
+    benchmark = _normalize_history(dataset.get("benchmark") or []) or None
+    all_dates = sorted({day for history in panel.values() for day in history})
+    evaluation = dataset.get("evaluation_period") if isinstance(dataset.get("evaluation_period"), dict) else None
+    if evaluation:
+        evaluation_start = _date_value(evaluation.get("start"))
+        evaluation_end = _date_value(evaluation.get("end"))
+        if evaluation_start is None or evaluation_end is None or evaluation_end < evaluation_start:
+            raise BacktestDataError("evaluation_period 必须包含有效的 start 和 end")
+        test_dates = [day for day in all_dates if evaluation_start <= day <= evaluation_end]
+        windows = (
+            [
+                {
+                    "test_start": test_dates[0],
+                    "test_end": test_dates[-1],
+                    "test_dates": test_dates,
+                }
+            ]
+            if test_dates
+            else []
+        )
+        method = "point_in_time_holdout_portfolio_pipeline_v1"
+    else:
+        windows = walk_forward_windows(all_dates, validation)
+        method = "rolling_walk_forward_portfolio_pipeline_v1"
+    if not windows:
+        raise BacktestDataError("历史长度不足以形成评估窗口")
+
+    minimum_history = max(
+        61,
+        int(strategy.get("signal", {}).get("minimum_history_rows", 61)),
+        int(validation["lookback_days"]),
+    )
+    top_n = min(int(validation["top_n"]), int(strategy.get("portfolio", {}).get("max_positions", 10)))
+    universe_snapshots = normalize_universe_snapshots(dataset.get("universe_by_date"))
+    folds = []
+    normal_results = []
+    stressed_results = []
+    sample_events = []
+
+    for fold_index, window in enumerate(windows, 1):
+        normal = replay_portfolio_fold(
+            panel,
+            benchmark,
+            window["test_dates"],
+            all_dates,
+            strategy,
+            universe_snapshots=universe_snapshots,
+            minimum_history=minimum_history,
+            top_n=top_n,
+            cost_multiplier=1.0,
+            execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
+        )
+        stressed = replay_portfolio_fold(
+            panel,
+            benchmark,
+            window["test_dates"],
+            all_dates,
+            strategy,
+            universe_snapshots=universe_snapshots,
+            minimum_history=minimum_history,
+            top_n=top_n,
+            cost_multiplier=2.0,
+            execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
+        )
+        if not normal["days"]:
+            continue
+        normal_results.append(normal)
+        stressed_results.append(stressed)
+        excess = normal["fold_return"] - normal["benchmark_return"]
+        folds.append(
+            {
+                "fold": fold_index,
+                "test_start": normal["days"][0]["signal_date"],
+                "test_end": normal["days"][-1]["signal_date"],
+                "events": len(normal["days"]),
+                "portfolio_return_pct": round(normal["fold_return"] * 100, 4),
+                "benchmark_return_pct": round(normal["benchmark_return"] * 100, 4),
+                "mean_excess_return_pct": round(excess * 100, 4),
+                "maximum_drawdown_pct": round(normal["maximum_drawdown"] * 100, 4),
+                "closed_trades": normal["closed_trades"],
+            }
+        )
+        for day_result in normal["days"]:
+            if len(sample_events) < 20:
+                sample_events.append({"fold": fold_index, **deepcopy(day_result)})
+
+    if not normal_results:
+        raise BacktestDataError("样本外窗口没有产生可评估的组合净值")
+    normal_days = [day for result in normal_results for day in result["days"]]
+    stressed_days = [day for result in stressed_results for day in result["days"]]
+    daily_returns = [day["daily_return"] for day in normal_days]
+    daily_excess = [day["excess_return"] for day in normal_days]
+    stressed_excess = [
+        stressed["daily_return"] - normal["benchmark_return"]
+        for normal, stressed in zip(normal_days, stressed_days)
+    ]
+    positive_folds = [fold for fold in folds if fold["mean_excess_return_pct"] > 0]
+    first_day = _date_value(normal_days[0]["signal_date"])
+    last_day = _date_value(normal_days[-1]["signal_date"])
+    parameter_trials = int(dataset.get("metadata", {}).get("parameter_trials") or 1)
+    cumulative_return = math.prod(1 + result["fold_return"] for result in normal_results) - 1
+    benchmark_cumulative = math.prod(1 + result["benchmark_return"] for result in normal_results) - 1
+    metrics = {
+        "history_days": len(all_dates),
+        "oos_events": len(normal_days),
+        "oos_months": round(((last_day - first_day).days + 1) / 30.4375, 2) if first_day and last_day else 0.0,
+        "folds": len(folds),
+        "positive_fold_ratio": round(len(positive_folds) / len(folds), 4),
+        "mean_net_return_pct": round(statistics.fmean(daily_returns) * 100, 4),
+        "mean_excess_return_pct": round(statistics.fmean(daily_excess) * 100, 4),
+        "stressed_mean_excess_return_pct": round(statistics.fmean(stressed_excess) * 100, 4),
+        "win_rate": round(sum(1 for value in daily_returns if value > 0) / len(daily_returns), 4),
+        "maximum_drawdown_pct": round(min(result["maximum_drawdown"] for result in normal_results) * 100, 4),
+        "dsr_probability": round(deflated_sharpe_probability(daily_excess, parameter_trials=parameter_trials), 6),
+        "cumulative_return_pct": round(cumulative_return * 100, 4),
+        "benchmark_cumulative_return_pct": round(benchmark_cumulative * 100, 4),
+        "closed_trades": sum(result["closed_trades"] for result in normal_results),
+        "maximum_positions_observed": max(day["positions"] for day in normal_days),
+        "parameter_trials": parameter_trials,
+    }
+
+    metadata = deepcopy(dataset.get("metadata") or {})
+    metadata["dataset_contract_version"] = BACKTEST_DATASET_CONTRACT_VERSION
+    metadata["signal_model"] = SIGNAL_MODEL_ID
+    metadata["point_in_time_complete"] = bool(metadata.get("point_in_time_complete")) and all(
+        result["coverage_complete"] for result in normal_results
+    )
+    benchmark_days = set(benchmark or {})
+    required_benchmark_days = {
+        _date_value(value)
+        for day in normal_days
+        for value in (day["signal_date"], day["cutoff_date"])
+    }
+    metadata["benchmark_complete"] = (
+        bool(metadata.get("benchmark_complete"))
+        and bool(benchmark)
+        and all(day in benchmark_days for day in required_benchmark_days if day is not None)
+    )
+    metadata["execution_parity_complete"] = True
+    metadata["execution_data_complete"] = bool(metadata.get("execution_data_complete")) and all(
+        result["execution_data_coverage_complete"] for result in normal_results
+    )
+    approval_gate = evaluate_approval_gate(metrics, validation, metadata)
+    return {
+        "status": "succeeded",
+        "strategy_id": strategy.get("id"),
+        "strategy_revision": strategy.get("revision", 1),
+        "generated_at": _timestamp(),
+        "method": method,
+        "execution": {
+            "signal_time": strategy.get("signal", {}).get("run_time", validation["signal_time"]),
+            "data_cutoff": "previous_trading_day_close",
+            "entry": "signal_day_open_with_t_plus_one",
+            "exit": "shared_portfolio_pipeline",
+            "valuation": "daily_liquidation_nav",
+            "cost_model": "commission_stamp_transfer_slippage",
+            "stress_cost_multiplier": 2.0,
+        },
+        "metadata": {**metadata, "signal_contract": signal_contract(strategy)},
+        "warnings": deepcopy(metadata.get("warnings") or []),
+        "metrics": metrics,
+        "folds": folds,
+        "sample_events": sample_events,
         "approval_gate": approval_gate,
     }
 
@@ -382,7 +560,7 @@ def load_current_universe_dataset(strategy: dict) -> dict:
     for row in rows:
         symbol = str(row.get("symbol") or "")
         name = str(row.get("name") or "")
-        if symbol.startswith(("0", "3", "6")) and "ST" not in name.upper() and symbol not in symbols:
+        if symbol.startswith(("0", "3", "6")) and "ST" not in name.upper() and "退" not in name and symbol not in symbols:
             symbols.append(symbol)
         if len(symbols) >= maximum:
             break
@@ -408,15 +586,48 @@ def load_current_universe_dataset(strategy: dict) -> dict:
             "universe_mode": "current_watchlist" if watchlist else "current_board_constituents",
             "benchmark_mode": "current_universe_equal_weight",
             "point_in_time_complete": False,
-            "strategy_parity_complete": False,
+            "benchmark_complete": False,
+            "strategy_parity_complete": True,
+            "execution_data_complete": False,
+            "corporate_actions_complete": False,
+            "signal_model": SIGNAL_MODEL_ID,
             "parameter_trials": 1,
             "warnings": [
                 "当前自动加载器使用现有成分股，存在幸存者偏差，只能用于探索和模拟盘，不能通过实盘门禁。",
-                "固定因子回测尚未覆盖线上全部实时筛选参数，需接入历史时点特征后才能通过策略一致性门禁。",
+                "回测已复用线上组合 Pipeline；当前日线数据不含完整执行时点成交量与涨跌停状态，不能通过实盘门禁。",
+                "当前加载器未处理分红送转等公司行动，不能通过实盘门禁。",
+                "当前没有独立基准行情，等权股票池仅作探索对照，不能通过实盘门禁。",
                 *errors[:10],
             ],
         },
     }
+
+
+def load_backtest_dataset_file(path: str | Path) -> dict:
+    target = Path(path).expanduser()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise BacktestDataError(f"无法读取回测数据集：{exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise BacktestDataError(f"回测数据集不是有效 JSON：{exc}") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("panel"), dict):
+        raise BacktestDataError("回测数据集必须包含 panel 股票历史映射")
+    dataset = deepcopy(payload)
+    dataset.setdefault("benchmark", [])
+    dataset.setdefault("universe_by_date", {})
+    metadata = dataset.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise BacktestDataError("回测数据集 metadata 必须是对象")
+    metadata.setdefault("source", "local_point_in_time_dataset")
+    return dataset
+
+
+def load_backtest_dataset(strategy: dict) -> dict:
+    configured = os.getenv("STOCK_AGENT_BACKTEST_DATASET_PATH", "").strip()
+    if configured:
+        return load_backtest_dataset_file(configured)
+    return load_current_universe_dataset(strategy)
 
 
 def _load_backtests_unlocked(path: str | Path | None = None) -> list[dict]:
@@ -526,6 +737,6 @@ def start_backtest(
         }
         items.insert(0, item)
         _save_backtests_unlocked(items, path)
-    thread = threading.Thread(target=_execute_backtest, args=(item["id"], strategy, data_loader or load_current_universe_dataset), kwargs={"path": path, "config_path": config_path}, daemon=True)
+    thread = threading.Thread(target=_execute_backtest, args=(item["id"], strategy, data_loader or load_backtest_dataset), kwargs={"path": path, "config_path": config_path}, daemon=True)
     thread.start()
     return deepcopy(item)

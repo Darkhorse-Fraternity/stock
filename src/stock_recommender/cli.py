@@ -9,7 +9,8 @@ from .data_sources import fetch_board_quotes
 from .delivery import should_deliver_report
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
 from .portfolio import format_action_notifications, format_portfolio_summary, monitor_portfolio
-from .reports import append_performance_link, generate_ai_report, generate_report
+from .reports import append_performance_link, generate_ai_report_result, generate_report_result
+from .runtime import assert_strategy_runnable
 from .schedule import parse_publish_hours, should_publish_now
 from .tracking import save_daily_selection
 from .universe import normalize_sector_filters, parse_watchlist
@@ -26,6 +27,8 @@ def main() -> None:
     if strategy is None:
         raise ValueError(f"策略不存在: {strategy_id}")
     mode = os.getenv("STOCK_AGENT_MODE", "report").strip().lower()
+    execution_kind = os.getenv("STOCK_AGENT_EXECUTION_KIND", "scheduled").strip().lower()
+    assert_strategy_runnable(strategy, execution_kind=execution_kind, mode=mode)
     board_code = os.getenv("STOCK_AGENT_BOARD_CODE") or str(parameter_value(strategy, "board_code", DEFAULT_BOARD_CODE))
     board_name = os.getenv("STOCK_AGENT_BOARD_NAME") or str(parameter_value(strategy, "board_name", DEFAULT_BOARD_NAME))
     state_path = os.getenv("STOCK_AGENT_STATE_PATH", "/tmp/stock-agent-daily-selection.json")
@@ -42,6 +45,7 @@ def main() -> None:
         sector_raw if sector_raw is not None else parameter_value(strategy, "sector_filters", [])
     )
     universe_options = {"watchlist": watchlist, "sector_filters": sector_filters}
+    recommendation = None
     if mode == "track":
         account, _, quote_error = monitor_portfolio(strategy, path=portfolio_path)
         report = format_portfolio_summary(account, performance_url=performance_url, quote_error=quote_error)
@@ -57,7 +61,7 @@ def main() -> None:
             **universe_options,
         )
     elif mode == "ai":
-        report = generate_ai_report(
+        recommendation = generate_ai_report_result(
             board_code=board_code,
             board_name=board_name,
             candidate_limit=int(os.getenv("STOCK_AGENT_CANDIDATE_LIMIT", "5")),
@@ -71,21 +75,23 @@ def main() -> None:
             tracking_limit=int(os.getenv("STOCK_AGENT_TRACKING_LIMIT", "3")),
             **universe_options,
         )
+        report = recommendation.report
     else:
-        report = generate_report(
+        recommendation = generate_report_result(
             board_code=board_code,
             board_name=board_name,
             top_n=int(os.getenv("STOCK_AGENT_TOP_N", "3")),
             strategy=strategy,
             **universe_options,
         )
-    if mode in {"ai", "report"}:
+        report = recommendation.report
+    if mode in {"ai", "report"} and execution_kind == "scheduled":
+        if recommendation is None:
+            raise RuntimeError("推荐模式未生成结构化推荐计划")
         save_daily_selection(
             state_path,
-            report,
+            recommendation.plan,
             strategy=strategy,
-            board_code=board_code,
-            board_name=board_name,
             benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
             history_path=history_path,
             portfolio_path=portfolio_path,
@@ -99,7 +105,7 @@ def main() -> None:
         path = Path(output).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(report, encoding="utf-8")
-    delivery_allowed = mode in {"track", "risk"} or should_deliver_report(report, strategy)
+    delivery_allowed = execution_kind == "scheduled" and (mode in {"track", "risk"} or should_deliver_report(report, strategy))
     if os.getenv("STOCK_AGENT_DELIVERY_RUN", "0") != "1" or delivery_allowed:
         print(report)
 
