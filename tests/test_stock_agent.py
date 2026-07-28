@@ -317,16 +317,19 @@ class StockAgentTests(unittest.TestCase):
         strategy = default_strategy_config()
         strategy["lifecycle"]["stage"] = "paper"
         calls = []
+        render_options = {}
 
         def persist(*args, **kwargs):
             calls.append("persist")
 
         def render(*args, **kwargs):
             calls.append("render")
+            render_options.update(kwargs)
             raise TimeoutError("llm timeout")
 
         env = {
             "STOCK_AGENT_MODE": "ai",
+            "STOCK_AGENT_ENABLE_TICK": "1",
             "STOCK_AGENT_OUTPUT": "",
         }
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
@@ -342,6 +345,7 @@ class StockAgentTests(unittest.TestCase):
                 main()
 
         self.assertEqual(calls, ["persist", "render"])
+        self.assertFalse(render_options["enable_tick"])
 
     def test_cli_caps_llm_timeout_to_remaining_run_budget(self):
         plan = make_recommendation_plan(
@@ -356,6 +360,7 @@ class StockAgentTests(unittest.TestCase):
             "STOCK_AGENT_EXECUTION_KIND": "preview",
             "STOCK_AGENT_LLM_TIMEOUT": "60",
             "STOCK_AGENT_RUN_BUDGET_SECONDS": "100",
+            "STOCK_AGENT_ENABLE_TICK": "1",
             "STOCK_AGENT_OUTPUT": "",
         }
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
@@ -370,6 +375,7 @@ class StockAgentTests(unittest.TestCase):
             main()
 
         self.assertEqual(render.call_args.kwargs["llm_timeout"], 25)
+        self.assertTrue(render.call_args.kwargs["enable_tick"])
 
     def test_recommendation_snapshot_contains_volume_turnover_and_change(self):
         snapshot = format_recommendation_snapshot(
