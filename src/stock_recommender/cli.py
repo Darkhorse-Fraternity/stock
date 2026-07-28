@@ -94,8 +94,6 @@ def main() -> None:
             board_name=board_name,
             candidate_limit=candidate_limit,
             selection_limit=selection_limit,
-            enable_tick=os.getenv("STOCK_AGENT_ENABLE_TICK", "0") == "1",
-            tick_limit=int(os.getenv("STOCK_AGENT_TICK_LIMIT", "2")),
             strategy=strategy,
             **universe_options,
         )
@@ -120,6 +118,11 @@ def main() -> None:
             llm_api_key=os.getenv("STOCK_AGENT_LLM_API_KEY", "ollama"),
             llm_timeout=min(configured_llm_timeout, remaining_budget),
             strategy=strategy,
+            enable_tick=(
+                execution_kind != "scheduled"
+                and os.getenv("STOCK_AGENT_ENABLE_TICK", "0") == "1"
+            ),
+            tick_limit=int(os.getenv("STOCK_AGENT_TICK_LIMIT", "2")),
         )
         report = recommendation.report
     else:

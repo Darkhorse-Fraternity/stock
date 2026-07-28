@@ -5,7 +5,13 @@ from datetime import datetime
 from typing import Callable, Iterable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
-from .context import collect_recommendation_plan, extract_market_payload, generate_agent_context_from_plan, recommendation_context_payload
+from .context import (
+    collect_recommendation_plan,
+    enrich_recommendation_plan_with_ticks,
+    extract_market_payload,
+    generate_agent_context_from_plan,
+    recommendation_context_payload,
+)
 from .llm import call_llm_analysis
 from .market_regime import normalize_market_regime_decision
 from .parameters import chase_risk_threshold, normalize_portfolio_config
@@ -348,9 +354,6 @@ def generate_ai_report_result(
         selection_limit=selection_limit,
         board_fetcher=board_fetcher,
         fallback_fetcher=fallback_fetcher,
-        enable_tick=enable_tick,
-        tick_fetcher=tick_fetcher,
-        tick_limit=tick_limit,
         history_fetcher=history_fetcher,
         financial_fetcher=financial_fetcher,
         enrich_limit=enrich_limit,
@@ -368,6 +371,9 @@ def generate_ai_report_result(
         llm_api_key=llm_api_key,
         llm_timeout=llm_timeout,
         strategy=current_strategy,
+        enable_tick=enable_tick,
+        tick_fetcher=tick_fetcher,
+        tick_limit=tick_limit,
     )
 
 
@@ -381,6 +387,9 @@ def render_ai_report_result(
     llm_api_key: str = "ollama",
     llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
     strategy: dict | None = None,
+    enable_tick: bool = False,
+    tick_fetcher: Callable | None = None,
+    tick_limit: int = 2,
 ) -> RecommendationOutput:
     """Render optional AI commentary after the deterministic plan is available.
 
@@ -390,6 +399,12 @@ def render_ai_report_result(
     """
 
     current_strategy = strategy
+    if enable_tick:
+        plan = enrich_recommendation_plan_with_ticks(
+            plan,
+            tick_fetcher=tick_fetcher,
+            tick_limit=tick_limit,
+        )
     context = generate_agent_context_from_plan(plan, strategy=current_strategy)
     payload = recommendation_context_payload(plan)
     market_regime = plan.market_regime

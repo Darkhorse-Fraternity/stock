@@ -159,9 +159,6 @@ def collect_recommendation_plan(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
-    enable_tick: bool = False,
-    tick_fetcher: Callable | None = None,
-    tick_limit: int = 2,
 ) -> RecommendationPlan:
     current = strategy if strategy is not None else load_strategy_config()
     configured_watchlist = watchlist if watchlist is not None else parameter_value(current, "watchlist", [])
@@ -194,8 +191,17 @@ def collect_recommendation_plan(
         candidate_limit=candidate_limit,
         selection_limit=selection_limit,
     )
-    if not enable_tick:
-        return plan
+    return plan
+
+
+def enrich_recommendation_plan_with_ticks(
+    plan: RecommendationPlan,
+    *,
+    tick_fetcher: Callable | None = None,
+    tick_limit: int = 2,
+) -> RecommendationPlan:
+    """Attach optional intraday tick commentary without changing admission."""
+
     candidates = [deepcopy(item) for item in plan.candidates]
     attach_ignition_signals(candidates, tick_fetcher=tick_fetcher, tick_limit=tick_limit)
     by_symbol = {str(item.get("symbol")): item for item in candidates}
@@ -338,10 +344,13 @@ def generate_agent_context(
         watchlist=watchlist,
         sector_filters=sector_filters,
         watchlist_fetcher=watchlist_fetcher,
-        enable_tick=enable_tick,
-        tick_fetcher=tick_fetcher,
-        tick_limit=tick_limit,
     )
+    if enable_tick:
+        plan = enrich_recommendation_plan_with_ticks(
+            plan,
+            tick_fetcher=tick_fetcher,
+            tick_limit=tick_limit,
+        )
     return generate_agent_context_from_plan(plan, strategy=current)
 
 
