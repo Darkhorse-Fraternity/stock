@@ -360,6 +360,12 @@ class StrategyPortfolioTests(unittest.TestCase):
         self.assertEqual(performance["strategy"]["id"], "tech-ai")
         self.assertEqual(performance["summary"]["position_count"], 0)
         self.assertEqual(len(performance["orders"]), 1)
+        self.assertEqual(performance["runtime"]["last_successful_pipeline_at"], self.t0.isoformat())
+        self.assertEqual(performance["runtime"]["last_pipeline_admitted"], 1)
+        self.assertEqual(
+            [stage["stage"] for stage in performance["runtime"]["last_pipeline_stages"]],
+            ["candidate_normalization", "market_regime", "portfolio_capacity", "risk_admission"],
+        )
 
     def test_daily_recommendation_is_committed_to_strategy_portfolio(self):
         plan = make_recommendation_plan(

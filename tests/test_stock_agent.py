@@ -234,11 +234,13 @@ class StockAgentTests(unittest.TestCase):
         plan = make_recommendation_plan([], now=datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc))
         output = RecommendationOutput(report="test report", plan=plan)
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
-            "stock_recommender.cli.generate_report_result", return_value=output
-        ) as generate_report:
+            "stock_recommender.cli.collect_recommendation_plan", return_value=plan
+        ) as collect_plan, mock.patch(
+            "stock_recommender.cli.render_report_result", return_value=output
+        ):
             main()
 
-        kwargs = generate_report.call_args.kwargs
+        kwargs = collect_plan.call_args.kwargs
         self.assertEqual([item["symbol"] for item in kwargs["watchlist"]], ["600519", "300750"])
         self.assertEqual(kwargs["sector_filters"], ["白酒"])
 
@@ -268,10 +270,10 @@ class StockAgentTests(unittest.TestCase):
         }
         with mock.patch.dict("os.environ", env, clear=True), mock.patch(
             "stock_recommender.cli.should_publish_now", return_value=False
-        ), mock.patch("stock_recommender.cli.generate_report_result") as generate_report:
+        ), mock.patch("stock_recommender.cli.collect_recommendation_plan") as collect_plan:
             main()
 
-        generate_report.assert_not_called()
+        collect_plan.assert_not_called()
 
     def test_cli_persists_recommendations_for_tracking_mode(self):
         generated_at = datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc)
@@ -283,10 +285,12 @@ class StockAgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state_path = str(Path(directory) / "selection.json")
             history_path = str(Path(directory) / "history.json")
+            portfolio_path = str(Path(directory) / "portfolio.json")
             env = {
                 "STOCK_AGENT_MODE": "report",
                 "STOCK_AGENT_STATE_PATH": state_path,
                 "STOCK_AGENT_HISTORY_PATH": history_path,
+                "STOCK_AGENT_PORTFOLIO_PATH": portfolio_path,
                 "STOCK_AGENT_OUTPUT": "",
             }
             from stock_recommender.parameters import default_strategy_config
@@ -295,13 +299,77 @@ class StockAgentTests(unittest.TestCase):
             with mock.patch.dict("os.environ", env, clear=True), mock.patch(
                 "stock_recommender.cli.load_strategy_config", return_value=strategy
             ), mock.patch(
-                "stock_recommender.cli.generate_report_result", return_value=recommendation
+                "stock_recommender.cli.collect_recommendation_plan", return_value=plan
+            ), mock.patch(
+                "stock_recommender.cli.render_report_result", return_value=recommendation
             ):
                 main()
 
             payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
 
         self.assertEqual(payload["symbols"], ["300130"])
+
+    def test_cli_persists_plan_before_ai_rendering(self):
+        plan = make_recommendation_plan(
+            [{"symbol": "300130", "name": "新国都", "price": 18.03}],
+            now=datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc),
+        )
+        strategy = default_strategy_config()
+        strategy["lifecycle"]["stage"] = "paper"
+        calls = []
+
+        def persist(*args, **kwargs):
+            calls.append("persist")
+
+        def render(*args, **kwargs):
+            calls.append("render")
+            raise TimeoutError("llm timeout")
+
+        env = {
+            "STOCK_AGENT_MODE": "ai",
+            "STOCK_AGENT_OUTPUT": "",
+        }
+        with mock.patch.dict("os.environ", env, clear=True), mock.patch(
+            "stock_recommender.cli.load_strategy_config", return_value=strategy
+        ), mock.patch(
+            "stock_recommender.cli.collect_recommendation_plan", return_value=plan
+        ), mock.patch(
+            "stock_recommender.cli.save_daily_selection", side_effect=persist
+        ), mock.patch(
+            "stock_recommender.cli.render_ai_report_result", side_effect=render
+        ):
+            with self.assertRaisesRegex(TimeoutError, "llm timeout"):
+                main()
+
+        self.assertEqual(calls, ["persist", "render"])
+
+    def test_cli_caps_llm_timeout_to_remaining_run_budget(self):
+        plan = make_recommendation_plan(
+            [{"symbol": "300130", "name": "新国都", "price": 18.03}],
+            now=datetime(2026, 7, 20, 1, 30, tzinfo=timezone.utc),
+        )
+        recommendation = RecommendationOutput(report="test report", plan=plan)
+        strategy = default_strategy_config()
+        strategy["lifecycle"]["stage"] = "paper"
+        env = {
+            "STOCK_AGENT_MODE": "ai",
+            "STOCK_AGENT_EXECUTION_KIND": "preview",
+            "STOCK_AGENT_LLM_TIMEOUT": "60",
+            "STOCK_AGENT_RUN_BUDGET_SECONDS": "100",
+            "STOCK_AGENT_OUTPUT": "",
+        }
+        with mock.patch.dict("os.environ", env, clear=True), mock.patch(
+            "stock_recommender.cli.load_strategy_config", return_value=strategy
+        ), mock.patch(
+            "stock_recommender.cli.collect_recommendation_plan", return_value=plan
+        ), mock.patch(
+            "stock_recommender.cli.time.monotonic", side_effect=[0.0, 75.0]
+        ), mock.patch(
+            "stock_recommender.cli.render_ai_report_result", return_value=recommendation
+        ) as render:
+            main()
+
+        self.assertEqual(render.call_args.kwargs["llm_timeout"], 25)
 
     def test_recommendation_snapshot_contains_volume_turnover_and_change(self):
         snapshot = format_recommendation_snapshot(
@@ -470,6 +538,23 @@ class StockAgentTests(unittest.TestCase):
         self.assertEqual([quote["symbol"] for quote in quotes], ["300130", "300857"])
         self.assertIn("pn=1", calls[0])
         self.assertIn("pn=2", calls[1])
+
+    def test_fetch_board_quotes_bounds_curl_retries_and_total_timeout(self):
+        completed = mock.Mock(returncode=1, stdout="", stderr="source unavailable")
+        with mock.patch(
+            "stock_recommender.data_sources.urllib.request.urlopen",
+            side_effect=OSError("primary unavailable"),
+        ), mock.patch(
+            "stock_recommender.data_sources.subprocess.run",
+            return_value=completed,
+        ) as run:
+            quotes, error = fetch_board_quotes("BK0800", timeout=3, retries=2)
+
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--retry") + 1], "2")
+        self.assertEqual(run.call_args.kwargs["timeout"], 11)
+        self.assertEqual(quotes, [])
+        self.assertEqual(error, "source unavailable")
 
     def test_fetch_sina_fallback_quotes_parses_realtime_payload(self):
         seen_requests = []

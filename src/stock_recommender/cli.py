@@ -1,23 +1,46 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from urllib.parse import quote
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
-from .context import generate_agent_context
+from .context import collect_recommendation_plan, generate_agent_context
 from .data_sources import fetch_board_quotes
 from .delivery import should_deliver_report
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
 from .portfolio import format_action_notifications, format_portfolio_summary, monitor_portfolio
-from .reports import append_performance_link, generate_ai_report_result, generate_report_result
+from .reports import append_performance_link, render_ai_report_result, render_report_result
 from .runtime import assert_strategy_runnable
 from .schedule import parse_publish_hours, should_publish_now
 from .tracking import save_daily_selection
 from .universe import normalize_sector_filters, parse_watchlist
 
 
+def _persist_scheduled_plan(
+    plan,
+    *,
+    execution_kind: str,
+    strategy: dict,
+    state_path: str,
+    history_path: str,
+    portfolio_path: str,
+) -> None:
+    if execution_kind != "scheduled":
+        return
+    save_daily_selection(
+        state_path,
+        plan,
+        strategy=strategy,
+        benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
+        history_path=history_path,
+        portfolio_path=portfolio_path,
+    )
+
+
 def main() -> None:
+    run_started = time.monotonic()
     publish_hours = parse_publish_hours(os.getenv("STOCK_AGENT_PUBLISH_HOURS", ""))
     schedule_guard = os.getenv("STOCK_AGENT_SCHEDULE_GUARD", "0").strip().lower() in {"1", "true", "yes"}
     if schedule_guard and not should_publish_now(publish_hours=publish_hours):
@@ -48,7 +71,6 @@ def main() -> None:
         sector_raw if sector_raw is not None else parameter_value(strategy, "sector_filters", [])
     )
     universe_options = {"watchlist": watchlist, "sector_filters": sector_filters}
-    recommendation = None
     if mode == "track":
         account, _, quote_error = monitor_portfolio(strategy, path=portfolio_path)
         report = format_portfolio_summary(account, performance_url=performance_url, quote_error=quote_error)
@@ -64,41 +86,62 @@ def main() -> None:
             **universe_options,
         )
     elif mode == "ai":
-        recommendation = generate_ai_report_result(
+        candidate_limit = int(os.getenv("STOCK_AGENT_CANDIDATE_LIMIT", "5"))
+        tracking_limit = int(os.getenv("STOCK_AGENT_TRACKING_LIMIT", "3"))
+        selection_limit = int(strategy.get("validation", {}).get("top_n", min(3, candidate_limit)))
+        plan = collect_recommendation_plan(
             board_code=board_code,
             board_name=board_name,
-            candidate_limit=int(os.getenv("STOCK_AGENT_CANDIDATE_LIMIT", "5")),
-            llm_base_url=os.getenv("STOCK_AGENT_LLM_BASE_URL", ""),
-            llm_model=os.getenv("STOCK_AGENT_LLM_MODEL", "Flux_AI/Flux_AI:latest"),
-            llm_api_key=os.getenv("STOCK_AGENT_LLM_API_KEY", "ollama"),
-            llm_timeout=int(os.getenv("STOCK_AGENT_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_SECONDS))),
+            candidate_limit=candidate_limit,
+            selection_limit=selection_limit,
             enable_tick=os.getenv("STOCK_AGENT_ENABLE_TICK", "0") == "1",
             tick_limit=int(os.getenv("STOCK_AGENT_TICK_LIMIT", "2")),
             strategy=strategy,
-            tracking_limit=int(os.getenv("STOCK_AGENT_TRACKING_LIMIT", "3")),
             **universe_options,
         )
-        report = recommendation.report
-    else:
-        recommendation = generate_report_result(
-            board_code=board_code,
-            board_name=board_name,
-            top_n=int(os.getenv("STOCK_AGENT_TOP_N", "3")),
+        _persist_scheduled_plan(
+            plan,
+            execution_kind=execution_kind,
             strategy=strategy,
-            **universe_options,
-        )
-        report = recommendation.report
-    if mode in {"ai", "report"} and execution_kind == "scheduled":
-        if recommendation is None:
-            raise RuntimeError("推荐模式未生成结构化推荐计划")
-        save_daily_selection(
-            state_path,
-            recommendation.plan,
-            strategy=strategy,
-            benchmark_fetcher=fetch_board_quotes if strategy.get("id") else None,
+            state_path=state_path,
             history_path=history_path,
             portfolio_path=portfolio_path,
         )
+        configured_llm_timeout = int(
+            os.getenv("STOCK_AGENT_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_SECONDS))
+        )
+        run_budget = max(1.0, float(os.getenv("STOCK_AGENT_RUN_BUDGET_SECONDS", "100")))
+        remaining_budget = max(1, int(run_budget - (time.monotonic() - run_started)))
+        recommendation = render_ai_report_result(
+            plan,
+            tracking_limit=tracking_limit,
+            llm_base_url=os.getenv("STOCK_AGENT_LLM_BASE_URL", ""),
+            llm_model=os.getenv("STOCK_AGENT_LLM_MODEL", "Flux_AI/Flux_AI:latest"),
+            llm_api_key=os.getenv("STOCK_AGENT_LLM_API_KEY", "ollama"),
+            llm_timeout=min(configured_llm_timeout, remaining_budget),
+            strategy=strategy,
+        )
+        report = recommendation.report
+    else:
+        top_n = int(os.getenv("STOCK_AGENT_TOP_N", "3"))
+        plan = collect_recommendation_plan(
+            board_code=board_code,
+            board_name=board_name,
+            candidate_limit=top_n,
+            selection_limit=top_n,
+            strategy=strategy,
+            **universe_options,
+        )
+        _persist_scheduled_plan(
+            plan,
+            execution_kind=execution_kind,
+            strategy=strategy,
+            state_path=state_path,
+            history_path=history_path,
+            portfolio_path=portfolio_path,
+        )
+        recommendation = render_report_result(plan, strategy=strategy)
+        report = recommendation.report
     if mode in {"ai", "report"}:
         report = append_performance_link(report, performance_url)
     if not report:

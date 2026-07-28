@@ -3,7 +3,8 @@ from __future__ import annotations
 import math
 import os
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import date, datetime
 from typing import Callable, Iterable
 
@@ -219,22 +220,12 @@ def _download_daily_history(symbol: str) -> list[dict]:
             return rows
         raise RuntimeError("东方财富日线返回空数据")
     except Exception as primary_error:
-        prefix = "sh" if normalized_symbol.startswith("6") else "bj" if normalized_symbol.startswith(("4", "8")) else "sz"
-        try:
-            fallback = ak.stock_zh_a_daily(
-                symbol=f"{prefix}{normalized_symbol}",
-                start_date="19700101",
-                end_date="20500101",
-                adjust="qfq",
-            )
-            rows = _history_rows(fallback)
-            if rows:
-                return rows
-            raise RuntimeError("新浪日线返回空数据")
-        except Exception as fallback_error:
-            raise RuntimeError(
-                f"东方财富与新浪日线均不可用：{primary_error}; {fallback_error}"
-            ) from fallback_error
+        # AkShare's Sina fallback does not expose a request timeout. Calling it
+        # here can hold an enrichment worker forever and make the whole Hermes
+        # job miss its 120-second deadline. The cache layer below already
+        # provides the safe fallback: retry the bounded source, then use the
+        # last valid point-in-time snapshot when one exists.
+        raise RuntimeError(f"东方财富日线不可用：{primary_error}") from primary_error
 
 
 def fetch_daily_history(
@@ -256,7 +247,7 @@ def fetch_daily_history(
     maximum_attempts = (
         int(attempts)
         if attempts is not None
-        else int(os.getenv("STOCK_AGENT_HISTORY_FETCH_ATTEMPTS", "3"))
+        else int(os.getenv("STOCK_AGENT_HISTORY_FETCH_ATTEMPTS", "1"))
     )
     backoff = (
         float(backoff_seconds)
@@ -354,9 +345,33 @@ def enrich_candidates(
     workers = min(4, target_count)
     if workers <= 0:
         return candidates
-    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stock-enrich") as executor:
-        futures = [executor.submit(enrich, index) for index in range(target_count)]
-        for future in as_completed(futures):
+    budget_seconds = max(1.0, float(os.getenv("STOCK_AGENT_ENRICH_TOTAL_BUDGET_SECONDS", "30")))
+    started = time.monotonic()
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="stock-enrich")
+    futures = {executor.submit(enrich, index): index for index in range(target_count)}
+    completed = set()
+    try:
+        remaining = max(0.01, budget_seconds - (time.monotonic() - started))
+        for future in as_completed(futures, timeout=remaining):
             index, row = future.result()
             candidates[index] = row
+            completed.add(index)
+    except FuturesTimeoutError:
+        pass
+    finally:
+        for future, index in futures.items():
+            if index in completed:
+                continue
+            if future.done() and not future.cancelled():
+                completed_index, row = future.result()
+                candidates[completed_index] = row
+                completed.add(completed_index)
+                continue
+            future.cancel()
+            row = dict(candidates[index])
+            errors = list(row.get("enrichment_errors") or [])
+            errors.append(f"enrichment: 总预算 {budget_seconds:g} 秒耗尽")
+            row["enrichment_errors"] = errors
+            candidates[index] = row
+        executor.shutdown(wait=False, cancel_futures=True)
     return candidates

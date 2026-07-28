@@ -173,15 +173,18 @@ recommendation instead of adding stocks outside the watchlist.
 | `STOCK_AGENT_LLM_BASE_URL` | empty | OpenAI-compatible base URL for `ai` mode. |
 | `STOCK_AGENT_LLM_MODEL` | `Flux_AI/Flux_AI:latest` | Model name used for final analysis in `ai` mode. |
 | `STOCK_AGENT_LLM_API_KEY` | `ollama` | Bearer token for OpenAI-compatible endpoint. |
-| `STOCK_AGENT_LLM_TIMEOUT` | `60` | LLM request timeout in seconds. |
+| `STOCK_AGENT_LLM_TIMEOUT` | `30` | Optional LLM commentary timeout in seconds. The deterministic plan is persisted first. |
+| `STOCK_AGENT_RUN_BUDGET_SECONDS` | `100` | Total scheduled-run budget reserved below Hermes' 120-second deadline. |
 | `STOCK_AGENT_TRACKING_LIMIT` | `3` | Maximum recommended stocks in the hourly volume/change tracking block. |
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
 | `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Recommendation audit archive; strategy performance uses the full portfolio ledger. |
 | `STOCK_AGENT_MARKET_HISTORY_CACHE_DIR` | `data/market_history_cache` | Per-symbol daily-history cache used by enrichment, backtests, and replay tools. |
 | `STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS` | `21600` | Fresh-cache lifetime; stale data remains available when the upstream source fails. |
-| `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `3` | Bounded daily-history download attempts. |
+| `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `1` | Bounded daily-history download attempts before stale-cache fallback. |
 | `STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS` | `1` | Initial exponential retry delay. |
 | `STOCK_AGENT_HISTORY_FETCH_WORKERS` | `2` | Maximum concurrent history downloads during a backtest. |
+| `STOCK_AGENT_ENRICH_TOTAL_BUDGET_SECONDS` | `30` | Total live enrichment budget; unfinished symbols are rejected with diagnostics. |
+| `STOCK_AGENT_SOURCE_RETRIES` | `2` | Maximum curl retries for the board quote source. |
 | `STOCK_AGENT_BACKTEST_DATASET_PATH` | empty | Optional read-only point-in-time JSON dataset; when absent the current-universe exploratory loader is used and cannot pass the live gate. |
 | `STOCK_AGENT_PUBLIC_URL` | empty | Public service origin used to build canonical strategy-performance links, for example `http://host:8765`. |
 | `STOCK_AGENT_SCHEDULE_GUARD` | `0` | Set to `1` to skip publication outside configured weekday hours. Background scripts default to `1`. |
@@ -191,7 +194,9 @@ recommendation instead of adding stocks outside the watchlist.
 
 At 08:00 Beijing time, the strategy ranks stocks from data strictly before the
 current trading day and saves the deterministic `factor_rank_v1` portfolio list
-to `STOCK_AGENT_STATE_PATH`. Later tracking jobs load that same list and fetch
+to `STOCK_AGENT_STATE_PATH` and the strategy portfolio before optional AI
+commentary is generated. A slow LLM or failed Feishu delivery therefore cannot
+discard that day's portfolio decision. Later tracking jobs load that same list and fetch
 fresh quotes without running selection again. Each tracking report contains
 latest price, intraday change percentage, trading volume in hands, and turnover
 amount. It does not include unrelated stocks from the full board or watchlist.
