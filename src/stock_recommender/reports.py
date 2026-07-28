@@ -296,6 +296,16 @@ def generate_report_result(
         sector_filters=sectors if sector_filters is not None else None,
         watchlist_fetcher=watchlist_fetcher,
     )
+    return render_report_result(plan, strategy=strategy)
+
+
+def render_report_result(
+    plan: RecommendationPlan,
+    *,
+    strategy: dict | None = None,
+) -> RecommendationOutput:
+    """Render a deterministic report from an already computed strategy plan."""
+
     return RecommendationOutput(report=render_report(plan, strategy=strategy), plan=plan)
 
 
@@ -349,6 +359,37 @@ def generate_ai_report_result(
         sector_filters=sector_filters,
         watchlist_fetcher=watchlist_fetcher,
     )
+    return render_ai_report_result(
+        plan,
+        tracking_limit=tracking_limit,
+        llm_client=llm_client,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
+        llm_api_key=llm_api_key,
+        llm_timeout=llm_timeout,
+        strategy=current_strategy,
+    )
+
+
+def render_ai_report_result(
+    plan: RecommendationPlan,
+    *,
+    tracking_limit: int = 3,
+    llm_client: Callable | None = None,
+    llm_base_url: str = "",
+    llm_model: str = "Flux_AI/Flux_AI:latest",
+    llm_api_key: str = "ollama",
+    llm_timeout: int = DEFAULT_LLM_TIMEOUT_SECONDS,
+    strategy: dict | None = None,
+) -> RecommendationOutput:
+    """Render optional AI commentary after the deterministic plan is available.
+
+    Callers that execute a scheduled strategy can persist ``plan`` before
+    entering this adapter. A slow model or failed delivery therefore cannot
+    erase the portfolio decision for the day.
+    """
+
+    current_strategy = strategy
     context = generate_agent_context_from_plan(plan, strategy=current_strategy)
     payload = recommendation_context_payload(plan)
     market_regime = plan.market_regime

@@ -1,5 +1,7 @@
 import math
 import sys
+import threading
+import time
 import unittest
 from datetime import date, timedelta
 from types import SimpleNamespace
@@ -9,6 +11,7 @@ from stock_recommender.enrichment import (
     _download_daily_history,
     calculate_technical_indicators,
     enrich_candidates,
+    fetch_daily_history,
     normalize_financial_snapshot,
 )
 from stock_recommender.parameters import default_strategy_config
@@ -21,39 +24,24 @@ def history(closes):
 
 
 class EnrichmentTests(unittest.TestCase):
-    def test_daily_history_falls_back_to_sina_after_eastmoney_failure(self):
-        class Frame:
-            def iterrows(self):
-                return iter(
-                    [
-                        (
-                            0,
-                            {
-                                "date": date(2026, 7, 21),
-                                "open": 10,
-                                "close": 10.5,
-                                "high": 10.8,
-                                "low": 9.9,
-                                "volume": 1000,
-                                "amount": 10500,
-                            },
-                        )
-                    ]
-                )
-
+    def test_daily_history_does_not_call_unbounded_sina_fallback(self):
         calls = []
         fake_akshare = SimpleNamespace(
             stock_zh_a_hist=lambda **kwargs: (_ for _ in ()).throw(ConnectionError("eastmoney unavailable")),
-            stock_zh_a_daily=lambda **kwargs: calls.append(kwargs) or Frame(),
+            stock_zh_a_daily=lambda **kwargs: calls.append(kwargs),
         )
 
         with patch.dict(sys.modules, {"akshare": fake_akshare}):
-            rows = _download_daily_history("002230")
+            with self.assertRaisesRegex(RuntimeError, "东方财富日线不可用"):
+                _download_daily_history("002230")
 
-        self.assertEqual(calls[0]["symbol"], "sz002230")
-        self.assertEqual(calls[0]["adjust"], "qfq")
-        self.assertEqual(rows[0]["date"], date(2026, 7, 21))
-        self.assertEqual(rows[0]["turnover"], 10500)
+        self.assertEqual(calls, [])
+
+    def test_daily_history_uses_one_bounded_attempt_by_default(self):
+        with patch("stock_recommender.enrichment.fetch_daily_history_with_cache", return_value=[]) as fetch:
+            fetch_daily_history("002230")
+
+        self.assertEqual(fetch.call_args.kwargs["attempts"], 1)
 
     def test_technical_indicators_cover_trend_momentum_and_risk(self):
         rows = history([10 + index * 0.1 for index in range(260)])
@@ -132,6 +120,27 @@ class EnrichmentTests(unittest.TestCase):
         )
 
         self.assertEqual([item["symbol"] for item in filtered], ["600001"])
+
+    def test_enrichment_returns_budget_diagnostics_without_waiting_for_slow_worker(self):
+        config = default_strategy_config()
+        gate = threading.Event()
+
+        def slow_history(symbol):
+            gate.wait(timeout=5)
+            return history([10 + index * 0.1 for index in range(80)])
+
+        started = time.monotonic()
+        with patch.dict("os.environ", {"STOCK_AGENT_ENRICH_TOTAL_BUDGET_SECONDS": "1"}):
+            rows = enrich_candidates(
+                [{"symbol": "600001", "price": 18, "turnover": 100, "float_market_cap": 3_000_000_000}],
+                strategy=config,
+                history_fetcher=slow_history,
+            )
+        elapsed = time.monotonic() - started
+        gate.set()
+
+        self.assertLess(elapsed, 1.5)
+        self.assertTrue(any("总预算 1 秒耗尽" in message for message in rows[0]["enrichment_errors"]))
 
 
 if __name__ == "__main__":

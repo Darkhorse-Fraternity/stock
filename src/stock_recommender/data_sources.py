@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import socket
 import subprocess
@@ -21,12 +22,14 @@ def fetch_board_quotes(
     limit: int = 50,
     page_size: int = 50,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    retries: int | None = None,
     urlopen_func: Callable | None = None,
 ) -> tuple[list[dict], str | None]:
     opener = urlopen_func or urllib.request.urlopen
     quotes = []
     last_error = None
     pages = max(1, (limit + page_size - 1) // page_size)
+    retry_count = max(0, int(os.getenv("STOCK_AGENT_SOURCE_RETRIES", "2") if retries is None else retries))
 
     for page in range(1, pages + 1):
         params = urllib.parse.urlencode(
@@ -70,7 +73,7 @@ def fetch_board_quotes(
                         "--max-time",
                         str(timeout),
                         "--retry",
-                        "10",
+                        str(retry_count),
                         "--retry-delay",
                         "1",
                         "--retry-all-errors",
@@ -85,7 +88,7 @@ def fetch_board_quotes(
                     check=False,
                     capture_output=True,
                     text=True,
-                    timeout=max(timeout + 2, timeout * 5),
+                    timeout=max(timeout + 2, timeout * (retry_count + 1) + retry_count),
                 )
                 if curl_result.returncode != 0:
                     last_error = (curl_result.stderr or str(exc)).strip() or str(exc)

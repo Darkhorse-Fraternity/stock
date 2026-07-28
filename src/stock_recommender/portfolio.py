@@ -1223,6 +1223,13 @@ def build_strategy_performance(
     realized = sum(number(trade.get("realized_pnl")) for trade in closed)
     history = list(projected.get("nav_history", []))
     maximum_drawdown = max((number(point.get("drawdown_pct")) for point in history), default=0.0)
+    pipeline_events = [
+        event
+        for event in projected.get("events", [])
+        if event.get("type") == "PIPELINE_COMPLETED"
+    ]
+    last_pipeline = max(pipeline_events, key=lambda event: str(event.get("occurred_at") or ""), default=None)
+    last_pipeline_data = deepcopy((last_pipeline or {}).get("data") or {})
     return {
         "generated_at": current.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "quote_error": quote_error,
@@ -1256,6 +1263,13 @@ def build_strategy_performance(
             "target_exposure_pct": number(projected.get("target_exposure_pct"), default=100.0),
             "closed_trade_count": len(closed),
             "win_rate_pct": _round(len(wins) / len(closed) * 100) if closed else None,
+        },
+        "runtime": {
+            "last_successful_pipeline_at": (last_pipeline or {}).get("occurred_at"),
+            "last_successful_pipeline_run_id": last_pipeline_data.get("run_id"),
+            "last_pipeline_admitted": int(number(last_pipeline_data.get("admitted"))),
+            "last_pipeline_stages": deepcopy(last_pipeline_data.get("stages") or []),
+            "last_pipeline_market_regime": deepcopy(last_pipeline_data.get("market_regime")),
         },
         "nav_history": history,
         "positions": positions,
