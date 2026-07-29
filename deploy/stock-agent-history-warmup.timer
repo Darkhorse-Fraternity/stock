@@ -1,0 +1,11 @@
+[Unit]
+Description=Warm Stock Agent history cache before the 08:00 strategy run
+
+[Timer]
+OnCalendar=*-*-* 07:00:00 Asia/Shanghai
+Persistent=true
+RandomizedDelaySec=2min
+Unit=stock-agent-history-warmup.service
+
+[Install]
+WantedBy=timers.target

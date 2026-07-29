@@ -1,0 +1,10 @@
+[Unit]
+Description=Stock Agent board history cache warmup
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/internal-tools/apps/stock-agent
+EnvironmentFile=-%h/internal-tools/apps/stock-agent/.env
+ExecStart=/bin/sh %h/internal-tools/apps/stock-agent/scripts/warm-board-history-run.sh
+TimeoutStartSec=45min
