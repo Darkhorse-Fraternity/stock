@@ -4,16 +4,41 @@ import json
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME
 from .enrichment import fetch_daily_history
+from .data_sources import akshare_symbol
+from .market_history import save_daily_history_cache
 from .parameters import load_strategy_config, parameter_value
 from .signal_engine import extract_signal_features, normalize_signal_history
 from .universe_provider import BoardUniverseProvider
 from .utils import beijing_now
+
+
+def _download_sina_warmup_history(symbol: str, *, now: datetime) -> list[dict]:
+    import akshare as ak
+
+    frame = ak.stock_zh_a_daily(
+        symbol=akshare_symbol(symbol),
+        start_date=(now.date() - timedelta(days=550)).strftime("%Y%m%d"),
+        end_date=(now.date() + timedelta(days=1)).strftime("%Y%m%d"),
+        adjust="qfq",
+    )
+    return [
+        {
+            "date": row.get("date"),
+            "open": row.get("open"),
+            "close": row.get("close"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "volume": row.get("volume"),
+            "turnover": row.get("amount"),
+        }
+        for _, row in frame.iterrows()
+    ]
 
 
 def warmup_status_path(path: str | Path | None = None) -> Path:
@@ -46,9 +71,11 @@ def warm_board_history_cache(
     board_name: str,
     provider: BoardUniverseProvider | None = None,
     history_fetcher: Callable | None = None,
+    secondary_history_fetcher: Callable | None = None,
     workers: int | None = None,
     minimum_history_rows: int = 61,
     now: datetime | None = None,
+    cache_dir: str | Path | None = None,
 ) -> dict:
     current = beijing_now(now)
     universe = (provider or BoardUniverseProvider()).fetch(
@@ -82,6 +109,11 @@ def warm_board_history_cache(
         return result
 
     fetcher = history_fetcher or fetch_daily_history
+    secondary_fetcher = (
+        secondary_history_fetcher
+        if secondary_history_fetcher is not None
+        else (_download_sina_warmup_history if history_fetcher is None else None)
+    )
     worker_count = max(
         1,
         int(workers if workers is not None else os.getenv("STOCK_AGENT_HISTORY_WARMUP_WORKERS", "8")),
@@ -90,7 +122,23 @@ def warm_board_history_cache(
     def warm(row: dict) -> tuple[str, str | None]:
         symbol = str(row.get("symbol") or "")
         try:
-            history = fetcher(symbol, attempts=1, force_refresh=True, now=current)
+            try:
+                history = fetcher(symbol, attempts=1, force_refresh=True, now=current)
+            except Exception as primary_error:
+                if secondary_fetcher is None:
+                    raise
+                try:
+                    history = secondary_fetcher(symbol, now=current)
+                    history = save_daily_history_cache(
+                        symbol,
+                        history,
+                        cache_dir=cache_dir,
+                        now=current,
+                    )
+                except Exception as secondary_error:
+                    raise RuntimeError(
+                        f"主源失败：{primary_error}；新浪源失败：{secondary_error}"
+                    ) from secondary_error
             normalized = normalize_signal_history(history, cutoff=current.date())
             features = extract_signal_features(
                 normalized,
