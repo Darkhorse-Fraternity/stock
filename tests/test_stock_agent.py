@@ -562,6 +562,45 @@ class StockAgentTests(unittest.TestCase):
         self.assertEqual(quotes, [])
         self.assertEqual(error, "source unavailable")
 
+    def test_fetch_board_quotes_fails_over_to_delay_domain(self):
+        payload = json.dumps(
+            {
+                "data": {
+                    "total": 1,
+                    "diff": [
+                        {
+                            "f12": "300130",
+                            "f14": "新国都",
+                            "f2": 18.03,
+                            "f3": 1.2,
+                            "f4": 0.2,
+                            "f5": 100,
+                            "f6": 100_000_000,
+                        }
+                    ],
+                }
+            }
+        )
+
+        def curl(command, **kwargs):
+            if "push2delay.eastmoney.com" in command[-1]:
+                return mock.Mock(returncode=0, stdout=payload, stderr="")
+            return mock.Mock(returncode=1, stdout="", stderr="primary eof")
+
+        with mock.patch(
+            "stock_recommender.data_sources.urllib.request.urlopen",
+            side_effect=OSError("primary unavailable"),
+        ), mock.patch(
+            "stock_recommender.data_sources.subprocess.run",
+            side_effect=curl,
+        ) as run:
+            quotes, error = fetch_board_quotes("BK0800", timeout=1, retries=0)
+
+        self.assertIsNone(error)
+        self.assertEqual([item["symbol"] for item in quotes], ["300130"])
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("push2delay.eastmoney.com", run.call_args.args[0][-1])
+
     def test_fetch_sina_fallback_quotes_parses_realtime_payload(self):
         seen_requests = []
         raw = (
