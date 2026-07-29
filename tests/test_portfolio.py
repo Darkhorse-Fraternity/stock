@@ -227,6 +227,35 @@ class StrategyPortfolioTests(unittest.TestCase):
         self.assertTrue(all(order["reason"] == "MARKET_REGIME_RISK_OFF" for order in sell_orders))
         self.assertIn("EXIT_TRIGGERED", [event["type"] for event in events])
 
+    def test_unknown_regime_from_data_gap_blocks_entries_without_liquidating_positions(self):
+        plan_daily_candidates(self.strategy, [self._candidate(1)], now=self.t0, path=self.path)
+        monitor_portfolio(
+            self.strategy,
+            now=self.t0 + timedelta(hours=2),
+            path=self.path,
+            quote_fetcher=self._quotes(10.0),
+        )
+        unknown = {
+            "model": "trend_breadth_v1",
+            "state": "UNKNOWN",
+            "target_exposure_pct": 0,
+            "reason": "历史特征覆盖不足",
+        }
+
+        account, events = plan_daily_candidates(
+            self.strategy,
+            [],
+            now=self.t0 + timedelta(days=1),
+            path=self.path,
+            market_regime=unknown,
+            data_quality={"status": "BLOCKED", "reason": "历史特征覆盖不足"},
+        )
+
+        self.assertIn("600001", account["positions"])
+        self.assertEqual([order for order in account["orders"] if order["side"] == "SELL"], [])
+        pipeline = next(event for event in events if event["type"] == "PIPELINE_COMPLETED")
+        self.assertEqual(pipeline["data"]["data_quality"]["status"], "BLOCKED")
+
     def test_stop_loss_creates_exit_then_fills_on_next_snapshot(self):
         plan_daily_candidates(self.strategy, [self._candidate(1)], now=self.t0, path=self.path)
         monitor_portfolio(

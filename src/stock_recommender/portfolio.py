@@ -528,6 +528,7 @@ def plan_daily_candidates(
     path: str | Path | None = None,
     account: dict | None = None,
     market_regime: dict,
+    data_quality: dict | None = None,
 ) -> tuple[dict, list[dict]]:
     assert_strategy_runnable(strategy, execution_kind="scheduled", mode="report")
     current = beijing_now(now)
@@ -566,13 +567,18 @@ def plan_daily_candidates(
                 "stages": pipeline_trace,
                 "admitted": len(admitted_candidates),
                 "market_regime": deepcopy(decision),
+                "data_quality": deepcopy(data_quality or {}),
             },
         )
         if pipeline_event:
             events.append(pipeline_event)
         events.extend(_expire_old_entries(account, current))
         regime_config = allocation_config(strategy)
-        if decision["target_exposure_pct"] <= 0 and regime_config.get("exit_on_risk_off", True):
+        if (
+            decision["state"] == "RISK_OFF"
+            and decision["target_exposure_pct"] <= 0
+            and regime_config.get("exit_on_risk_off", True)
+        ):
             for order in list(_open_orders(account, "BUY")):
                 event = _cancel_order(account, order, current, f"MARKET_REGIME_{decision['state']}")
                 if event:
@@ -582,7 +588,10 @@ def plan_daily_candidates(
                 key=lambda item: (number(item.get("current_score")), item.get("symbol") or ""),
             ):
                 events.extend(_trigger_exit(account, position, current, f"MARKET_REGIME_{decision['state']}"))
-        elif regime_config.get("rebalance_to_target_exposure", True):
+        elif (
+            decision["state"] in {"RISK_ON", "NEUTRAL"}
+            and regime_config.get("rebalance_to_target_exposure", True)
+        ):
             nav = number(account.get("latest_nav"), default=number(account.get("initial_cash")))
             target_value = nav * decision["target_exposure_pct"] / 100
             projected_value = sum(
@@ -1270,6 +1279,7 @@ def build_strategy_performance(
             "last_pipeline_admitted": int(number(last_pipeline_data.get("admitted"))),
             "last_pipeline_stages": deepcopy(last_pipeline_data.get("stages") or []),
             "last_pipeline_market_regime": deepcopy(last_pipeline_data.get("market_regime")),
+            "last_pipeline_data_quality": deepcopy(last_pipeline_data.get("data_quality") or {}),
         },
         "nav_history": history,
         "positions": positions,

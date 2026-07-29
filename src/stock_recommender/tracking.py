@@ -77,6 +77,7 @@ def save_daily_selection(
         "benchmark_initial_change_pct": benchmark_change,
         "benchmark_error": benchmark_error,
         "market_regime": market_regime,
+        "data_quality": deepcopy(plan.data_quality),
     }
     _save_state(target, payload)
     if payload["strategy_id"] and payload["strategy_stage"] == "paper":
@@ -93,6 +94,7 @@ def save_daily_selection(
                 now=current,
                 path=portfolio_path,
                 market_regime=market_regime,
+                data_quality=plan.data_quality,
             )
             payload["portfolio_account_id"] = account.get("id")
             payload["portfolio_event_ids"] = [event.get("id") for event in events]

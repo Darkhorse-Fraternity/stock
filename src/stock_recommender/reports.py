@@ -105,6 +105,30 @@ def format_market_regime_summary(decision: dict) -> str:
     )
 
 
+def format_data_quality_funnel(data_quality: dict) -> str:
+    quality = data_quality or {}
+    source_labels = {
+        "primary": "主数据源",
+        "snapshot_realtime": "完整板块快照 + 实时行情",
+        "watchlist": "自选股池实时行情",
+        "injected_primary": "指定数据源",
+        "unavailable": "不可用",
+    }
+    source = source_labels.get(str(quality.get("source_mode") or ""), str(quality.get("source_mode") or "未知"))
+    status = "可运行" if quality.get("status") == "READY" else "已阻断"
+    return (
+        "🔎 **数据漏斗**："
+        f"股票池 {int(number(quality.get('raw_count')))} → "
+        f"实时行情 {int(number(quality.get('quote_count', quality.get('raw_count'))))} → "
+        f"基础过滤 {int(number(quality.get('basic_count')))} → "
+        f"历史特征 {int(number(quality.get('history_ready_count')))} → "
+        f"策略过滤 {int(number(quality.get('strategy_filtered_count')))} → "
+        f"动量准入 {int(number(quality.get('absolute_momentum_count')))} → "
+        f"最终 {int(number(quality.get('selected_count')))}；"
+        f"{source} · {status}"
+    )
+
+
 def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:
     current_strategy = strategy
     report_time = plan.generated_at
@@ -118,6 +142,8 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
                 f"📊 **策略运行报告** ({report_time.strftime('%Y 年%m月%d日')})",
                 "",
                 format_market_regime_summary(market_regime),
+                "",
+                format_data_quality_funnel(plan.data_quality),
                 "",
                 "本次没有匹配股票，不新增持仓；既有持仓继续由退出 Pipeline 管理。",
                 f"数据状态：{error or market_regime['reason']}",
@@ -139,6 +165,8 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
         f"🎯 **{universe_label}{filter_label}精选 {len(top)} 只值得关注的股票**",
         "",
         format_market_regime_summary(market_regime),
+        "",
+        format_data_quality_funnel(plan.data_quality),
         "",
     ]
 
@@ -213,6 +241,8 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
         f"📋 **确定性策略入场计划** ({report_time.strftime('%Y 年%m月%d日')})",
         "",
         format_market_regime_summary(plan.market_regime),
+        "",
+        format_data_quality_funnel(plan.data_quality),
         "",
         f"候选范围：{universe_label}{filter_label}",
     ]
@@ -409,6 +439,28 @@ def render_ai_report_result(
     payload = recommendation_context_payload(plan)
     market_regime = plan.market_regime
     regime_summary = format_market_regime_summary(market_regime)
+    if payload.get("data_quality", {}).get("status") == "BLOCKED":
+        quality = payload.get("data_quality") or {}
+        unavailable = quality.get("source_mode") == "unavailable" and not quality.get("raw_count")
+        report = decorate_strategy_output("\n".join(
+            [
+                (
+                    "⚠️ **实时行情不可用，本次不生成策略动作**"
+                    if unavailable
+                    else "⚠️ **数据覆盖不足，本次不生成策略动作**"
+                ),
+                "",
+                regime_summary,
+                "",
+                format_data_quality_funnel(quality),
+                f"阻断原因：{quality.get('reason') or payload.get('fetch_error') or 'unknown'}",
+                "今日不生成股票推荐。",
+                "已有持仓不会因为数据不足被清空，仍由价格风控与退出 Pipeline 管理。",
+                "",
+                "仅供参考，不构成投资建议。",
+            ]
+        ), current_strategy)
+        return RecommendationOutput(report=report, plan=plan)
     if payload.get("fetch_error") or any("估算兜底" in source for source in payload.get("source", [])):
         report = decorate_strategy_output("\n".join(
             [

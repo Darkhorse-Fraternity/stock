@@ -1,4 +1,6 @@
 import tempfile
+import threading
+import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -65,13 +67,14 @@ class MarketHistoryCacheTests(unittest.TestCase):
         )
         self.assertEqual(cached, result)
 
-    def test_stale_cache_is_returned_after_all_retries_fail(self):
+    def test_stale_cache_is_returned_immediately_without_blocking_retries(self):
         save_daily_history_cache("600001", self.rows, cache_dir=self.cache_dir, now=self.now)
         sleeps = []
+        calls = []
 
         result = fetch_daily_history_with_cache(
             "600001",
-            lambda: (_ for _ in ()).throw(ConnectionError("upstream unavailable")),
+            lambda: calls.append(True),
             cache_dir=self.cache_dir,
             cache_ttl_seconds=1,
             attempts=2,
@@ -81,7 +84,8 @@ class MarketHistoryCacheTests(unittest.TestCase):
         )
 
         self.assertEqual(result[0]["close"], 10.5)
-        self.assertEqual(sleeps, [0.25])
+        self.assertEqual(calls, [])
+        self.assertEqual(sleeps, [])
 
     def test_missing_cache_raises_bounded_error_after_retries(self):
         with self.assertRaises(DailyHistoryUnavailableError) as raised:
@@ -95,6 +99,37 @@ class MarketHistoryCacheTests(unittest.TestCase):
             )
 
         self.assertIn("已重试 2 次", str(raised.exception))
+
+    def test_stale_cache_is_revalidated_by_background_worker(self):
+        save_daily_history_cache("600001", self.rows, cache_dir=self.cache_dir, now=self.now)
+        started = threading.Event()
+        refreshed_rows = [{"date": "2026-07-22", "close": 11.0}]
+
+        result = fetch_daily_history_with_cache(
+            "600001",
+            lambda: (started.set() or refreshed_rows),
+            cache_dir=self.cache_dir,
+            cache_ttl_seconds=1,
+            attempts=1,
+            now=self.now + timedelta(hours=1),
+            background_refresh=True,
+        )
+
+        self.assertEqual(result[0]["close"], 10.5)
+        self.assertTrue(started.wait(timeout=1))
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            cached = fetch_daily_history_with_cache(
+                "600001",
+                lambda: self.fail("refreshed cache should be available"),
+                cache_dir=self.cache_dir,
+                cache_ttl_seconds=60,
+                now=self.now + timedelta(hours=1),
+            )
+            if cached[0]["close"] == 11.0:
+                break
+            time.sleep(0.01)
+        self.assertEqual(cached[0]["close"], 11.0)
 
 
 if __name__ == "__main__":
