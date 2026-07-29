@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
 from stock_recommender.universe_provider import UniverseQuoteBatch
 from stock_recommender.warmup import warm_board_history_cache
@@ -54,6 +56,30 @@ class HistoryWarmupTests(unittest.TestCase):
         self.assertEqual({symbol for symbol, _ in calls}, {"600001", "600002", "600003"})
         self.assertTrue(all(options["force_refresh"] for _, options in calls))
         self.assertTrue(all(options["attempts"] == 1 for _, options in calls))
+
+    def test_warmup_uses_secondary_source_and_persists_valid_history(self):
+        start = date(2025, 1, 1)
+        secondary_rows = [
+            {"date": start + timedelta(days=index), "close": 10 + index * 0.1}
+            for index in range(70)
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            result = warm_board_history_cache(
+                board_code="BK0800",
+                board_name="人工智能",
+                provider=FakeProvider([{"symbol": "600001", "name": "测试"}]),
+                history_fetcher=lambda symbol, **kwargs: (_ for _ in ()).throw(
+                    ConnectionError("primary unavailable")
+                ),
+                secondary_history_fetcher=lambda symbol, **kwargs: secondary_rows,
+                cache_dir=directory,
+                workers=1,
+                now=datetime(2026, 7, 29, 7, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertTrue((Path(directory) / "600001.json").exists())
+        self.assertEqual(result["ready_count"], 1)
+        self.assertEqual(result["failed_count"], 0)
 
 
 if __name__ == "__main__":
