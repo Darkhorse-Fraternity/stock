@@ -30,6 +30,7 @@ class RecommendationPlan:
     sources: tuple[str, ...]
     fetch_error: str | None
     analyzed_count: int
+    data_quality: dict
     market_regime: dict
     signal_contract: dict
     candidates: tuple[dict, ...]
@@ -46,6 +47,8 @@ class RecommendationPlan:
             raise ValueError("selected recommendation candidates must be present in candidates")
         if not isinstance(self.market_regime, dict) or not self.market_regime.get("state"):
             raise ValueError("recommendation plan requires an explicit market regime")
+        if not isinstance(self.data_quality, dict) or self.data_quality.get("status") not in {"READY", "BLOCKED"}:
+            raise ValueError("recommendation plan requires explicit data quality")
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,19 +64,47 @@ def build_recommendation_plan(
     strategy: Mapping | None,
     board_code: str,
     board_name: str,
+    market_analyses: Iterable[Mapping] | None = None,
     watchlist_size: int = 0,
     sector_filters: Iterable[str] = (),
     fetch_error: str | None = None,
+    data_quality: Mapping | None = None,
     candidate_limit: int = 8,
     selection_limit: int = 3,
 ) -> RecommendationPlan:
     analyzed = [deepcopy(dict(item)) for item in analyses]
-    decision = evaluate_market_regime(analyzed, strategy)
-    eligible = filter_absolute_momentum(analyzed, strategy, decision)
+    market_rows = (
+        [deepcopy(dict(item)) for item in market_analyses]
+        if market_analyses is not None
+        else analyzed
+    )
+    quality = deepcopy(dict(data_quality or {}))
+    quality.setdefault("status", "READY")
+    quality.setdefault("reason", "数据覆盖满足策略运行要求")
+    quality["analyzed_count"] = len(analyzed)
+    quality["market_analyzed_count"] = len(market_rows)
+    if quality["status"] == "BLOCKED":
+        decision = evaluate_market_regime([], strategy)
+        decision.update(
+            {
+                "state": "UNKNOWN",
+                "label": "数据不足",
+                "target_exposure_pct": 0.0,
+                "sample_size": len(market_rows),
+                "reason": str(quality.get("reason") or "数据覆盖不足"),
+            }
+        )
+        eligible = []
+    else:
+        decision = evaluate_market_regime(market_rows, strategy)
+        eligible = filter_absolute_momentum(analyzed, strategy, decision)
     normalized_selection_limit = max(0, int(selection_limit))
     normalized_candidate_limit = max(normalized_selection_limit, max(0, int(candidate_limit)))
     candidates = select_agent_candidates(eligible, normalized_candidate_limit, strategy=strategy)
     selected = select_agent_candidates(eligible, normalized_selection_limit, strategy=strategy)
+    quality["absolute_momentum_count"] = len(eligible)
+    quality["candidate_count"] = len(candidates)
+    quality["selected_count"] = len(selected)
     sources = sorted({str(item.get("source")) for item in candidates if item.get("source")})
     normalized_sectors = tuple(str(item) for item in sector_filters if str(item))
     return RecommendationPlan(
@@ -86,6 +117,7 @@ def build_recommendation_plan(
         sources=tuple(sources),
         fetch_error=fetch_error,
         analyzed_count=len(analyzed),
+        data_quality=quality,
         market_regime=deepcopy(decision),
         signal_contract=signal_contract(dict(strategy or {}), cutoff=generated_at.date()),
         candidates=tuple(deepcopy(item) for item in candidates),

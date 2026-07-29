@@ -1,20 +1,44 @@
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Callable, Iterable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME
-from .data_sources import fallback_quotes, fetch_board_quotes, fetch_sina_fallback_quotes, fetch_watchlist_quotes
+from .data_sources import fetch_watchlist_quotes
 from .enrichment import enrich_candidates
 from .parameters import chase_risk_threshold, load_strategy_config, parameter_value
 from .recommendation import RecommendationPlan, build_recommendation_plan
 from .selection import analyze_candidates, attach_ignition_signals, filter_candidates, missing_required_parameter_data, price_position
 from .universe import constrain_to_watchlist, normalize_sector_filters, normalize_watchlist
+from .universe_provider import BoardUniverseProvider, UniverseQuoteBatch
 from .utils import beijing_now, number
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePreparation:
+    filtered: tuple[dict, ...]
+    history_ready: tuple[dict, ...]
+    raw_count: int
+    basic_count: int
+    enriched_count: int
+    history_ready_count: int
+    strategy_filtered_count: int
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateCollection:
+    generated_at: datetime
+    analyses: tuple[dict, ...]
+    market_analyses: tuple[dict, ...]
+    fetch_error: str | None
+    data_quality: dict
 
 
 def prepare_candidates(
@@ -26,11 +50,20 @@ def prepare_candidates(
     enrich_limit: int | None = None,
     sector_filters: str | Iterable[object] | None = None,
     signal_cutoff=None,
-) -> tuple[list[dict], str | None]:
+) -> CandidatePreparation:
     current = strategy if strategy is not None else load_strategy_config()
     missing = missing_required_parameter_data(rows, current)
     if missing:
-        return [], "行情缺少已启用参数数据：" + "、".join(missing)
+        return CandidatePreparation(
+            filtered=(),
+            history_ready=(),
+            raw_count=len(rows),
+            basic_count=0,
+            enriched_count=0,
+            history_ready_count=0,
+            strategy_filtered_count=0,
+            error="行情缺少已启用参数数据：" + "、".join(missing),
+        )
     basic = filter_candidates(rows, current, include_enriched=False, sector_filters=sector_filters)
     enriched = enrich_candidates(
         basic,
@@ -40,12 +73,112 @@ def prepare_candidates(
         limit=enrich_limit,
         signal_cutoff=signal_cutoff,
     )
+    history_ready = [row for row in enriched if isinstance(row.get("signal_features"), dict)]
     filtered = filter_candidates(enriched, current, sector_filters=sector_filters)
     errors = [message for row in enriched for message in row.get("enrichment_errors", [])]
     enrichment_error = None
-    if basic and not filtered and errors:
+    if basic and not history_ready and errors:
         enrichment_error = "扩展指标获取失败或缺失：" + "；".join(sorted(set(errors))[:3])
-    return filtered, enrichment_error
+    return CandidatePreparation(
+        filtered=tuple(filtered),
+        history_ready=tuple(history_ready),
+        raw_count=len(rows),
+        basic_count=len(basic),
+        enriched_count=len(enriched),
+        history_ready_count=len(history_ready),
+        strategy_filtered_count=len(filtered),
+        error=enrichment_error,
+    )
+
+
+def _coverage_thresholds(universe_type: str) -> tuple[int, float]:
+    if universe_type == "watchlist":
+        minimum = int(os.getenv("STOCK_AGENT_MIN_WATCHLIST_HISTORY_COUNT", "1"))
+        ratio = float(os.getenv("STOCK_AGENT_MIN_WATCHLIST_HISTORY_COVERAGE_RATIO", "0.7"))
+    else:
+        minimum = int(os.getenv("STOCK_AGENT_MIN_BOARD_HISTORY_COUNT", "30"))
+        ratio = float(os.getenv("STOCK_AGENT_MIN_BOARD_HISTORY_COVERAGE_RATIO", "0.7"))
+    return max(1, minimum), min(1.0, max(0.0, ratio))
+
+
+def _data_quality(
+    preparation: CandidatePreparation,
+    *,
+    universe_type: str,
+    source_diagnostics: dict,
+    analyzed_count: int,
+    market_analyzed_count: int,
+) -> dict:
+    minimum_count, minimum_ratio = _coverage_thresholds(universe_type)
+    if source_diagnostics.get("source_mode") == "injected_primary":
+        minimum_count = 1
+    snapshot_count = int(source_diagnostics.get("snapshot_count") or 0)
+    universe_count = max(preparation.raw_count, snapshot_count)
+    quote_coverage_ratio = preparation.raw_count / universe_count if universe_count else 0.0
+    minimum_quote_ratio = min(
+        1.0,
+        max(0.0, float(os.getenv("STOCK_AGENT_MIN_QUOTE_COVERAGE_RATIO", "0.8"))),
+    )
+    ratio_required = math.ceil(preparation.basic_count * minimum_ratio)
+    if universe_type == "watchlist":
+        required_count = min(preparation.basic_count, max(minimum_count, ratio_required))
+    else:
+        required_count = max(minimum_count, ratio_required)
+    coverage_ratio = (
+        preparation.history_ready_count / preparation.basic_count
+        if preparation.basic_count
+        else 0.0
+    )
+    ready = (
+        preparation.error is None
+        and preparation.basic_count > 0
+        and quote_coverage_ratio >= minimum_quote_ratio
+        and preparation.history_ready_count >= required_count
+    )
+    if ready:
+        reason = (
+            f"历史特征覆盖 {preparation.history_ready_count}/{preparation.basic_count} "
+            f"（{coverage_ratio * 100:.1f}%）"
+        )
+    elif preparation.error:
+        reason = preparation.error
+    elif universe_count and quote_coverage_ratio < minimum_quote_ratio:
+        reason = (
+            f"实时行情覆盖不足：{preparation.raw_count}/{universe_count} "
+            f"（{quote_coverage_ratio * 100:.1f}%），至少需要 {minimum_quote_ratio * 100:.0f}%"
+        )
+    elif preparation.basic_count <= 0:
+        reason = "基础过滤后没有可评估股票"
+    else:
+        reason = (
+            f"历史特征覆盖不足：{preparation.history_ready_count}/{preparation.basic_count} "
+            f"（{coverage_ratio * 100:.1f}%），至少需要 {required_count} 只"
+        )
+    return {
+        "schema_version": 1,
+        "status": "READY" if ready else "BLOCKED",
+        "reason": reason,
+        "universe_type": universe_type,
+        "source_mode": source_diagnostics.get("source_mode") or universe_type,
+        "primary_error": source_diagnostics.get("primary_error"),
+        "quote_error": source_diagnostics.get("quote_error"),
+        "snapshot_count": snapshot_count,
+        "snapshot_fetched_at": source_diagnostics.get("snapshot_fetched_at"),
+        "raw_count": universe_count,
+        "quote_count": preparation.raw_count,
+        "basic_count": preparation.basic_count,
+        "enriched_count": preparation.enriched_count,
+        "history_ready_count": preparation.history_ready_count,
+        "strategy_filtered_count": preparation.strategy_filtered_count,
+        "market_analyzed_count": market_analyzed_count,
+        "analyzed_count": analyzed_count,
+        "minimum_history_count": minimum_count,
+        "minimum_history_coverage_ratio": minimum_ratio,
+        "required_history_count": required_count,
+        "history_coverage_ratio": round(coverage_ratio, 6),
+        "minimum_quote_coverage_ratio": minimum_quote_ratio,
+        "quote_coverage_ratio": round(quote_coverage_ratio, 6),
+    }
 
 
 def collect_analyzed_candidates(
@@ -62,7 +195,8 @@ def collect_analyzed_candidates(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
-) -> tuple[datetime, list[dict], str | None]:
+    universe_provider: BoardUniverseProvider | None = None,
+) -> CandidateCollection:
     report_time = beijing_now(now)
     strategy = strategy or load_strategy_config()
     configured_watchlist = watchlist if watchlist is not None else parameter_value(strategy, "watchlist", [])
@@ -77,7 +211,7 @@ def collect_analyzed_candidates(
         except Exception as exc:
             rows, error = [], str(exc)
         rows = constrain_to_watchlist(rows, watchlist_entries)
-        filtered, enrichment_error = prepare_candidates(
+        prepared = prepare_candidates(
             rows,
             strategy=strategy,
             history_fetcher=history_fetcher,
@@ -86,26 +220,58 @@ def collect_analyzed_candidates(
             sector_filters=sectors,
             signal_cutoff=report_time.date(),
         )
-        if enrichment_error:
-            error = enrichment_error
-        if not filtered and not error:
+        if prepared.error:
+            error = prepared.error
+        if not prepared.filtered and not error:
             if sectors:
                 error = f"自选股池中没有匹配板块过滤（{'、'.join(sectors)}）的有效候选"
             else:
                 error = "自选股池中没有符合当前策略的候选"
-        analyses = analyze_candidates(filtered, strategy=strategy)
-        if filtered and not analyses and not error:
+        analyses = analyze_candidates(prepared.filtered, strategy=strategy)
+        market_analyses = analyze_candidates(prepared.history_ready, strategy=strategy)
+        if prepared.filtered and not analyses and not error:
             error = "候选缺少 08:00 信号所需的前一交易日历史数据"
-        return report_time, analyses, error
+        quality = _data_quality(
+            prepared,
+            universe_type="watchlist",
+            source_diagnostics={"source_mode": "watchlist"},
+            analyzed_count=len(analyses),
+            market_analyzed_count=len(market_analyses),
+        )
+        if quality["status"] == "BLOCKED":
+            error = error or quality["reason"]
+        return CandidateCollection(
+            generated_at=report_time,
+            analyses=tuple(analyses),
+            market_analyses=tuple(market_analyses),
+            fetch_error=error,
+            data_quality=quality,
+        )
 
-    fetcher = board_fetcher or fetch_board_quotes
-    try:
-        rows, error = fetcher(board_code, board_name=board_name)
-    except Exception as exc:
-        rows, error = [], str(exc)
+    if universe_provider is not None:
+        batch = universe_provider.fetch(board_code, board_name=board_name, now=report_time)
+    elif board_fetcher is not None:
+        try:
+            rows, error = board_fetcher(board_code, board_name=board_name)
+        except Exception as exc:
+            rows, error = [], str(exc)
+        batch = UniverseQuoteBatch(
+            rows=tuple(rows),
+            mode="injected_primary" if rows else "unavailable",
+            board_code=str(board_code),
+            board_name=str(board_name),
+            primary_error=error,
+            quote_error=(
+                "注入数据源没有完整板块快照，禁止使用固定兜底名单"
+                if not rows and fallback_fetcher is not None
+                else None
+            ),
+        )
+    else:
+        batch = BoardUniverseProvider().fetch(board_code, board_name=board_name, now=report_time)
 
-    filtered, enrichment_error = prepare_candidates(
-        rows,
+    prepared = prepare_candidates(
+        list(batch.rows),
         strategy=strategy,
         history_fetcher=history_fetcher,
         financial_fetcher=financial_fetcher,
@@ -113,34 +279,27 @@ def collect_analyzed_candidates(
         sector_filters=sectors,
         signal_cutoff=report_time.date(),
     )
-    if enrichment_error:
-        error = enrichment_error
-    if not rows:
-        fallback = fallback_fetcher or fetch_sina_fallback_quotes
-        try:
-            fallback_rows, fallback_error = fallback(board_name=board_name)
-        except Exception as exc:
-            fallback_rows, fallback_error = [], str(exc)
-        filtered, enrichment_error = prepare_candidates(
-            fallback_rows,
-            strategy=strategy,
-            history_fetcher=history_fetcher,
-            financial_fetcher=financial_fetcher,
-            enrich_limit=enrich_limit,
-            sector_filters=sectors,
-            signal_cutoff=report_time.date(),
-        )
-        if fallback_rows and not enrichment_error:
-            error = None
-        elif not fallback_rows:
-            filtered = fallback_quotes(report_time, error or fallback_error or "未获得有效行情")
-        elif enrichment_error:
-            error = enrichment_error
-
-    analyses = analyze_candidates(filtered, strategy=strategy)
-    if filtered and not analyses and not error:
+    error = batch.error or prepared.error
+    analyses = analyze_candidates(prepared.filtered, strategy=strategy)
+    market_analyses = analyze_candidates(prepared.history_ready, strategy=strategy)
+    if prepared.filtered and not analyses and not error:
         error = "候选缺少 08:00 信号所需的前一交易日历史数据"
-    return report_time, analyses, error
+    quality = _data_quality(
+        prepared,
+        universe_type="board",
+        source_diagnostics=batch.diagnostics(),
+        analyzed_count=len(analyses),
+        market_analyzed_count=len(market_analyses),
+    )
+    if quality["status"] == "BLOCKED":
+        error = error or quality["reason"]
+    return CandidateCollection(
+        generated_at=report_time,
+        analyses=tuple(analyses),
+        market_analyses=tuple(market_analyses),
+        fetch_error=error,
+        data_quality=quality,
+    )
 
 
 def collect_recommendation_plan(
@@ -159,13 +318,14 @@ def collect_recommendation_plan(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
+    universe_provider: BoardUniverseProvider | None = None,
 ) -> RecommendationPlan:
     current = strategy if strategy is not None else load_strategy_config()
     configured_watchlist = watchlist if watchlist is not None else parameter_value(current, "watchlist", [])
     configured_sectors = sector_filters if sector_filters is not None else parameter_value(current, "sector_filters", [])
     watchlist_entries = normalize_watchlist(configured_watchlist)
     sectors = normalize_sector_filters(configured_sectors)
-    report_time, analyses, error = collect_analyzed_candidates(
+    collection = collect_analyzed_candidates(
         now=now,
         board_code=board_code,
         board_name=board_name,
@@ -178,16 +338,19 @@ def collect_recommendation_plan(
         watchlist=watchlist_entries,
         sector_filters=sectors,
         watchlist_fetcher=watchlist_fetcher,
+        universe_provider=universe_provider,
     )
     plan = build_recommendation_plan(
-        generated_at=report_time,
-        analyses=analyses,
+        generated_at=collection.generated_at,
+        analyses=collection.analyses,
+        market_analyses=collection.market_analyses,
         strategy=current,
         board_code=board_code,
         board_name=board_name,
         watchlist_size=len(watchlist_entries),
         sector_filters=sectors,
-        fetch_error=error,
+        fetch_error=collection.fetch_error,
+        data_quality=collection.data_quality,
         candidate_limit=candidate_limit,
         selection_limit=selection_limit,
     )
@@ -220,6 +383,7 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
         "source": list(plan.sources),
         "fetch_error": plan.fetch_error,
         "candidate_count": len(plan.candidates),
+        "data_quality": deepcopy(plan.data_quality),
         "market_regime": deepcopy(plan.market_regime),
         "signal_contract": deepcopy(plan.signal_contract),
         "portfolio_candidates": [str(item.get("symbol")) for item in plan.selected_candidates],
@@ -326,6 +490,7 @@ def generate_agent_context(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
+    universe_provider: BoardUniverseProvider | None = None,
 ) -> str:
     current = strategy or load_strategy_config()
     selection_limit = int(current.get("validation", {}).get("top_n", 3))
@@ -344,6 +509,7 @@ def generate_agent_context(
         watchlist=watchlist,
         sector_filters=sector_filters,
         watchlist_fetcher=watchlist_fetcher,
+        universe_provider=universe_provider,
     )
     if enable_tick:
         plan = enrich_recommendation_plan_with_ticks(

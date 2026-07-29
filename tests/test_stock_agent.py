@@ -589,7 +589,7 @@ class StockAgentTests(unittest.TestCase):
         self.assertEqual(quotes[0]["source"], "新浪财经实时行情（AI智能体备用股池）")
         self.assertIn("list=sz300130", seen_requests[0])
 
-    def test_agent_context_uses_realtime_fallback_when_board_fetch_fails(self):
+    def test_agent_context_blocks_fixed_fallback_when_board_fetch_fails(self):
         def board_fetcher(board_code, **kwargs):
             return [], "eastmoney ssl eof"
 
@@ -620,9 +620,9 @@ class StockAgentTests(unittest.TestCase):
         )
         payload = extract_market_payload(context)
 
-        self.assertIsNone(payload["fetch_error"])
-        self.assertEqual(payload["source"], ["新浪财经实时行情（AI智能体备用股池）"])
-        self.assertEqual(payload["candidates"][0]["symbol"], "300130")
+        self.assertIn("禁止使用固定兜底名单", payload["fetch_error"])
+        self.assertEqual(payload["data_quality"]["status"], "BLOCKED")
+        self.assertEqual(payload["candidates"], [])
 
     def test_filter_candidates_removes_bse_st_and_empty_rows(self):
         rows = [

@@ -19,7 +19,7 @@ def fetch_board_quotes(
     board_code: str = DEFAULT_BOARD_CODE,
     *,
     board_name: str = DEFAULT_BOARD_NAME,
-    limit: int = 50,
+    limit: int = 1000,
     page_size: int = 50,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int | None = None,
@@ -28,6 +28,7 @@ def fetch_board_quotes(
     opener = urlopen_func or urllib.request.urlopen
     quotes = []
     last_error = None
+    expected_total: int | None = None
     pages = max(1, (limit + page_size - 1) // page_size)
     retry_count = max(0, int(os.getenv("STOCK_AGENT_SOURCE_RETRIES", "2") if retries is None else retries))
 
@@ -98,7 +99,10 @@ def fetch_board_quotes(
                 last_error = str(curl_exc) or str(exc)
                 break
 
-        rows = (payload.get("data") or {}).get("diff") or []
+        data = payload.get("data") or {}
+        if expected_total is None and number(data.get("total")) > 0:
+            expected_total = int(number(data.get("total")))
+        rows = data.get("diff") or []
         if not rows:
             break
         for row in rows:
@@ -136,7 +140,13 @@ def fetch_board_quotes(
 
     if not quotes:
         return [], last_error or "Eastmoney returned no board rows"
-    return quotes, None
+    if expected_total is not None:
+        if expected_total > limit:
+            last_error = f"板块共有 {expected_total} 只，配置上限 {limit} 只，拒绝保存截断股票池"
+        elif len(quotes) < expected_total:
+            last_error = last_error or f"板块行情只返回 {len(quotes)}/{expected_total} 只"
+    quotes.sort(key=lambda item: str(item.get("symbol") or ""))
+    return quotes, last_error
 
 
 def sina_quote_symbol(symbol: str) -> str:
@@ -170,77 +180,83 @@ def fetch_sina_fallback_quotes(
     if not quote_symbols:
         return [], "No Sina quote symbols configured"
 
-    params = urllib.parse.urlencode({"list": ",".join(quote_symbols)}, safe=",")
-    request = urllib.request.Request(
-        f"https://hq.sinajs.cn/?{params}",
-        headers={
-            "Accept": "*/*",
-            "Referer": "https://finance.sina.com.cn/",
-            "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
-        },
-    )
     opener = urlopen_func or urllib.request.urlopen
-
-    try:
-        with opener(request, timeout=timeout) as response:
-            text = response.read().decode("gb18030", errors="replace")
-    except (OSError, TimeoutError, socket.timeout) as exc:
-        return [], str(exc)
-
     quotes = []
+    errors: list[str] = []
     source = source_label or f"新浪财经实时行情（{board_name}备用股池）"
-    for match in re.finditer(r'var hq_str_(sh|sz)(\d{6})="(.*?)";', text, flags=re.S):
-        symbol = match.group(2)
-        fields = match.group(3).split(",")
-        if len(fields) < 10:
-            continue
-        configured = metadata.get(symbol) or {}
-        name = str(configured.get("name") or fields[0].strip() or symbol)
-        sector = str(configured.get("sector") or board_name)
-        sectors = configured.get("sectors") or ([sector] if sector else [])
-        open_price = number(fields[1])
-        prev_close = number(fields[2])
-        price = number(fields[3])
-        high = number(fields[4])
-        low = number(fields[5])
-        shares = number(fields[8])
-        turnover = number(fields[9])
-        if price <= 0 or turnover <= 0:
-            continue
-        change = price - prev_close if prev_close > 0 else 0.0
-        percent = (change / prev_close * 100) if prev_close > 0 else 0.0
-        amplitude = ((high - low) / prev_close * 100) if prev_close > 0 and high > 0 and low > 0 else 0.0
-        quote_time = ""
-        if len(fields) > 31:
-            quote_time = f"{fields[30]} {fields[31]}".strip()
-        quotes.append(
-            {
-                "symbol": symbol,
-                "name": name,
-                "sector": sector,
-                "sectors": sectors,
-                "price": round(price, 2),
-                "percent": round(percent, 2),
-                "change": round(change, 2),
-                "volume": int(shares / 100),
-                "turnover": round(turnover, 2),
-                "turnover_rate": 0.0,
-                "volume_ratio": 0.0,
-                "pe": 0.0,
-                "pb": 0.0,
-                "amplitude": round(amplitude, 2),
-                "high": round(high, 2),
-                "low": round(low, 2),
-                "open": round(open_price, 2),
-                "prev_close": round(prev_close, 2),
-                "source": source,
-                "time": quote_time,
-            }
+    batch_size = max(1, int(os.getenv("STOCK_AGENT_SINA_QUOTE_BATCH_SIZE", "80")))
+    for offset in range(0, len(quote_symbols), batch_size):
+        batch = quote_symbols[offset : offset + batch_size]
+        params = urllib.parse.urlencode({"list": ",".join(batch)}, safe=",")
+        request = urllib.request.Request(
+            f"https://hq.sinajs.cn/?{params}",
+            headers={
+                "Accept": "*/*",
+                "Referer": "https://finance.sina.com.cn/",
+                "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+            },
         )
+        try:
+            with opener(request, timeout=timeout) as response:
+                text = response.read().decode("gb18030", errors="replace")
+        except (OSError, TimeoutError, socket.timeout) as exc:
+            errors.append(str(exc))
+            continue
+
+        for match in re.finditer(r'var hq_str_(sh|sz)(\d{6})="(.*?)";', text, flags=re.S):
+            symbol = match.group(2)
+            fields = match.group(3).split(",")
+            if len(fields) < 10:
+                continue
+            configured = metadata.get(symbol) or {}
+            name = str(configured.get("name") or fields[0].strip() or symbol)
+            sector = str(configured.get("sector") or board_name)
+            sectors = configured.get("sectors") or ([sector] if sector else [])
+            open_price = number(fields[1])
+            prev_close = number(fields[2])
+            price = number(fields[3])
+            high = number(fields[4])
+            low = number(fields[5])
+            shares = number(fields[8])
+            turnover = number(fields[9])
+            if price <= 0 or turnover <= 0:
+                continue
+            change = price - prev_close if prev_close > 0 else 0.0
+            percent = (change / prev_close * 100) if prev_close > 0 else 0.0
+            amplitude = ((high - low) / prev_close * 100) if prev_close > 0 and high > 0 and low > 0 else 0.0
+            quote_time = ""
+            if len(fields) > 31:
+                quote_time = f"{fields[30]} {fields[31]}".strip()
+            quotes.append(
+                {
+                    "symbol": symbol,
+                    "name": name,
+                    "sector": sector,
+                    "sectors": sectors,
+                    "price": round(price, 2),
+                    "percent": round(percent, 2),
+                    "change": round(change, 2),
+                    "volume": int(shares / 100),
+                    "turnover": round(turnover, 2),
+                    "turnover_rate": 0.0,
+                    "volume_ratio": 0.0,
+                    "pe": 0.0,
+                    "pb": 0.0,
+                    "amplitude": round(amplitude, 2),
+                    "high": round(high, 2),
+                    "low": round(low, 2),
+                    "open": round(open_price, 2),
+                    "prev_close": round(prev_close, 2),
+                    "source": source,
+                    "time": quote_time,
+                }
+            )
 
     if not quotes:
-        return [], "Sina returned no usable quote rows"
-    return quotes, None
+        return [], "；".join(errors) or "Sina returned no usable quote rows"
+    quotes.sort(key=lambda item: str(item.get("symbol") or ""))
+    error = f"新浪分批行情部分失败：{'；'.join(sorted(set(errors)))}" if errors else None
+    return quotes, error
 
 
 def fetch_watchlist_quotes(

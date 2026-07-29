@@ -265,6 +265,7 @@ def fetch_daily_history(
         cache_ttl_seconds=ttl,
         attempts=maximum_attempts,
         backoff_seconds=backoff,
+        background_refresh=os.getenv("STOCK_AGENT_HISTORY_BACKGROUND_REFRESH", "1") == "1",
         now=now,
         **options,
     )
@@ -307,7 +308,8 @@ def enrich_candidates(
     needs_financial = _requires(current, FINANCIAL_PARAMETER_IDS)
     candidates = [dict(row) for row in rows]
 
-    maximum = limit if limit is not None else int(os.getenv("STOCK_AGENT_SIGNAL_UNIVERSE_LIMIT", "30"))
+    configured_limit = int(os.getenv("STOCK_AGENT_SIGNAL_UNIVERSE_LIMIT", "0"))
+    maximum = limit if limit is not None else (configured_limit if configured_limit > 0 else len(candidates))
     target_count = min(len(candidates), max(0, maximum))
     history_client = history_fetcher or fetch_daily_history
     financial_client = financial_fetcher or fetch_financial_record
