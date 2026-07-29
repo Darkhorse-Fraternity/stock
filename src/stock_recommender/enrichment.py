@@ -238,6 +238,7 @@ def fetch_daily_history(
     downloader: Callable[[str], Iterable[dict]] | None = None,
     sleep: Callable[[float], None] | None = None,
     now: datetime | None = None,
+    force_refresh: bool = False,
 ) -> list[dict]:
     ttl = (
         float(cache_ttl_seconds)
@@ -266,6 +267,7 @@ def fetch_daily_history(
         attempts=maximum_attempts,
         backoff_seconds=backoff,
         background_refresh=os.getenv("STOCK_AGENT_HISTORY_BACKGROUND_REFRESH", "1") == "1",
+        force_refresh=force_refresh,
         now=now,
         **options,
     )

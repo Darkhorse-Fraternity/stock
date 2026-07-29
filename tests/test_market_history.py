@@ -131,6 +131,21 @@ class MarketHistoryCacheTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(cached[0]["close"], 11.0)
 
+    def test_force_refresh_replaces_even_fresh_cache(self):
+        save_daily_history_cache("600001", self.rows, cache_dir=self.cache_dir, now=self.now)
+
+        result = fetch_daily_history_with_cache(
+            "600001",
+            lambda: [{"date": "2026-07-22", "close": 12.0}],
+            cache_dir=self.cache_dir,
+            cache_ttl_seconds=60,
+            attempts=1,
+            now=self.now + timedelta(seconds=30),
+            force_refresh=True,
+        )
+
+        self.assertEqual(result[0]["close"], 12.0)
+
 
 if __name__ == "__main__":
     unittest.main()

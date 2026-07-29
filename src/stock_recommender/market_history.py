@@ -206,14 +206,15 @@ def fetch_daily_history_with_cache(
     sleep: Callable[[float], None] = time.sleep,
     now: datetime | None = None,
     background_refresh: bool = False,
+    force_refresh: bool = False,
 ) -> list[dict]:
     normalized_symbol = _validated_symbol(symbol)
     current = _aware_utc(now)
     cached = _read_cache(normalized_symbol, cache_dir)
     ttl = max(0.0, float(cache_ttl_seconds))
-    if cached and (current - cached[0]).total_seconds() <= ttl:
+    if cached and not force_refresh and (current - cached[0]).total_seconds() <= ttl:
         return cached[1]
-    if cached:
+    if cached and not force_refresh:
         if background_refresh:
             _schedule_background_refresh(
                 normalized_symbol,
@@ -241,5 +242,7 @@ def fetch_daily_history_with_cache(
             if attempt + 1 < maximum_attempts and delay > 0:
                 sleep(delay * (2**attempt))
 
+    if cached:
+        return cached[1]
     message = f"{normalized_symbol} 日线获取失败，已重试 {maximum_attempts} 次"
     raise DailyHistoryUnavailableError(message) from last_error
