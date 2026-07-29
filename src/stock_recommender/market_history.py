@@ -109,6 +109,8 @@ def save_daily_history_cache(
     normalized_rows = normalize_daily_history(rows)
     if not normalized_rows:
         raise DailyHistoryUnavailableError(f"{normalized_symbol} 未返回可缓存日线")
+    maximum_rows = max(61, int(os.getenv("STOCK_AGENT_HISTORY_CACHE_MAX_ROWS", "320")))
+    normalized_rows = normalized_rows[-maximum_rows:]
     target = _cache_path(normalized_symbol, cache_dir)
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = {

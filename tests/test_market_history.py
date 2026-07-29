@@ -4,6 +4,7 @@ import time
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from stock_recommender.market_history import (
     DailyHistoryUnavailableError,
@@ -145,6 +146,23 @@ class MarketHistoryCacheTests(unittest.TestCase):
         )
 
         self.assertEqual(result[0]["close"], 12.0)
+
+    def test_cache_keeps_bounded_recent_history(self):
+        rows = [
+            {"date": self.now.date() - timedelta(days=400 - index), "close": 10 + index}
+            for index in range(400)
+        ]
+        with mock.patch.dict("os.environ", {"STOCK_AGENT_HISTORY_CACHE_MAX_ROWS": "100"}):
+            saved = save_daily_history_cache(
+                "600001",
+                rows,
+                cache_dir=self.cache_dir,
+                now=self.now,
+            )
+
+        self.assertEqual(len(saved), 100)
+        self.assertEqual(saved[0]["close"], 310)
+        self.assertEqual(saved[-1]["close"], 409)
 
 
 if __name__ == "__main__":
