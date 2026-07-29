@@ -76,6 +76,7 @@ def warm_board_history_cache(
     minimum_history_rows: int = 61,
     now: datetime | None = None,
     cache_dir: str | Path | None = None,
+    force_refresh: bool = True,
 ) -> dict:
     current = beijing_now(now)
     universe = (provider or BoardUniverseProvider()).fetch(
@@ -123,22 +124,27 @@ def warm_board_history_cache(
         symbol = str(row.get("symbol") or "")
         try:
             try:
-                history = fetcher(symbol, attempts=1, force_refresh=True, now=current)
+                history = fetcher(
+                    symbol,
+                    attempts=1,
+                    force_refresh=force_refresh,
+                    now=current,
+                )
             except Exception as primary_error:
                 if secondary_fetcher is None:
                     raise
                 try:
                     history = secondary_fetcher(symbol, now=current)
-                    history = save_daily_history_cache(
-                        symbol,
-                        history,
-                        cache_dir=cache_dir,
-                        now=current,
-                    )
                 except Exception as secondary_error:
                     raise RuntimeError(
                         f"主源失败：{primary_error}；新浪源失败：{secondary_error}"
                     ) from secondary_error
+            history = save_daily_history_cache(
+                symbol,
+                history,
+                cache_dir=cache_dir,
+                now=current,
+            )
             normalized = normalize_signal_history(history, cutoff=current.date())
             features = extract_signal_features(
                 normalized,
@@ -186,6 +192,7 @@ def main() -> None:
         board_code=board_code,
         board_name=board_name,
         minimum_history_rows=int(strategy.get("signal", {}).get("minimum_history_rows", 61)),
+        force_refresh=os.getenv("STOCK_AGENT_HISTORY_WARMUP_FORCE_REFRESH", "1") == "1",
     )
     save_warmup_status(result)
     print(json.dumps(result, ensure_ascii=False, indent=2))
