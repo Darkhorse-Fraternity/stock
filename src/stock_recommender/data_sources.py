@@ -10,7 +10,14 @@ import urllib.request
 from datetime import datetime
 from typing import Callable, Iterable
 
-from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_TIMEOUT_SECONDS, EASTMONEY_URL, STATIC_FALLBACK
+from .config import (
+    DEFAULT_BOARD_CODE,
+    DEFAULT_BOARD_NAME,
+    DEFAULT_TIMEOUT_SECONDS,
+    EASTMONEY_FALLBACK_URL,
+    EASTMONEY_URL,
+    STATIC_FALLBACK,
+)
 from .universe import normalize_stock_symbol, normalize_watchlist
 from .utils import number
 
@@ -24,11 +31,13 @@ def fetch_board_quotes(
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     retries: int | None = None,
     urlopen_func: Callable | None = None,
+    _base_url: str | None = None,
 ) -> tuple[list[dict], str | None]:
     opener = urlopen_func or urllib.request.urlopen
     quotes = []
     last_error = None
     expected_total: int | None = None
+    base_url = _base_url or os.getenv("STOCK_AGENT_EASTMONEY_URL", EASTMONEY_URL).strip() or EASTMONEY_URL
     pages = max(1, (limit + page_size - 1) // page_size)
     retry_count = max(0, int(os.getenv("STOCK_AGENT_SOURCE_RETRIES", "2") if retries is None else retries))
 
@@ -49,7 +58,7 @@ def fetch_board_quotes(
             safe=":,",
         )
         request = urllib.request.Request(
-            f"{EASTMONEY_URL}?{params}",
+            f"{base_url}?{params}",
             headers={
                 "Accept": "application/json,text/plain,*/*",
                 "Referer": "https://quote.eastmoney.com/",
@@ -137,7 +146,24 @@ def fetch_board_quotes(
                 break
         if len(quotes) >= limit:
             break
+        if expected_total is not None and len(quotes) >= min(limit, expected_total):
+            break
 
+    if last_error and urlopen_func is None and base_url == EASTMONEY_URL:
+        fallback_url = (
+            os.getenv("STOCK_AGENT_EASTMONEY_FALLBACK_URL", EASTMONEY_FALLBACK_URL).strip()
+            or EASTMONEY_FALLBACK_URL
+        )
+        if fallback_url != base_url:
+            return fetch_board_quotes(
+                board_code,
+                board_name=board_name,
+                limit=limit,
+                page_size=page_size,
+                timeout=timeout,
+                retries=retries,
+                _base_url=fallback_url,
+            )
     if not quotes:
         return [], last_error or "Eastmoney returned no board rows"
     if expected_total is not None:

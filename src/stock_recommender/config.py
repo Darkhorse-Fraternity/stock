@@ -5,6 +5,7 @@ from datetime import timedelta, timezone
 
 BEIJING_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 EASTMONEY_URL = "https://push2.eastmoney.com/api/qt/clist/get"
+EASTMONEY_FALLBACK_URL = "https://push2delay.eastmoney.com/api/qt/clist/get"
 DEFAULT_BOARD_CODE = "BK0800"
 DEFAULT_BOARD_NAME = "人工智能"
 DEFAULT_TIMEOUT_SECONDS = 8
