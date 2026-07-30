@@ -10,8 +10,9 @@ endpoint is unavailable, the pipeline falls back to Sina realtime quotes for the
 configured AI-agent stock pool. The strategy filters out non-Shenzhen/Shanghai
 rows, ST rows, and empty quote rows before scoring candidates.
 
-US strategies use the dynamic Nasdaq-100 membership published by Nasdaq and
-Sina US realtime/daily quotes. They use New York market hours, USD display,
+US strategies use the dynamic Nasdaq-100 membership published by Nasdaq,
+Alpaca Market Data as the primary realtime/daily source, and Sina only as an
+emergency fallback. They use New York market hours, USD display,
 whole-share simulated orders, same-day sellability, and a commission-free
 simulation with slippage and volume-participation limits retained.
 
@@ -35,6 +36,7 @@ src/stock_recommender/
   markets.py       market profiles: timezone, currency, sessions, and execution conventions
   market_adapters.py  pluggable market I/O, universe, history, benchmark, and execution contract
   data_sources.py  Eastmoney, Sina fallback, static fallback, tick fetchers
+  us_data_providers.py  Alpaca primary provider, Sina fallback, and failover policy
   selection.py     candidate filtering, scoring, price position, ignition signal
   context.py       structured JSON context for an AI agent
   llm.py           OpenAI-compatible chat completion client
@@ -177,6 +179,21 @@ market cap, PB, A-share financial-report factors, and 10-second ignition—are
 also declared unavailable and skipped by the execution pipeline rather than
 being inferred or fabricated.
 
+Alpaca Basic credentials belong in the ignored `.env` file:
+
+```bash
+STOCK_AGENT_US_DATA_PRIMARY=alpaca
+STOCK_AGENT_US_DATA_FALLBACK=sina
+STOCK_AGENT_ALPACA_API_KEY_ID=your-key-id
+STOCK_AGENT_ALPACA_API_SECRET_KEY=your-secret-key
+STOCK_AGENT_ALPACA_FEED=iex
+STOCK_AGENT_ALPACA_HISTORY_FEED=iex
+```
+
+When the key is missing, Alpaca is unavailable, quote/history requests are
+explicitly marked as degraded, and the provider uses Sina. No credential value
+is returned by the health endpoint.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -198,6 +215,12 @@ being inferred or fabricated.
 | `STOCK_AGENT_STATE_PATH` | empty | Daily recommendation state shared by the recommendation and tracking jobs. |
 | `STOCK_AGENT_HISTORY_PATH` | `data/recommendation_history.json` | Recommendation audit archive; strategy performance uses the full portfolio ledger. |
 | `STOCK_AGENT_MARKET_HISTORY_CACHE_DIR` | `data/market_history_cache` | Per-symbol daily-history cache used by enrichment, backtests, and replay tools. |
+| `STOCK_AGENT_US_DATA_PRIMARY` | `alpaca` | Primary US quote and daily-history provider. |
+| `STOCK_AGENT_US_DATA_FALLBACK` | `sina` | Emergency US provider used only when the primary is unavailable or incomplete. |
+| `STOCK_AGENT_ALPACA_API_KEY_ID` | empty | Alpaca Market Data key ID; the standard `APCA_API_KEY_ID` alias is also accepted. |
+| `STOCK_AGENT_ALPACA_API_SECRET_KEY` | empty | Alpaca Market Data secret; the standard `APCA_API_SECRET_KEY` alias is also accepted. |
+| `STOCK_AGENT_ALPACA_FEED` | `iex` | Alpaca realtime feed used by the free Basic plan. |
+| `STOCK_AGENT_ALPACA_MAX_QUOTE_AGE_SECONDS` | `900` | Maximum Alpaca quote age while the US regular session is open. |
 | `STOCK_AGENT_HISTORY_CACHE_TTL_SECONDS` | `21600` | Fresh-cache lifetime; stale data remains available when the upstream source fails. |
 | `STOCK_AGENT_HISTORY_FETCH_ATTEMPTS` | `1` | Bounded daily-history download attempts before stale-cache fallback. |
 | `STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS` | `1` | Initial exponential retry delay. |

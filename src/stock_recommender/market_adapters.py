@@ -18,6 +18,7 @@ from .markets import (
 )
 from .universe import constrain_to_watchlist, normalize_stock_symbol, normalize_watchlist
 from .universe_provider import BoardUniverseProvider, Nasdaq100UniverseProvider, UniverseQuoteBatch
+from .us_data_providers import get_us_market_data_provider
 
 
 class MarketAdapter(ABC):
@@ -141,10 +142,34 @@ class UsStockMarketAdapter(MarketAdapter):
     market = US_MARKET
 
     def universe_provider(self) -> Nasdaq100UniverseProvider:
-        return Nasdaq100UniverseProvider()
+        return Nasdaq100UniverseProvider(
+            quote_fetcher=get_us_market_data_provider().fetch_quotes,
+        )
 
     def benchmark_fetcher(self) -> Callable:
         return fetch_nasdaq100_quotes
+
+    def fetch_watchlist(
+        self,
+        entries: Iterable[object],
+        *,
+        fetcher: Callable | None = None,
+    ) -> tuple[list[dict], str | None]:
+        if fetcher is not None:
+            return fetcher(entries)
+        return get_us_market_data_provider().fetch_quotes(
+            symbols=entries,
+            board_name="未分类",
+        )
+
+    def fetch_history(self, symbol: str, **kwargs) -> list[dict]:
+        provider = get_us_market_data_provider()
+        return enrichment.fetch_daily_history(
+            symbol,
+            market=self.market,
+            downloader=provider.fetch_daily_history,
+            **kwargs,
+        )
 
     def execution_config(self, config: dict) -> dict:
         effective = deepcopy(config)

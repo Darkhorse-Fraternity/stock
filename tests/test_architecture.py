@@ -20,6 +20,7 @@ class ArchitectureTests(unittest.TestCase):
             "stock_recommender.selection",
             "stock_recommender.tracking",
             "stock_recommender.universe",
+            "stock_recommender.us_data_providers",
         ):
             with self.subTest(module=module):
                 self.assertIsNotNone(importlib.import_module(module))

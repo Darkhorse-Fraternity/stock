@@ -33,6 +33,7 @@ from .parameters import (
 from .portfolio import build_strategy_performance
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
+from .us_data_providers import us_market_data_status
 
 
 WEB_ROOT = Path(__file__).with_name("web")
@@ -55,6 +56,7 @@ def health_payload() -> dict:
         "approval_gate": config.get("validation", {}).get("approval_gate"),
         "active_parameters": active,
         "effective_parameters": effective,
+        "us_market_data": us_market_data_status(),
     }
 
 

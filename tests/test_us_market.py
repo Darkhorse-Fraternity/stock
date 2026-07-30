@@ -12,7 +12,7 @@ from stock_recommender.context import (
 )
 from stock_recommender.data_sources import fetch_nasdaq100_quotes, fetch_sina_us_quotes
 from stock_recommender.delivery import portfolio_delivery_crons
-from stock_recommender.enrichment import _download_us_daily_history, fetch_daily_history
+from stock_recommender.enrichment import _download_sina_us_daily_history, fetch_daily_history
 from stock_recommender.market_adapters import (
     AShareMarketAdapter,
     MarketAdapter,
@@ -37,6 +37,11 @@ from stock_recommender.universe_provider import (
     BoardUniverseSnapshotStore,
     Nasdaq100UniverseProvider,
     UniverseQuoteBatch,
+)
+from stock_recommender.us_data_providers import (
+    AlpacaMarketDataClient,
+    FailoverUsMarketDataProvider,
+    us_market_data_status,
 )
 
 from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME
@@ -225,11 +230,179 @@ class UsMarketAdapterTests(unittest.TestCase):
             "stock_recommender.enrichment.urllib.request.urlopen",
             return_value=FakeResponse(raw),
         ) as opener:
-            rows = _download_us_daily_history("AAPL")
+            rows = _download_sina_us_daily_history("AAPL")
 
         self.assertEqual(rows[0]["date"], "2026-07-29")
         self.assertEqual(rows[0]["close"], "210")
+        self.assertEqual(rows[0]["source"], "新浪财经美股日线（降级源）")
         self.assertEqual(opener.call_args.kwargs["timeout"], 8.0)
+
+    def test_alpaca_snapshot_parser_maps_realtime_price_and_daily_volume(self):
+        captured = {}
+        payload = {
+            "snapshots": {
+                "AAPL": {
+                    "latestTrade": {
+                        "p": 213.25,
+                        "t": "2026-07-30T15:45:00Z",
+                    },
+                    "minuteBar": {"c": 213.2, "t": "2026-07-30T15:45:00Z"},
+                    "dailyBar": {
+                        "o": 210,
+                        "h": 214,
+                        "l": 209,
+                        "c": 213.2,
+                        "v": 12_345_678,
+                        "vw": 212.5,
+                    },
+                    "prevDailyBar": {"c": 208.5},
+                }
+            }
+        }
+
+        def opener(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return FakeResponse(json.dumps(payload).encode())
+
+        client = AlpacaMarketDataClient(
+            api_key="test-key",
+            api_secret="test-secret",
+            urlopen_func=opener,
+            now_func=lambda: datetime(
+                2026,
+                7,
+                30,
+                15,
+                50,
+                tzinfo=ZoneInfo("UTC"),
+            ),
+        )
+        rows = client.fetch_quotes(
+            symbols=[{"symbol": "AAPL", "name": "Apple", "sector": "AI"}],
+        )
+
+        headers = {
+            key.lower(): value for key, value in captured["request"].header_items()
+        }
+        self.assertEqual(headers["apca-api-key-id"], "test-key")
+        self.assertEqual(headers["apca-api-secret-key"], "test-secret")
+        self.assertIn("feed=iex", captured["request"].full_url)
+        self.assertEqual(captured["timeout"], 8.0)
+        self.assertEqual(rows[0]["price"], 213.25)
+        self.assertEqual(rows[0]["prev_close"], 208.5)
+        self.assertEqual(rows[0]["volume"], 12_345_678)
+        self.assertEqual(rows[0]["turnover"], 2_623_456_575)
+        self.assertEqual(rows[0]["source"], "Alpaca IEX 美股行情")
+
+    def test_alpaca_rejects_stale_intraday_snapshot(self):
+        payload = {
+            "snapshots": {
+                "AAPL": {
+                    "latestTrade": {
+                        "p": 213.25,
+                        "t": "2026-07-30T14:00:00Z",
+                    },
+                    "dailyBar": {"c": 213.25, "v": 1_000_000},
+                    "prevDailyBar": {"c": 208.5},
+                }
+            }
+        }
+        client = AlpacaMarketDataClient(
+            api_key="test-key",
+            api_secret="test-secret",
+            urlopen_func=lambda request, timeout: FakeResponse(
+                json.dumps(payload).encode()
+            ),
+            now_func=lambda: datetime(
+                2026,
+                7,
+                30,
+                16,
+                0,
+                tzinfo=ZoneInfo("UTC"),
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "时间戳过期"):
+            client.fetch_quotes(symbols=["AAPL"])
+
+    def test_alpaca_history_parser_returns_adjusted_daily_rows(self):
+        payload = {
+            "bars": [
+                {
+                    "t": "2026-07-29T04:00:00Z",
+                    "o": 205,
+                    "h": 211,
+                    "l": 204,
+                    "c": 210,
+                    "v": 1_000_000,
+                    "vw": 208,
+                }
+            ],
+            "next_page_token": None,
+        }
+        client = AlpacaMarketDataClient(
+            api_key="test-key",
+            api_secret="test-secret",
+            urlopen_func=lambda request, timeout: FakeResponse(
+                json.dumps(payload).encode()
+            ),
+        )
+
+        rows = client.fetch_daily_history("AAPL")
+
+        self.assertEqual(rows[0]["date"], "2026-07-29")
+        self.assertEqual(rows[0]["close"], 210)
+        self.assertEqual(rows[0]["turnover"], 208_000_000)
+        self.assertEqual(rows[0]["source"], "Alpaca IEX 美股日线")
+
+    def test_alpaca_failover_uses_sina_only_when_primary_is_unavailable(self):
+        primary = mock.Mock()
+        fallback = mock.Mock()
+        primary.provider_id = "alpaca"
+        fallback.provider_id = "sina"
+        primary.fetch_quotes.return_value = ([], "Alpaca timeout")
+        fallback.fetch_quotes.return_value = (
+            [
+                {
+                    "symbol": "AAPL",
+                    "price": 210,
+                    "source": "新浪财经美股实时行情（降级源）",
+                }
+            ],
+            None,
+        )
+        primary.fetch_daily_history.side_effect = RuntimeError("Alpaca timeout")
+        fallback.fetch_daily_history.return_value = signal_history("AAPL")
+        provider = FailoverUsMarketDataProvider(primary, fallback)
+
+        quotes, error = provider.fetch_quotes(symbols=["AAPL"])
+        history = provider.fetch_daily_history("AAPL")
+
+        self.assertEqual(quotes[0]["source"], "新浪财经美股实时行情（降级源）")
+        self.assertIn("已降级至 新浪", error)
+        self.assertEqual(len(history), 120)
+        fallback.fetch_quotes.assert_called_once()
+        fallback.fetch_daily_history.assert_called_once_with("AAPL")
+
+    def test_market_data_status_exposes_configuration_without_secrets(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "STOCK_AGENT_ALPACA_API_KEY_ID": "key",
+                "STOCK_AGENT_ALPACA_API_SECRET_KEY": "secret",
+                "STOCK_AGENT_ALPACA_FEED": "iex",
+            },
+            clear=False,
+        ):
+            status = us_market_data_status()
+
+        self.assertEqual(status["primary"], "alpaca")
+        self.assertEqual(status["mode"], "primary_ready")
+        self.assertTrue(status["alpaca_configured"])
+        self.assertNotIn("key", status)
+        self.assertNotIn("secret", status)
 
     def test_nasdaq_provider_rejects_partial_membership_and_uses_fresh_snapshot(self):
         membership = [

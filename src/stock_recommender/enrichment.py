@@ -236,7 +236,7 @@ def _download_daily_history(symbol: str) -> list[dict]:
         raise RuntimeError(f"东方财富日线不可用：{primary_error}") from primary_error
 
 
-def _download_us_daily_history(symbol: str) -> list[dict]:
+def _download_sina_us_daily_history(symbol: str) -> list[dict]:
     normalized_symbol = str(symbol or "").strip().upper()
     callback = f"var _{re.sub(r'[^A-Z0-9]', '_', normalized_symbol)}="
     params = urllib.parse.urlencode(
@@ -288,6 +288,7 @@ def _download_us_daily_history(symbol: str) -> list[dict]:
                 "low": item.get("l"),
                 "volume": item.get("v"),
                 "turnover": item.get("a"),
+                "source": "新浪财经美股日线（降级源）",
             }
         )
     if not rows:
@@ -355,9 +356,14 @@ def fetch_daily_history(
         if backoff_seconds is not None
         else float(os.getenv("STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS", "1"))
     )
-    loader = downloader or (
-        _download_us_daily_history if normalized_market == US_MARKET else _download_daily_history
-    )
+    if downloader is not None:
+        loader = downloader
+    elif normalized_market == US_MARKET:
+        from .us_data_providers import get_us_market_data_provider
+
+        loader = get_us_market_data_provider().fetch_daily_history
+    else:
+        loader = _download_daily_history
     options = {}
     if sleep is not None:
         options["sleep"] = sleep
@@ -436,6 +442,14 @@ def enrich_candidates(
         errors = []
         try:
             history = history_client(row["symbol"])
+            history_source = next(
+                (
+                    str(item.get("source") or "").strip()
+                    for item in reversed(history)
+                    if isinstance(item, dict) and str(item.get("source") or "").strip()
+                ),
+                "",
+            )
             signal_history = normalize_signal_history(history, cutoff=signal_cutoff)
             features = extract_signal_features(
                 signal_history,
@@ -448,7 +462,7 @@ def enrich_candidates(
             if needs_technical:
                 row.update(calculate_technical_indicators(signal_history))
                 if normalized_market == US_MARKET:
-                    row["technical_source"] = "新浪财经美股日线"
+                    row["technical_source"] = history_source or "美股日线"
         except Exception as exc:
             errors.append(f"signal: {exc}")
         if needs_financial:

@@ -481,10 +481,11 @@ def fetch_watchlist_quotes(
     if not entries:
         return [], "自选股池为空"
     if normalized_market == US_MARKET:
-        return fetch_sina_us_quotes(
+        from .us_data_providers import get_us_market_data_provider
+
+        return get_us_market_data_provider().fetch_quotes(
             symbols=entries,
             board_name="未分类",
-            source_label="新浪财经美股实时行情（自选股池）",
             timeout=timeout,
             urlopen_func=urlopen_func,
         )

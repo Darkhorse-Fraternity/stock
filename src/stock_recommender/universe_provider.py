@@ -12,10 +12,10 @@ from .data_sources import (
     fetch_board_quotes,
     fetch_nasdaq100_quotes,
     fetch_sina_fallback_quotes,
-    fetch_sina_us_quotes,
 )
 from .markets import CN_MARKET, US_MARKET, normalize_market
 from .universe import normalize_stock_symbol
+from .us_data_providers import get_us_market_data_provider
 
 
 SNAPSHOT_SCHEMA_VERSION = 1
@@ -327,14 +327,14 @@ class Nasdaq100UniverseProvider:
         self,
         *,
         primary_fetcher: Callable = fetch_nasdaq100_quotes,
-        quote_fetcher: Callable = fetch_sina_us_quotes,
+        quote_fetcher: Callable | None = None,
         snapshot_store: BoardUniverseSnapshotStore | None = None,
         universe_limit: int | None = None,
         snapshot_max_age_days: float | None = None,
         minimum_membership_count: int | None = None,
     ):
         self.primary_fetcher = primary_fetcher
-        self.quote_fetcher = quote_fetcher
+        self.quote_fetcher = quote_fetcher or get_us_market_data_provider().fetch_quotes
         self.snapshot_store = snapshot_store or BoardUniverseSnapshotStore()
         configured_limit = int(os.getenv("STOCK_AGENT_US_UNIVERSE_LIMIT", "200"))
         self.universe_limit = max(
@@ -370,7 +370,7 @@ class Nasdaq100UniverseProvider:
             rows, quote_error = self.quote_fetcher(
                 symbols=snapshot.rows,
                 board_name=snapshot.board_name,
-                source_label=f"新浪财经美股实时行情（{snapshot.board_name}动态成分）",
+                source_label=f"美股实时行情（{snapshot.board_name}动态成分）",
             )
         except Exception as exc:
             rows, quote_error = [], str(exc)
