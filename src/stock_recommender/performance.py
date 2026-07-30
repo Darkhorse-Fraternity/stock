@@ -8,8 +8,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from .data_sources import fetch_watchlist_quotes
-from .universe import constrain_to_watchlist
+from .market_adapters import get_market_adapter
 from .utils import beijing_now, number
 
 
@@ -117,22 +116,45 @@ def build_recommendation_performance(
 ) -> dict:
     current = beijing_now(now)
     records = load_recommendation_history(days=days, path=path, now=current)
-    entries_by_symbol: dict[str, dict] = {}
+    entries_by_market: dict[str, dict[str, dict]] = {}
     for record in records:
+        market = str(record.get("market") or "cn")
+        adapter = get_market_adapter(market)
         for item in record.get("recommendations") or []:
-            symbol = str(item.get("symbol") or "")
-            if len(symbol) == 6 and symbol.isdigit():
-                entries_by_symbol.setdefault(symbol, {"symbol": symbol, "name": item.get("name") or symbol})
+            try:
+                symbol = adapter.normalize_symbol(item.get("symbol"))
+            except ValueError:
+                continue
+            entries_by_market.setdefault(adapter.market, {}).setdefault(
+                symbol,
+                {"symbol": symbol, "name": item.get("name") or symbol},
+            )
 
     rows = []
     quote_error = None
-    if entries_by_symbol:
-        fetcher = quote_fetcher or fetch_watchlist_quotes
+    errors = []
+    if quote_fetcher is not None:
+        entries = [entry for group in entries_by_market.values() for entry in group.values()]
         try:
-            rows, quote_error = fetcher(list(entries_by_symbol.values()))
+            rows, quote_error = quote_fetcher(entries)
+            rows = [
+                row
+                for market, group in entries_by_market.items()
+                for row in get_market_adapter(market).constrain_watchlist(rows, group.values())
+            ]
         except Exception as exc:
             quote_error = str(exc)
-    rows = constrain_to_watchlist(rows, list(entries_by_symbol.values()))
+    else:
+        for market, entries in entries_by_market.items():
+            adapter = get_market_adapter(market)
+            try:
+                fetched, error = adapter.fetch_watchlist(entries.values())
+                rows.extend(adapter.constrain_watchlist(fetched, entries.values()))
+                if error:
+                    errors.append(f"{adapter.profile.label}: {error}")
+            except Exception as exc:
+                errors.append(f"{adapter.profile.label}: {exc}")
+        quote_error = "；".join(errors) or None
     quotes = {str(row.get("symbol")): row for row in rows}
 
     events = []
@@ -173,6 +195,7 @@ def build_recommendation_performance(
                     "strategy_name": record.get("strategy_name") or "股票推荐策略",
                     "strategy_revision": record.get("strategy_revision", 1),
                     "strategy_stage": record.get("strategy_stage", "draft"),
+                    "market": record.get("market") or "cn",
                     "last_tracking_at": item.get("last_updated_at") or record.get("last_tracking_at"),
                     "quote_status": "live" if live_price > 0 else "stored",
                 }

@@ -50,7 +50,7 @@ class FakeBytesResponse:
 
 class StockAgentTests(unittest.TestCase):
     def setUp(self):
-        def history(symbol):
+        def history(symbol, **kwargs):
             numeric = int(symbol) if str(symbol).isdigit() else sum(ord(char) for char in str(symbol))
             slope = 0.08 + (1_000_000 - numeric) / 100_000_000
             start = date(2026, 2, 1)

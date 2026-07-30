@@ -5,6 +5,7 @@ import re
 from typing import Callable, Iterable
 
 from .data_sources import fetch_tick_rows
+from .markets import CN_MARKET, market_profile, parameter_applicable, strategy_market
 from .parameters import PARAMETERS_BY_ID, load_strategy_config, parameter_value
 from .signal_engine import rank_signal_rows, select_ranked_signals
 from .universe import row_matches_sector
@@ -17,9 +18,12 @@ def filter_candidates(
     *,
     include_enriched: bool = True,
     sector_filters: str | Iterable[object] | None = None,
+    market: object | None = None,
 ) -> list[dict]:
     materialized = list(rows)
     strategy = strategy or load_strategy_config()
+    normalized_market = strategy_market(strategy) if market is None else market_profile(market).code
+    profile = market_profile(normalized_market)
     prefixes = tuple(parameter_value(strategy, "stock_prefixes", ["0", "3", "6"]))
     exclude_st = bool(parameter_value(strategy, "exclude_st", True))
     exclude_suspended = bool(parameter_value(strategy, "exclude_suspended", True))
@@ -29,58 +33,138 @@ def filter_candidates(
             continue
         symbol = str(row.get("symbol") or "")
         name = str(row.get("name") or "")
-        if prefixes and not symbol.startswith(prefixes):
+        if profile.uses_code_prefixes and prefixes and not symbol.startswith(prefixes):
             continue
-        if exclude_st and "ST" in name.upper():
+        if profile.uses_special_treatment_labels and exclude_st and "ST" in name.upper():
             continue
         price = number(row.get("price"))
         turnover = number(row.get("turnover"))
         if exclude_suspended and (price <= 0 or turnover <= 0):
             continue
-        if not _matches_numeric(strategy, "price_min", price, "min"):
+        if not _matches_numeric(
+            strategy, "price_min", price, "min", market=normalized_market
+        ):
             continue
-        if not _matches_numeric(strategy, "price_max", price, "max"):
+        if not _matches_numeric(
+            strategy, "price_max", price, "max", market=normalized_market
+        ):
             continue
-        if not _matches_numeric(strategy, "change_pct_min", number(row.get("percent")), "min"):
+        if not _matches_numeric(
+            strategy,
+            "change_pct_min",
+            number(row.get("percent")),
+            "min",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_numeric(strategy, "change_pct_max", number(row.get("percent")), "max"):
+        if not _matches_numeric(
+            strategy,
+            "change_pct_max",
+            number(row.get("percent")),
+            "max",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_numeric(strategy, "turnover_rate_min", number(row.get("turnover_rate")), "min"):
+        if not _matches_numeric(
+            strategy,
+            "turnover_rate_min",
+            number(row.get("turnover_rate")),
+            "min",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_numeric(strategy, "turnover_rate_max", number(row.get("turnover_rate")), "max"):
+        if not _matches_numeric(
+            strategy,
+            "turnover_rate_max",
+            number(row.get("turnover_rate")),
+            "max",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_numeric(strategy, "turnover_min", turnover, "min"):
+        if not _matches_numeric(
+            strategy, "turnover_min", turnover, "min", market=normalized_market
+        ):
             continue
-        if not _matches_numeric(strategy, "volume_ratio_min", number(row.get("volume_ratio")), "min"):
+        if not _matches_numeric(
+            strategy,
+            "volume_ratio_min",
+            number(row.get("volume_ratio")),
+            "min",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_numeric(strategy, "amplitude_max", number(row.get("amplitude")), "max"):
+        if not _matches_numeric(
+            strategy,
+            "amplitude_max",
+            number(row.get("amplitude")),
+            "max",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "float_market_cap_min", row.get("float_market_cap"), "min"):
+        if not _matches_optional_numeric(
+            strategy,
+            "float_market_cap_min",
+            row.get("float_market_cap"),
+            "min",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "float_market_cap_max", row.get("float_market_cap"), "max"):
+        if not _matches_optional_numeric(
+            strategy,
+            "float_market_cap_max",
+            row.get("float_market_cap"),
+            "max",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "total_market_cap_min", row.get("total_market_cap"), "min"):
+        if not _matches_optional_numeric(
+            strategy,
+            "total_market_cap_min",
+            row.get("total_market_cap"),
+            "min",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "total_market_cap_max", row.get("total_market_cap"), "max"):
+        if not _matches_optional_numeric(
+            strategy,
+            "total_market_cap_max",
+            row.get("total_market_cap"),
+            "max",
+            market=normalized_market,
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "pe_min", row.get("pe"), "min"):
+        if not _matches_optional_numeric(
+            strategy, "pe_min", row.get("pe"), "min", market=normalized_market
+        ):
             continue
-        if not _matches_optional_numeric(strategy, "pe_max", row.get("pe"), "max"):
+        if not _matches_optional_numeric(
+            strategy, "pe_max", row.get("pe"), "max", market=normalized_market
+        ):
             continue
-        if not _matches_required_numeric(strategy, "pb_max", row, "pb", "max"):
+        if not _matches_required_numeric(
+            strategy, "pb_max", row, "pb", "max", market=normalized_market
+        ):
             continue
         if parameter_value(strategy, "above_open", None) is True and number(row.get("open")) > 0 and price < number(row.get("open")):
             continue
         if parameter_value(strategy, "above_prev_close", None) is True and number(row.get("prev_close")) > 0 and price < number(row.get("prev_close")):
             continue
         if parameter_value(strategy, "above_vwap", None) is True:
-            volume_hands = number(row.get("volume"))
-            vwap = turnover / (volume_hands * 100) if volume_hands > 0 else 0.0
+            volume_units = number(row.get("volume"))
+            vwap = turnover / (volume_units * profile.lot_size) if volume_units > 0 else 0.0
             if vwap > 0 and price < vwap:
                 continue
-        if parameter_value(strategy, "exclude_limit_up", None) is True and number(row.get("percent")) >= 9.8:
+        if (
+            profile.has_daily_price_limits
+            and parameter_value(strategy, "exclude_limit_up", None) is True
+            and number(row.get("percent")) >= 9.8
+        ):
             continue
-        if include_enriched and not _matches_enriched_parameters(strategy, row):
+        if include_enriched and not _matches_enriched_parameters(
+            strategy,
+            row,
+            normalized_market,
+        ):
             continue
         candidates.append(row)
     return candidates
@@ -90,7 +174,16 @@ def _parameter_state(strategy: dict, parameter_id: str) -> dict:
     return strategy.get("parameters", {}).get(parameter_id, {})
 
 
-def _matches_numeric(strategy: dict, parameter_id: str, actual: float, operator: str) -> bool:
+def _matches_numeric(
+    strategy: dict,
+    parameter_id: str,
+    actual: float,
+    operator: str,
+    *,
+    market: object = CN_MARKET,
+) -> bool:
+    if not parameter_applicable(parameter_id, market):
+        return True
     state = _parameter_state(strategy, parameter_id)
     if not state.get("enabled"):
         return True
@@ -98,7 +191,16 @@ def _matches_numeric(strategy: dict, parameter_id: str, actual: float, operator:
     return actual >= expected if operator == "min" else actual <= expected
 
 
-def _matches_optional_numeric(strategy: dict, parameter_id: str, raw_actual, operator: str) -> bool:
+def _matches_optional_numeric(
+    strategy: dict,
+    parameter_id: str,
+    raw_actual,
+    operator: str,
+    *,
+    market: object = CN_MARKET,
+) -> bool:
+    if not parameter_applicable(parameter_id, market):
+        return True
     state = _parameter_state(strategy, parameter_id)
     if not state.get("enabled"):
         return True
@@ -111,7 +213,12 @@ def _matches_optional_numeric(strategy: dict, parameter_id: str, raw_actual, ope
     return actual >= expected if operator == "min" else actual <= expected
 
 
-def missing_required_parameter_data(rows: Iterable[dict], strategy: dict) -> list[str]:
+def missing_required_parameter_data(
+    rows: Iterable[dict],
+    strategy: dict,
+    *,
+    market: object = CN_MARKET,
+) -> list[str]:
     field_parameters = {
         "float_market_cap": ["float_market_cap_min", "float_market_cap_max"],
         "total_market_cap": ["total_market_cap_min", "total_market_cap_max"],
@@ -120,7 +227,12 @@ def missing_required_parameter_data(rows: Iterable[dict], strategy: dict) -> lis
     materialized = list(rows)
     missing = []
     for field, parameter_ids in field_parameters.items():
-        enabled = [parameter_id for parameter_id in parameter_ids if _parameter_state(strategy, parameter_id).get("enabled")]
+        enabled = [
+            parameter_id
+            for parameter_id in parameter_ids
+            if parameter_applicable(parameter_id, market)
+            and _parameter_state(strategy, parameter_id).get("enabled")
+        ]
         if not enabled:
             continue
         actuals = [number(row.get(field), default=float("nan")) for row in materialized]
@@ -130,7 +242,17 @@ def missing_required_parameter_data(rows: Iterable[dict], strategy: dict) -> lis
     return missing
 
 
-def _matches_required_numeric(strategy: dict, parameter_id: str, row: dict, field: str, operator: str) -> bool:
+def _matches_required_numeric(
+    strategy: dict,
+    parameter_id: str,
+    row: dict,
+    field: str,
+    operator: str,
+    *,
+    market: object = CN_MARKET,
+) -> bool:
+    if not parameter_applicable(parameter_id, market):
+        return True
     state = _parameter_state(strategy, parameter_id)
     if not state.get("enabled"):
         return True
@@ -143,7 +265,16 @@ def _matches_required_numeric(strategy: dict, parameter_id: str, row: dict, fiel
     return actual >= expected if operator == "min" else actual <= expected
 
 
-def _matches_required_boolean(strategy: dict, parameter_id: str, row: dict, field: str) -> bool:
+def _matches_required_boolean(
+    strategy: dict,
+    parameter_id: str,
+    row: dict,
+    field: str,
+    *,
+    market: object = CN_MARKET,
+) -> bool:
+    if not parameter_applicable(parameter_id, market):
+        return True
     state = _parameter_state(strategy, parameter_id)
     if not state.get("enabled"):
         return True
@@ -152,7 +283,11 @@ def _matches_required_boolean(strategy: dict, parameter_id: str, row: dict, fiel
     return bool(row.get(field)) is bool(state.get("value", True))
 
 
-def _matches_enriched_parameters(strategy: dict, row: dict) -> bool:
+def _matches_enriched_parameters(
+    strategy: dict,
+    row: dict,
+    market: object = CN_MARKET,
+) -> bool:
     numeric_rules = [
         ("listed_days_min", "listed_days", "min"),
         ("rsi_min", "rsi", "min"),
@@ -172,7 +307,14 @@ def _matches_enriched_parameters(strategy: dict, row: dict) -> bool:
         ("current_ratio_min", "current_ratio", "min"),
     ]
     for parameter_id, field, operator in numeric_rules:
-        if not _matches_required_numeric(strategy, parameter_id, row, field, operator):
+        if not _matches_required_numeric(
+            strategy,
+            parameter_id,
+            row,
+            field,
+            operator,
+            market=market,
+        ):
             return False
     boolean_rules = [
         ("ma5_above_ma20", "ma5_above_ma20"),
@@ -183,7 +325,16 @@ def _matches_enriched_parameters(strategy: dict, row: dict) -> bool:
         ("operating_cashflow_positive", "operating_cashflow_positive"),
         ("free_cashflow_positive", "free_cashflow_positive"),
     ]
-    return all(_matches_required_boolean(strategy, parameter_id, row, field) for parameter_id, field in boolean_rules)
+    return all(
+        _matches_required_boolean(
+            strategy,
+            parameter_id,
+            row,
+            field,
+            market=market,
+        )
+        for parameter_id, field in boolean_rules
+    )
 
 
 def tick_seconds(value) -> int | None:
@@ -249,13 +400,17 @@ def attach_ignition_signals(candidates: list[dict], tick_fetcher: Callable | Non
             }
 
 
-def price_position(row: dict) -> dict:
+def price_position(row: dict, *, market: object = CN_MARKET) -> dict:
     price = number(row.get("price"))
     open_price = number(row.get("open"))
     prev_close = number(row.get("prev_close"))
-    volume_hands = number(row.get("volume"))
+    volume_units = number(row.get("volume"))
     turnover = number(row.get("turnover"))
-    vwap = turnover / (volume_hands * 100) if volume_hands > 0 else 0.0
+    vwap = (
+        turnover / (volume_units * market_profile(market).lot_size)
+        if volume_units > 0
+        else 0.0
+    )
     return {
         "open": open_price,
         "prev_close": prev_close,

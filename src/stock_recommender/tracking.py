@@ -7,14 +7,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from .data_sources import fetch_board_quotes, fetch_watchlist_quotes
+from .market_adapters import get_market_adapter
+from .markets import market_date, order_session_date
 from .parameters import record_paper_session
 from .performance import upsert_recommendation_history
 from .portfolio import plan_daily_candidates
 from .recommendation import RecommendationPlan, recommendation_tracking_entries
 from .reports import format_recommendation_snapshot
 from .runtime import assert_strategy_runnable
-from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
 
 
@@ -61,7 +61,7 @@ def save_daily_selection(
     lifecycle = (strategy or {}).get("lifecycle", {})
     payload = {
         "version": 2,
-        "trade_date": current.strftime("%Y-%m-%d"),
+        "trade_date": order_session_date(current, plan.market).isoformat(),
         "generated_at": current.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "symbols": symbols,
         "recommendations": entries,
@@ -73,6 +73,7 @@ def save_daily_selection(
         "signal_data_cutoff": (strategy or {}).get("signal", {}).get("data_cutoff"),
         "board_code": plan.board_code,
         "board_name": plan.board_name,
+        "market": plan.market,
         "benchmark_mode": "board_constituent_equal_weight",
         "benchmark_initial_change_pct": benchmark_change,
         "benchmark_error": benchmark_error,
@@ -117,7 +118,10 @@ def load_daily_selection_state(path: str | Path, *, now: datetime | None = None)
         payload = json.loads(target.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if payload.get("trade_date") != beijing_now(now).strftime("%Y-%m-%d"):
+    if payload.get("trade_date") != market_date(
+        beijing_now(now),
+        payload.get("market") or "cn",
+    ).isoformat():
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -127,7 +131,11 @@ def load_daily_selection(path: str | Path, *, now: datetime | None = None) -> li
     if not payload:
         return []
     symbols = payload.get("symbols") or []
-    return [str(symbol) for symbol in symbols if re.fullmatch(r"\d{6}", str(symbol))]
+    return [
+        str(symbol)
+        for symbol in symbols
+        if re.fullmatch(r"(?:\d{6}|[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)?)", str(symbol))
+    ]
 
 
 def _return_since(entry_price: float, current_price: float) -> float | None:
@@ -157,12 +165,17 @@ def generate_saved_tracking_report(
         return "⚠️ 今日尚无可跟踪的推荐股票，跳过本次盘中报告。"
 
     entries = [{"symbol": symbol} for symbol in symbols]
-    fetcher = quote_fetcher or fetch_watchlist_quotes
+    market = state.get("market") or "cn"
+    adapter = get_market_adapter(market)
+    profile = adapter.profile
     try:
-        rows, error = fetcher(entries)
+        if quote_fetcher is not None:
+            rows, error = quote_fetcher(entries)
+        else:
+            rows, error = adapter.fetch_watchlist(entries)
     except Exception as exc:
         rows, error = [], str(exc)
-    rows = constrain_to_watchlist(rows, entries)
+    rows = adapter.constrain_watchlist(rows, entries)
     by_symbol = {str(row.get("symbol")): row for row in rows}
     ordered = [by_symbol[symbol] for symbol in symbols if symbol in by_symbol]
     if not ordered:
@@ -178,7 +191,7 @@ def generate_saved_tracking_report(
     current_benchmark = None
     benchmark_error = None
     if initial_benchmark is not None:
-        benchmark_client = benchmark_fetcher or fetch_board_quotes
+        benchmark_client = benchmark_fetcher or adapter.benchmark_fetcher()
         try:
             benchmark_rows, benchmark_error = benchmark_client(
                 state.get("board_code") or "BK0800",
@@ -210,7 +223,11 @@ def generate_saved_tracking_report(
         since_text = f"{since:+.2f}%" if since is not None else "缺少入选价"
         excess_text = f"{excess:+.2f}%" if excess is not None else "基准暂缺"
         drawdown_text = f"{drawdown:.2f}%" if drawdown is not None else "-"
-        volume_text = f"，较上次 +{max(0.0, volume_delta):.0f} 手" if volume_delta is not None else ""
+        volume_text = (
+            f"，较上次 +{max(0.0, volume_delta):.0f} {profile.volume_unit}"
+            if volume_delta is not None
+            else ""
+        )
         detail_lines.append(
             f"- {row.get('name') or symbol} ({symbol})：推荐后 {since_text}，相对{state.get('board_name') or '板块'} {excess_text}，"
             f"采样最大回撤 {drawdown_text}{volume_text}"
@@ -246,7 +263,12 @@ def generate_saved_tracking_report(
             state["history_archive_error"] = str(exc)[:500]
             _save_state(Path(state_path).expanduser(), state)
 
-    snapshot = format_recommendation_snapshot(ordered, limit=len(symbols), generated_at=current.strftime("%m月%d日 %H:%M"))
+    snapshot = format_recommendation_snapshot(
+        ordered,
+        limit=len(symbols),
+        generated_at=current.strftime("%m月%d日 %H:%M"),
+        market=market,
+    )
     mode_label = "🧪 模拟盘" if state.get("strategy_stage") != "live" else "✅ 已批准实盘"
     benchmark_line = (
         f"板块成分等权近似：{benchmark_return:+.2f}%（从推荐时刻起）"

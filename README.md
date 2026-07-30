@@ -1,12 +1,19 @@
 # Stock Recommender
 
-A-share market-data collector and AI-assisted report generator for Hermes
-stock-analysis jobs.
+Multi-market stock-data collector and AI-assisted report generator for Hermes
+stock-analysis jobs. A-share and US-stock behavior is provided through separate
+market adapters while the signal, risk, portfolio, and reporting pipelines use
+one shared contract.
 
-The default primary source is Eastmoney's `BK0800` Artificial Intelligence board. If that board
+The default A-share source is Eastmoney's `BK0800` Artificial Intelligence board. If that board
 endpoint is unavailable, the pipeline falls back to Sina realtime quotes for the
 configured AI-agent stock pool. The strategy filters out non-Shenzhen/Shanghai
 rows, ST rows, and empty quote rows before scoring candidates.
+
+US strategies use the dynamic Nasdaq-100 membership published by Nasdaq and
+Sina US realtime/daily quotes. They use New York market hours, USD display,
+whole-share simulated orders, same-day sellability, and a commission-free
+simulation with slippage and volume-participation limits retained.
 
 Recommended production flow:
 
@@ -25,6 +32,8 @@ The implementation is split by responsibility:
 ```text
 src/stock_recommender/
   config.py        constants and stock-pool defaults
+  markets.py       market profiles: timezone, currency, sessions, and execution conventions
+  market_adapters.py  pluggable market I/O, universe, history, benchmark, and execution contract
   data_sources.py  Eastmoney, Sina fallback, static fallback, tick fetchers
   selection.py     candidate filtering, scoring, price position, ignition signal
   context.py       structured JSON context for an AI agent
@@ -32,7 +41,7 @@ src/stock_recommender/
   reports.py       script report, AI report orchestration, risk guard
   cli.py           environment variable parsing and output writing
   universe.py      watchlist parsing, universe constraints, sector filters
-  schedule.py      Beijing-time weekday and hourly publication guard
+  schedule.py      exchange-local weekday, session, and hourly publication guard
   tracking.py      daily recommendation state and intraday quote tracking
   recommendation.py structured recommendation plan shared by reports, tracking, and portfolio execution
   performance.py   recommendation audit archive
@@ -158,6 +167,16 @@ When a watchlist is configured, board collection and the built-in fallback pool
 are not used. A quote failure or an empty sector-filter result produces no
 recommendation instead of adding stocks outside the watchlist.
 
+For a US strategy, choose “美股” in the strategy's “证券市场” parameter. The
+default universe becomes `NASDAQ100`; a custom watchlist accepts tickers such as
+`AAPL:Apple:AI,MSFT:Microsoft:AI,NVDA:NVIDIA:AI`. Market-specific parameters
+that do not apply to US stocks, such as A-share code prefixes, ST filtering, and
+daily price-limit filtering, are removed from the active parameter view. Fields
+not provided reliably by the current US feeds—such as turnover rate, float
+market cap, PB, A-share financial-report factors, and 10-second ignition—are
+also declared unavailable and skipped by the execution pipeline rather than
+being inferred or fabricated.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -215,7 +234,10 @@ checkpoints:
 0 10,11,13,14,15 * * 1-5  hermes-tracking-run.sh
 ```
 
-The application guard uses the A-share sessions 09:30-11:30 and 13:00-15:00.
+The application guard uses the configured exchange's local session: A shares
+09:30-11:30 and 13:00-15:00 Asia/Shanghai, or US stocks 09:30-16:00
+America/New_York. The US cron window covers both EST and EDT; the exchange-local
+guard rejects triggers outside the active session.
 Accidental triggers on weekends, during the lunch break, before open, or after
 close exit without generating or overwriting a report. This guard treats
 Monday-Friday as workdays; exchange holidays still need to be excluded by the

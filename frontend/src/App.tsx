@@ -64,6 +64,32 @@ import {
 import { cn } from "@/lib/utils"
 
 type StatusFilter = "all" | "enabled" | "available" | "planned"
+const usInapplicableParameters = new Set([
+  "stock_prefixes",
+  "exclude_st",
+  "exclude_limit_up",
+  "turnover_rate_min",
+  "turnover_rate_max",
+  "volume_ratio_min",
+  "float_market_cap_min",
+  "float_market_cap_max",
+  "pb_max",
+  "ignition_price_10s_min",
+  "ignition_volume_ratio_min",
+  "fcf_yield_min",
+  "revenue_growth_min",
+  "profit_growth_min",
+  "eps_growth_min",
+  "roe_min",
+  "roa_min",
+  "roic_min",
+  "gross_margin_min",
+  "net_margin_min",
+  "operating_cashflow_positive",
+  "free_cashflow_positive",
+  "debt_ratio_max",
+  "current_ratio_min",
+])
 
 const statusCopy: Record<ParameterStatus, { label: string; description: string; variant: "success" | "info" | "warning" }> = {
   live: { label: "已接入", description: "数据源直接提供", variant: "success" },
@@ -478,10 +504,12 @@ function PortfolioNumberField({
   )
 }
 
-function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllocationChange }: { portfolio: PortfolioConfig; allocation: AllocationConfig; strategyId: string; onChange: (patch: Partial<PortfolioConfig>) => void; onAllocationChange: (patch: Partial<AllocationConfig>) => void }) {
+function PortfolioSettings({ portfolio, allocation, strategyId, market, onChange, onAllocationChange }: { portfolio: PortfolioConfig; allocation: AllocationConfig; strategyId: string; market: "cn" | "us"; onChange: (patch: Partial<PortfolioConfig>) => void; onAllocationChange: (patch: Partial<AllocationConfig>) => void }) {
   const field = (key: keyof PortfolioConfig) => (value: number) => onChange({ [key]: value } as Partial<PortfolioConfig>)
   const allocationField = (key: keyof AllocationConfig) => (value: number) => onAllocationChange({ [key]: value } as Partial<AllocationConfig>)
   const performanceUrl = `/strategies/${encodeURIComponent(strategyId)}/portfolio`
+  const isUs = market === "us"
+  const currency = isUs ? "USD" : "元"
   return (
     <div className="max-w-5xl space-y-5">
       <section className="overflow-hidden rounded-lg border bg-background shadow-xs">
@@ -512,7 +540,7 @@ function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllo
         <div className={cn("space-y-6 px-5 py-5 sm:px-6", !portfolio.enabled && "opacity-55")}>
           <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">组合与入场</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             <PortfolioNumberField disabled label="最大持仓" description="硬上限；每只股票占用一个独立槽位" value={portfolio.max_positions} suffix="只" onChange={field("max_positions")} />
-            <PortfolioNumberField label="初始资金" description="每个策略独立的模拟账户本金" value={portfolio.initial_cash} suffix="元" step={10000} onChange={field("initial_cash")} />
+            <PortfolioNumberField label="初始资金" description="每个策略独立的模拟账户本金" value={portfolio.initial_cash} suffix={currency} step={10000} onChange={field("initial_cash")} />
             <PortfolioNumberField label="目标权重" description="按下单前冻结净值计算，未用资金保留现金" value={portfolio.target_weight_pct} suffix="%" step={0.5} onChange={field("target_weight_pct")} />
             <PortfolioNumberField label="信号失效" description="连续多少次日评估无效后退出" value={portfolio.signal_invalid_days} suffix="天" onChange={field("signal_invalid_days")} />
           </div></div>
@@ -528,10 +556,10 @@ function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllo
             <PortfolioNumberField label="人工暂停线" description="暂停信号与新订单，保留风控执行" value={portfolio.halt_drawdown_pct} suffix="%" step={0.5} onChange={field("halt_drawdown_pct")} />
             <PortfolioNumberField label="预警最大暴露" description="预警状态允许的最高股票仓位" value={portfolio.warning_max_exposure_pct} suffix="%" step={1} onChange={field("warning_max_exposure_pct")} />
           </div></div>
-          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">模拟成交成本</h4><div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <PortfolioNumberField label="佣金率" description="买卖双边；另计最低佣金" value={portfolio.commission_rate_pct} suffix="%" step={0.001} onChange={field("commission_rate_pct")} />
-            <PortfolioNumberField label="最低佣金" description="单笔最低佣金金额" value={portfolio.minimum_commission_cny} suffix="元" step={1} onChange={field("minimum_commission_cny")} />
-            <PortfolioNumberField label="卖出印花税" description="仅卖出方向计费" value={portfolio.stamp_duty_rate_pct} suffix="%" step={0.001} onChange={field("stamp_duty_rate_pct")} />
+          <div><h4 className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">模拟成交成本</h4>{isUs && <p className="mb-3 rounded-md border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-900">美股由市场适配器执行整股、允许日内卖出和免佣模拟；保留滑点与成交参与率。</p>}<div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+            <PortfolioNumberField disabled={isUs} label="佣金率" description="买卖双边；另计最低佣金" value={isUs ? 0 : portfolio.commission_rate_pct} suffix="%" step={0.001} onChange={field("commission_rate_pct")} />
+            <PortfolioNumberField disabled={isUs} label="最低佣金" description="单笔最低佣金金额" value={isUs ? 0 : portfolio.minimum_commission_cny} suffix={currency} step={1} onChange={field("minimum_commission_cny")} />
+            <PortfolioNumberField disabled={isUs} label="卖出印花税" description="仅卖出方向计费" value={isUs ? 0 : portfolio.stamp_duty_rate_pct} suffix="%" step={0.001} onChange={field("stamp_duty_rate_pct")} />
             <PortfolioNumberField label="滑点" description="在下一可执行行情基础上的保守偏移" value={portfolio.slippage_bps} suffix="bps" step={1} onChange={field("slippage_bps")} />
           </div></div>
           <div className="grid gap-3 md:grid-cols-2">
@@ -540,7 +568,7 @@ function PortfolioSettings({ portfolio, allocation, strategyId, onChange, onAllo
           </div>
         </div>
       </section>
-      <p className="text-xs leading-6 text-muted-foreground">订单不会使用产生信号的同一时点价格成交；买入遵守整手与 T+1，卖出受可卖数量、涨跌停和成交量参与率约束。策略版本变化会撤销旧版本未成交订单。</p>
+      <p className="text-xs leading-6 text-muted-foreground">订单不会使用产生信号的同一时点价格成交；{isUs ? "美股按整股模拟并允许日内卖出" : "A 股买入遵守整手与 T+1"}，卖出受可卖数量、市场规则和成交量参与率约束。策略版本变化会撤销旧版本未成交订单。</p>
     </div>
   )
 }
@@ -657,18 +685,28 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   }
 
   const activeCount = parameters.filter((item) => item.enabled).length
-  const effectiveCount = parameters.filter((item) => item.enabled && item.status !== "planned").length
-  const plannedActiveCount = parameters.filter((item) => item.enabled && item.status === "planned").length
-  const availableCount = parameters.filter((item) => item.status !== "planned").length
-
+  const marketCode = String(parameters.find((item) => item.id === "market")?.value || "cn") === "us" ? "us" : "cn"
+  const isParameterApplicable = (item: Parameter) => (
+    marketCode !== "us"
+    || (item.applicable !== false && !usInapplicableParameters.has(item.id))
+  )
+  const effectiveCount = parameters.filter((item) => isParameterApplicable(item) && item.effective).length
+  const plannedActiveCount = parameters.filter((item) => isParameterApplicable(item) && item.enabled && item.status === "planned").length
+  const availableCount = parameters.filter((item) => isParameterApplicable(item) && item.status !== "planned").length
   const visibleParameters = useMemo(() => parameters.filter((item) => {
+    if (marketCode === "us" && (item.applicable === false || usInapplicableParameters.has(item.id))) return false
     if (activeGroup !== "all" && item.group !== activeGroup) return false
     if (statusFilter === "enabled" && !item.enabled) return false
     if (statusFilter === "available" && item.status === "planned") return false
     if (statusFilter === "planned" && item.status !== "planned") return false
     const needle = search.trim().toLowerCase()
     return !needle || `${item.label} ${item.description} ${item.id}`.toLowerCase().includes(needle)
-  }), [parameters, activeGroup, statusFilter, search])
+  }).map((item) => {
+    if (marketCode !== "us") return item
+    if (["price_min", "price_max"].includes(item.id)) return { ...item, unit: "$" }
+    if (["turnover_min", "float_market_cap_min", "float_market_cap_max", "total_market_cap_min", "total_market_cap_max"].includes(item.id)) return { ...item, unit: "亿美元" }
+    return item
+  }), [parameters, activeGroup, statusFilter, search, marketCode])
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -800,7 +838,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
           </section>
 
           {portfolioView ? (
-            <PortfolioSettings portfolio={config.portfolio} allocation={config.allocation} strategyId={config.id!} onChange={updatePortfolio} onAllocationChange={updateAllocation} />
+            <PortfolioSettings portfolio={config.portfolio} allocation={config.allocation} strategyId={config.id!} market={marketCode} onChange={updatePortfolio} onAllocationChange={updateAllocation} />
           ) : deliveryView ? (
             <DeliverySettings
               delivery={config.delivery}
@@ -928,7 +966,7 @@ function StrategyRow({ strategy, onEdit, onUsageChange, usagePending, onDuplicat
       <div className="flex min-w-0 flex-1 items-start gap-3">
         <div className={cn("mt-0.5 grid size-9 shrink-0 place-items-center rounded-md", strategy.is_active ? "bg-emerald-50 text-emerald-700" : "bg-muted text-muted-foreground")}><SlidersHorizontal className="size-4" /></div>
         <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2"><h3 className="truncate font-medium">{strategy.name}</h3><Badge variant={strategy.lifecycle.stage === "live" ? "success" : strategy.lifecycle.stage === "paper" ? "info" : "secondary"}>{lifecycleCopy[strategy.lifecycle.stage]}</Badge><span className="font-mono text-[10px] text-muted-foreground">v{strategy.revision}</span></div>
+          <div className="flex flex-wrap items-center gap-2"><h3 className="truncate font-medium">{strategy.name}</h3><Badge variant="outline">{strategy.market.label}</Badge><Badge variant={strategy.lifecycle.stage === "live" ? "success" : strategy.lifecycle.stage === "paper" ? "info" : "secondary"}>{lifecycleCopy[strategy.lifecycle.stage]}</Badge><span className="font-mono text-[10px] text-muted-foreground">v{strategy.revision}</span></div>
           <p className="mt-1 truncate text-xs text-muted-foreground">{strategy.description || "暂无说明"}</p>
           <p className="mt-1 font-mono text-[10px] text-muted-foreground">{strategy.signal.model} · {strategy.signal.run_time} · 前一交易日收盘数据</p>
         </div>

@@ -4,6 +4,7 @@ import json
 import math
 import os
 import queue
+import re
 import tempfile
 import threading
 import time
@@ -34,14 +35,20 @@ def market_history_cache_dir(path: str | Path | None = None) -> Path:
 
 
 def _validated_symbol(symbol: str) -> str:
-    normalized = str(symbol or "").strip()
-    if len(normalized) != 6 or not normalized.isdigit():
+    normalized = str(symbol or "").strip().upper()
+    if re.fullmatch(r"\d{6}", normalized):
+        return normalized
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)?", normalized) or len(normalized) > 15:
         raise ValueError(f"无效股票代码：{symbol}")
     return normalized
 
 
 def _cache_path(symbol: str, cache_dir: str | Path | None = None) -> Path:
-    return market_history_cache_dir(cache_dir) / f"{_validated_symbol(symbol)}.json"
+    normalized = _validated_symbol(symbol)
+    if normalized.isdigit():
+        return market_history_cache_dir(cache_dir) / f"{normalized}.json"
+    safe_symbol = normalized.replace(".", "_").replace("-", "_")
+    return market_history_cache_dir(cache_dir) / "us" / f"{safe_symbol}.json"
 
 
 def _aware_utc(value: datetime | None = None) -> datetime:

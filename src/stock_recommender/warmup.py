@@ -4,41 +4,18 @@ import json
 import os
 import tempfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME
-from .enrichment import fetch_daily_history
-from .data_sources import akshare_symbol
+from .market_adapters import get_market_adapter
 from .market_history import save_daily_history_cache
 from .parameters import load_strategy_config, parameter_value
+from .markets import CN_MARKET, normalize_market, strategy_market
 from .signal_engine import extract_signal_features, normalize_signal_history
-from .universe_provider import BoardUniverseProvider
+from .universe_provider import BoardUniverseProvider, Nasdaq100UniverseProvider, UniverseQuoteBatch
 from .utils import beijing_now
-
-
-def _download_sina_warmup_history(symbol: str, *, now: datetime) -> list[dict]:
-    import akshare as ak
-
-    frame = ak.stock_zh_a_daily(
-        symbol=akshare_symbol(symbol),
-        start_date=(now.date() - timedelta(days=550)).strftime("%Y%m%d"),
-        end_date=(now.date() + timedelta(days=1)).strftime("%Y%m%d"),
-        adjust="qfq",
-    )
-    return [
-        {
-            "date": row.get("date"),
-            "open": row.get("open"),
-            "close": row.get("close"),
-            "high": row.get("high"),
-            "low": row.get("low"),
-            "volume": row.get("volume"),
-            "turnover": row.get("amount"),
-        }
-        for _, row in frame.iterrows()
-    ]
 
 
 def warmup_status_path(path: str | Path | None = None) -> Path:
@@ -69,7 +46,7 @@ def warm_board_history_cache(
     *,
     board_code: str,
     board_name: str,
-    provider: BoardUniverseProvider | None = None,
+    provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
     history_fetcher: Callable | None = None,
     secondary_history_fetcher: Callable | None = None,
     workers: int | None = None,
@@ -77,12 +54,29 @@ def warm_board_history_cache(
     now: datetime | None = None,
     cache_dir: str | Path | None = None,
     force_refresh: bool = True,
+    market: object = CN_MARKET,
+    universe_rows: list[dict] | None = None,
 ) -> dict:
     current = beijing_now(now)
-    universe = (provider or BoardUniverseProvider()).fetch(
-        board_code,
-        board_name=board_name,
-        now=current,
+    normalized_market = normalize_market(market)
+    adapter = get_market_adapter(normalized_market)
+    universe = (
+        UniverseQuoteBatch(
+            rows=tuple(dict(item) for item in universe_rows),
+            mode="watchlist",
+            board_code=str(board_code),
+            board_name=str(board_name),
+            snapshot_count=len(universe_rows),
+            market=normalized_market,
+        )
+        if universe_rows
+        else adapter.fetch_universe(
+            None,
+            code=board_code,
+            name=board_name,
+            now=current,
+            provider=provider,
+        )
     )
     result = {
         "schema_version": 1,
@@ -91,6 +85,7 @@ def warm_board_history_cache(
         "status": "RUNNING",
         "board_code": str(board_code),
         "board_name": str(board_name),
+        "market": normalized_market,
         "source_mode": universe.mode,
         "universe_count": len(universe.rows),
         "ready_count": 0,
@@ -109,11 +104,11 @@ def warm_board_history_cache(
         )
         return result
 
-    fetcher = history_fetcher or fetch_daily_history
+    fetcher = history_fetcher or adapter.fetch_history
     secondary_fetcher = (
         secondary_history_fetcher
         if secondary_history_fetcher is not None
-        else (_download_sina_warmup_history if history_fetcher is None else None)
+        else (adapter.secondary_history_fetcher() if history_fetcher is None else None)
     )
     worker_count = max(
         1,
@@ -182,17 +177,23 @@ def warm_board_history_cache(
 
 def main() -> None:
     strategy = load_strategy_config()
-    board_code = os.getenv("STOCK_AGENT_BOARD_CODE") or str(
-        parameter_value(strategy, "board_code", DEFAULT_BOARD_CODE)
-    )
-    board_name = os.getenv("STOCK_AGENT_BOARD_NAME") or str(
-        parameter_value(strategy, "board_name", DEFAULT_BOARD_NAME)
+    market = strategy_market(strategy)
+    adapter = get_market_adapter(market)
+    watchlist = adapter.normalize_watchlist(parameter_value(strategy, "watchlist", []))
+    board_code, board_name = adapter.resolve_universe(
+        strategy,
+        code=os.getenv("STOCK_AGENT_BOARD_CODE")
+        or str(parameter_value(strategy, "board_code", DEFAULT_BOARD_CODE)),
+        name=os.getenv("STOCK_AGENT_BOARD_NAME")
+        or str(parameter_value(strategy, "board_name", DEFAULT_BOARD_NAME)),
     )
     result = warm_board_history_cache(
         board_code=board_code,
         board_name=board_name,
         minimum_history_rows=int(strategy.get("signal", {}).get("minimum_history_rows", 61)),
         force_refresh=os.getenv("STOCK_AGENT_HISTORY_WARMUP_FORCE_REFRESH", "1") == "1",
+        market=market,
+        universe_rows=watchlist or None,
     )
     save_warmup_status(result)
     print(json.dumps(result, ensure_ascii=False, indent=2))

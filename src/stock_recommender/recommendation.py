@@ -35,6 +35,7 @@ class RecommendationPlan:
     signal_contract: dict
     candidates: tuple[dict, ...]
     selected_candidates: tuple[dict, ...]
+    market: str = "cn"
 
     def __post_init__(self) -> None:
         candidate_symbols = tuple(str(item.get("symbol") or "") for item in self.candidates)
@@ -71,6 +72,7 @@ def build_recommendation_plan(
     data_quality: Mapping | None = None,
     candidate_limit: int = 8,
     selection_limit: int = 3,
+    market: str = "cn",
 ) -> RecommendationPlan:
     analyzed = [deepcopy(dict(item)) for item in analyses]
     market_rows = (
@@ -122,6 +124,7 @@ def build_recommendation_plan(
         signal_contract=signal_contract(dict(strategy or {}), cutoff=generated_at.date()),
         candidates=tuple(deepcopy(item) for item in candidates),
         selected_candidates=tuple(deepcopy(item) for item in selected),
+        market=str(market),
     )
 
 
@@ -143,6 +146,7 @@ def recommendation_tracking_entries(plan: RecommendationPlan) -> list[dict]:
                 "last_volume": None,
                 "score": number(item.get("score", item.get("signal_score")), default=0.0),
                 "signal_features": deepcopy(dict(item.get("signal_features") or {})),
+                "market": plan.market,
             }
         )
     return entries

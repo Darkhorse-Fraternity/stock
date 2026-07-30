@@ -17,12 +17,12 @@ try:  # pragma: no cover - fcntl is present on the Linux deployment and macOS de
 except ImportError:  # pragma: no cover
     fcntl = None
 
-from .data_sources import fetch_watchlist_quotes
+from .market_adapters import get_market_adapter
 from .market_regime import allocation_config, normalize_market_regime_decision
+from .markets import market_date, market_profile, order_session_date, strategy_market
 from .parameters import load_strategy_config, normalize_portfolio_config
 from .portfolio_pipeline import ENTRY_PIPELINE_VERSION, run_entry_pipeline
 from .runtime import assert_strategy_runnable
-from .universe import constrain_to_watchlist
 from .utils import beijing_now, number
 
 
@@ -115,7 +115,11 @@ def _round(value: float, digits: int = 6) -> float:
 
 
 def _new_account(strategy: dict, now: datetime) -> dict:
-    config = normalize_portfolio_config(strategy.get("portfolio"))
+    market = strategy_market(strategy)
+    adapter = get_market_adapter(market)
+    profile = adapter.profile
+    configured = normalize_portfolio_config(strategy.get("portfolio"))
+    config = adapter.execution_config(configured)
     initial_cash = number(config["initial_cash"])
     max_positions = int(config["max_positions"])
     account = {
@@ -124,6 +128,11 @@ def _new_account(strategy: dict, now: datetime) -> dict:
         "strategy_name": strategy.get("name") or "股票策略",
         "strategy_revision": int(strategy.get("revision") or 1),
         "strategy_stage": strategy.get("lifecycle", {}).get("stage", "draft"),
+        "market": market,
+        "market_label": profile.label,
+        "currency": profile.currency,
+        "currency_symbol": profile.currency_symbol,
+        "lot_size": profile.lot_size,
         "signal_model": strategy.get("signal", {}).get("model", "factor_rank_v1"),
         "signal_time": strategy.get("signal", {}).get("run_time", "08:00"),
         "last_market_regime": None,
@@ -140,6 +149,7 @@ def _new_account(strategy: dict, now: datetime) -> dict:
         "trading_mode": "RUNNING",
         "control_epoch": 1,
         "portfolio_config": config,
+        "configured_portfolio_config": configured,
         "slots": [
             {"id": index + 1, "state": "AVAILABLE", "symbol": None}
             for index in range(max_positions)
@@ -330,12 +340,35 @@ def _cancel_order(account: dict, order: dict, now: datetime, reason: str) -> dic
 
 def _activate_strategy(account: dict, strategy: dict, now: datetime) -> list[dict]:
     revision = int(strategy.get("revision") or 1)
-    config = normalize_portfolio_config(strategy.get("portfolio"))
-    changed = revision != int(account.get("strategy_revision") or 1) or config != account.get("portfolio_config")
+    market = strategy_market(strategy)
+    adapter = get_market_adapter(market)
+    profile = adapter.profile
+    configured = normalize_portfolio_config(strategy.get("portfolio"))
+    config = adapter.execution_config(configured)
+    previous_market = str(account.get("market") or "cn")
+    if previous_market != market and (
+        account.get("positions") or _open_orders(account)
+    ):
+        raise ValueError("持仓或未完成订单存在时不能切换证券市场")
+    changed = (
+        revision != int(account.get("strategy_revision") or 1)
+        or config != account.get("portfolio_config")
+        or previous_market != market
+    )
     account["strategy_name"] = strategy.get("name") or account.get("strategy_name")
     account["strategy_stage"] = strategy.get("lifecycle", {}).get("stage", "draft")
     account["signal_model"] = strategy.get("signal", {}).get("model", "factor_rank_v1")
     account["signal_time"] = strategy.get("signal", {}).get("run_time", "08:00")
+    account.update(
+        {
+            "market": market,
+            "market_label": profile.label,
+            "currency": profile.currency,
+            "currency_symbol": profile.currency_symbol,
+            "lot_size": profile.lot_size,
+            "configured_portfolio_config": configured,
+        }
+    )
     if not changed:
         account["portfolio_config"] = config
         return []
@@ -391,7 +424,8 @@ def _estimated_buy_reservation(account: dict, price: float) -> tuple[int, float]
     if budget <= minimum or worst_price <= 0:
         return 0, 0.0
     approximate_unit_cost = worst_price * (1 + commission_rate + transfer_rate)
-    quantity = math.floor((budget - minimum) / approximate_unit_cost / 100) * 100
+    lot_size = max(1, int(account.get("lot_size") or 100))
+    quantity = math.floor((budget - minimum) / approximate_unit_cost / lot_size) * lot_size
     if quantity <= 0:
         return 0, 0.0
     notional = worst_price * quantity
@@ -419,6 +453,7 @@ def _create_order(
     existing = next((item for item in account.get("orders", []) if item.get("key") == key), None)
     if existing:
         return existing, None
+    session_date = order_session_date(now, account.get("market") or "cn")
     order = {
         "id": uuid.uuid4().hex,
         "key": key,
@@ -438,7 +473,8 @@ def _create_order(
         "signal_price": _round(signal_price),
         "score": _round(score) if score is not None else None,
         "reserved_cash": _round(reserved_cash),
-        "valid_date": beijing_now(now).date().isoformat() if side == "BUY" else None,
+        "valid_date": session_date.isoformat() if side == "BUY" else None,
+        "valid_session_date": session_date.isoformat() if side == "BUY" else None,
         "created_at": _timestamp(now),
         "updated_at": _timestamp(now),
         "replacement_candidate": deepcopy(replacement_candidate),
@@ -494,9 +530,9 @@ def _trigger_exit(account: dict, position: dict, now: datetime, reason: str) -> 
 
 def _expire_old_entries(account: dict, now: datetime) -> list[dict]:
     events: list[dict] = []
-    current_date = beijing_now(now).date().isoformat()
+    current_date = market_date(now, account.get("market") or "cn").isoformat()
     for order in _open_orders(account, "BUY"):
-        if order.get("valid_date") == current_date:
+        if (order.get("valid_session_date") or order.get("valid_date")) == current_date:
             continue
         order["status"] = "EXPIRED"
         order["reserved_cash"] = 0.0
@@ -538,8 +574,9 @@ def plan_daily_candidates(
     def mutation(account: dict) -> list[dict]:
         events = _activate_strategy(account, strategy, current)
         _roll_settlements(account, current)
+        session_date = order_session_date(current, account.get("market") or "cn")
         run_key = (
-            f"daily:{current.date().isoformat()}:"
+            f"daily:{session_date.isoformat()}:"
             f"strategy-r{int(strategy.get('revision') or 1)}:"
             f"entry-pipeline-v{ENTRY_PIPELINE_VERSION}"
         )
@@ -552,6 +589,7 @@ def plan_daily_candidates(
             run_id=run_key,
             as_of=_timestamp(current),
             market_regime=decision,
+            symbol_normalizer=get_market_adapter(account.get("market") or "cn").normalize_symbol,
         )
         account["last_market_regime"] = deepcopy(decision)
         account["target_exposure_pct"] = decision["target_exposure_pct"]
@@ -627,7 +665,7 @@ def plan_daily_candidates(
                 if position["signal_invalid_days"] >= int(account["portfolio_config"]["signal_invalid_days"]):
                     events.extend(_trigger_exit(account, position, current, "SIGNAL_INVALIDATED"))
         account["last_candidates"] = deepcopy(normalized)
-        account["last_candidate_date"] = current.date().isoformat()
+        account["last_candidate_date"] = session_date.isoformat()
 
         occupied = len(account.get("positions", {})) + len(
             [order for order in _open_orders(account, "BUY") if order.get("symbol") not in account.get("positions", {})]
@@ -709,17 +747,24 @@ def _commission_increment(order: dict, notional: float, config: dict) -> float:
     return max(0.0, required - number(order.get("commission_charged")))
 
 
-def _fill_capacity(order: dict, quote: dict, config: dict) -> int:
+def _fill_capacity(
+    order: dict,
+    quote: dict,
+    config: dict,
+    *,
+    lot_size: int = 100,
+) -> int:
     remaining = int(order["quantity"] - order.get("filled_quantity", 0))
     bar_volume = quote.get("bar_volume")
     if bar_volume is None:
         return remaining
     capacity = int(number(bar_volume) * number(config["max_bar_participation_pct"]) / 100)
+    normalized_lot = max(1, int(lot_size))
     if order["side"] == "BUY":
-        return min(remaining, capacity // 100 * 100)
-    if remaining < 100 and capacity >= remaining:
+        return min(remaining, capacity // normalized_lot * normalized_lot)
+    if remaining < normalized_lot and capacity >= remaining:
         return remaining
-    return min(remaining, capacity // 100 * 100)
+    return min(remaining, capacity // normalized_lot * normalized_lot)
 
 
 def _limit_locked(order: dict, quote: dict) -> bool:
@@ -743,7 +788,8 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
     if created_at is None or created_at >= now:
         return events
     if order["side"] == "BUY":
-        if order.get("valid_date") != now.date().isoformat():
+        current_session_date = market_date(now, account.get("market") or "cn").isoformat()
+        if (order.get("valid_session_date") or order.get("valid_date")) != current_session_date:
             return events
         if order.get("control_epoch") != account.get("control_epoch") or account.get("trading_mode") != "RUNNING":
             event = _cancel_order(account, order, now, "当前风险状态禁止入场")
@@ -757,7 +803,8 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
         order["last_block_reason"] = "NO_VALID_PRICE"
         return events
     config = account["portfolio_config"]
-    quantity = _fill_capacity(order, quote, config)
+    lot_size = max(1, int(account.get("lot_size") or 100))
+    quantity = _fill_capacity(order, quote, config, lot_size=lot_size)
     if order["side"] == "SELL":
         position = account.get("positions", {}).get(order["symbol"])
         quantity = min(quantity, int(number((position or {}).get("sellable_quantity"))))
@@ -780,8 +827,8 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
     fees = commission + transfer_fee + stamp_duty
 
     if order["side"] == "BUY":
-        while quantity >= 100 and notional + fees > number(account.get("cash")):
-            quantity -= 100
+        while quantity >= lot_size and notional + fees > number(account.get("cash")):
+            quantity -= lot_size
             notional = fill_price * quantity
             commission = _commission_increment(order, notional, config) if quantity else 0.0
             transfer_fee = notional * number(config["transfer_fee_rate_pct"]) / 100
@@ -803,7 +850,13 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
                 "average_cost": 0.0,
                 "first_entry_price": fill_price,
                 "first_entry_at": _timestamp(now),
-                "sellable_on": _next_business_date(now.date()).isoformat(),
+                "sellable_on": (
+                    market_date(now, account.get("market") or "cn").isoformat()
+                    if market_profile(account.get("market") or "cn").same_day_sell
+                    else _next_business_date(
+                        market_date(now, account.get("market") or "cn")
+                    ).isoformat()
+                ),
                 "current_price": fill_price,
                 "peak_price": fill_price,
                 "trailing_active": False,
@@ -819,6 +872,8 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
         previous_quantity = int(position["quantity"])
         previous_cost = number(position["average_cost"]) * previous_quantity
         position["quantity"] = previous_quantity + quantity
+        if market_profile(account.get("market") or "cn").same_day_sell:
+            position["sellable_quantity"] = int(position.get("sellable_quantity") or 0) + quantity
         position["average_cost"] = _round((previous_cost + total_cost) / position["quantity"], 4)
         position["buy_fees"] = _round(number(position.get("buy_fees")) + fees)
         position["current_price"] = fill_price
@@ -893,7 +948,12 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
                     slot.update({"state": "AVAILABLE", "symbol": None})
                     break
             candidate = position.get("replacement_candidate")
-            if candidate and account.get("last_candidate_date") == now.date().isoformat() and account.get("trading_mode") == "RUNNING":
+            if (
+                candidate
+                and account.get("last_candidate_date")
+                == market_date(now, account.get("market") or "cn").isoformat()
+                and account.get("trading_mode") == "RUNNING"
+            ):
                 normalized = next((item for item in account.get("last_candidates", []) if item.get("symbol") == candidate.get("symbol")), None)
                 if normalized:
                     slot = _available_slot(account)
@@ -920,7 +980,7 @@ def _execute_order(account: dict, order: dict, quote: dict, now: datetime) -> li
 
 
 def _roll_settlements(account: dict, now: datetime) -> None:
-    settlement_date = now.date().isoformat()
+    settlement_date = market_date(now, account.get("market") or "cn").isoformat()
     for position in account.get("positions", {}).values():
         if settlement_date >= str(position.get("sellable_on") or "9999-12-31"):
             position["sellable_quantity"] = int(position["quantity"])
@@ -1087,12 +1147,12 @@ def monitor_portfolio(
     if not symbols:
         return account, [], None
     entries = [{"symbol": symbol, "name": account.get("positions", {}).get(symbol, {}).get("name", symbol)} for symbol in symbols]
-    fetcher = quote_fetcher or fetch_watchlist_quotes
+    adapter = get_market_adapter(account.get("market") or strategy_market(strategy))
     try:
-        rows, error = fetcher(entries)
+        rows, error = adapter.fetch_watchlist(entries, fetcher=quote_fetcher)
     except Exception as exc:
         rows, error = [], str(exc)
-    rows = constrain_to_watchlist(rows, entries)
+    rows = adapter.constrain_watchlist(rows, entries)
     if not rows:
         return account, [], error or "未返回有效行情"
     account, events = process_market_snapshot(strategy, rows, now=current, path=path)
@@ -1121,11 +1181,15 @@ def format_action_notifications(account: dict, events: Iterable[dict], *, perfor
         f"风险：{account.get('risk_level')} / {account.get('trading_mode')}",
         "",
     ]
+    currency_symbol = str(account.get("currency_symbol") or "¥")
     for event in selected:
         data = event.get("data") or {}
         line = f"- {event.get('message')}"
         if data.get("fill_price") is not None:
-            line += f"；成交价 ¥{number(data.get('fill_price')):.2f}，费用 ¥{number(data.get('fees')):.2f}"
+            line += (
+                f"；成交价 {currency_symbol}{number(data.get('fill_price')):.2f}，"
+                f"费用 {currency_symbol}{number(data.get('fees')):.2f}"
+            )
         link = _with_event_link(performance_url, event.get("id"))
         if link:
             line += f"；[查看事件]({link})"
@@ -1141,12 +1205,14 @@ def format_portfolio_summary(account: dict, *, performance_url: str = "", quote_
     return_pct = (nav / initial - 1) * 100 if initial > 0 else 0.0
     positions = sorted(account.get("positions", {}).values(), key=lambda item: int(item.get("slot_id") or 0))
     regime = normalize_market_regime_decision(account.get("last_market_regime"))
+    currency_symbol = str(account.get("currency_symbol") or "¥")
+    volume_unit = market_profile(account.get("market") or "cn").volume_unit
     lines = [
         "📊 **策略持仓每小时报告**",
         f"策略：{account.get('strategy_name')} · v{account.get('strategy_revision')} · {account.get('strategy_stage')}",
         f"信号：{account.get('signal_model', 'factor_rank_v1')} @ {account.get('signal_time', '08:00')} · 前一交易日收盘数据",
         f"板块：{regime['label']}（{regime['state']}） · 目标仓位 {regime['target_exposure_pct']:.0f}% · {regime['model']}",
-        f"净值：¥{nav:,.2f}（累计 {return_pct:+.2f}%） · 现金 ¥{number(account.get('cash')):,.2f} · 回撤 {drawdown:.2f}%",
+        f"净值：{currency_symbol}{nav:,.2f}（累计 {return_pct:+.2f}%） · 现金 {currency_symbol}{number(account.get('cash')):,.2f} · 回撤 {drawdown:.2f}%",
         f"风险：{account.get('risk_level')} / {account.get('trading_mode')} · 持仓 {len(positions)}/{account.get('portfolio_config', {}).get('max_positions', 10)}",
         "",
         "**当前持仓**",
@@ -1156,10 +1222,10 @@ def format_portfolio_summary(account: dict, *, performance_url: str = "", quote_
     for position in positions:
         sellable = int(number(position.get("sellable_quantity")))
         lines.append(
-            f"- {position.get('name')} ({position.get('symbol')})：现价 ¥{number(position.get('current_price')):.2f}，"
+            f"- {position.get('name')} ({position.get('symbol')})：现价 {currency_symbol}{number(position.get('current_price')):.2f}，"
             f"当日 {number(position.get('day_change_pct')):+.2f}%，持仓 {number(position.get('return_pct')):+.2f}%，"
             f"仓位 {number(position.get('quantity')) * number(position.get('current_price')) / max(nav, 1) * 100:.1f}%，"
-            f"可卖 {sellable} 股，成交量 {number(position.get('volume_hands')):.0f} 手"
+            f"可卖 {sellable} 股，成交量 {number(position.get('volume_hands')):.0f} {volume_unit}"
         )
     pending = _open_orders(account)
     if pending:
@@ -1197,9 +1263,12 @@ def build_strategy_performance(
     symbols = list(projected.get("positions", {}))
     quote_error = None
     if symbols and quote_fetcher is not False:
-        fetcher = quote_fetcher or fetch_watchlist_quotes
+        adapter = get_market_adapter(projected.get("market") or strategy_market(strategy))
         try:
-            rows, quote_error = fetcher([{"symbol": symbol} for symbol in symbols])
+            rows, quote_error = adapter.fetch_watchlist(
+                [{"symbol": symbol} for symbol in symbols],
+                fetcher=quote_fetcher,
+            )
         except Exception as exc:
             rows, quote_error = [], str(exc)
         quotes = {str(row.get("symbol")): row for row in rows}
@@ -1242,11 +1311,17 @@ def build_strategy_performance(
     return {
         "generated_at": current.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "quote_error": quote_error,
+        "market": projected.get("market", "cn"),
+        "market_label": projected.get("market_label", "A股"),
+        "currency": projected.get("currency", "CNY"),
+        "currency_symbol": projected.get("currency_symbol", "¥"),
         "strategy": {
             "id": projected.get("strategy_id"),
             "name": projected.get("strategy_name"),
             "revision": projected.get("strategy_revision", 1),
             "stage": projected.get("strategy_stage", "draft"),
+            "market": projected.get("market", "cn"),
+            "market_label": projected.get("market_label", "A股"),
             "signal_model": strategy.get("signal", {}).get("model", "factor_rank_v1"),
             "signal_time": strategy.get("signal", {}).get("run_time", "08:00"),
             "signal_data_cutoff": strategy.get("signal", {}).get("data_cutoff", "previous_trading_day_close"),

@@ -13,8 +13,8 @@ from pathlib import Path
 from statistics import NormalDist
 from typing import Callable, Iterable
 
-from .data_sources import fetch_board_quotes, fetch_watchlist_quotes
-from .enrichment import fetch_daily_history
+from .market_adapters import get_market_adapter
+from .markets import strategy_market
 from .parameters import (
     find_strategy_config,
     parameter_value,
@@ -31,7 +31,6 @@ from .signal_engine import (
     select_ranked_signals,
     signal_contract,
 )
-from .universe import normalize_watchlist
 from .utils import number
 
 
@@ -546,13 +545,19 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
 
 
 def load_current_universe_dataset(strategy: dict) -> dict:
-    watchlist = normalize_watchlist(parameter_value(strategy, "watchlist", []))
+    market = strategy_market(strategy)
+    adapter = get_market_adapter(market)
+    watchlist = adapter.normalize_watchlist(parameter_value(strategy, "watchlist", []))
     if watchlist:
-        rows, error = fetch_watchlist_quotes(watchlist)
+        rows, error = adapter.fetch_watchlist(watchlist)
     else:
-        board_code = str(parameter_value(strategy, "board_code", "BK0800"))
-        board_name = str(parameter_value(strategy, "board_name", "人工智能"))
-        rows, error = fetch_board_quotes(board_code, board_name=board_name)
+        board_code, board_name = adapter.resolve_universe(strategy)
+        batch = adapter.fetch_universe(
+            strategy,
+            code=board_code,
+            name=board_name,
+        )
+        rows, error = list(batch.rows), batch.error
     if not rows:
         raise BacktestDataError(error or "无法获取当前股票范围")
     maximum = max(3, int(os.getenv("STOCK_AGENT_BACKTEST_UNIVERSE_LIMIT", "30")))
@@ -560,7 +565,12 @@ def load_current_universe_dataset(strategy: dict) -> dict:
     for row in rows:
         symbol = str(row.get("symbol") or "")
         name = str(row.get("name") or "")
-        if symbol.startswith(("0", "3", "6")) and "ST" not in name.upper() and "退" not in name and symbol not in symbols:
+        if (
+            symbol
+            and (not adapter.profile.uses_code_prefixes or symbol.startswith(("0", "3", "6")))
+            and (not adapter.profile.uses_special_treatment_labels or ("ST" not in name.upper() and "退" not in name))
+            and symbol not in symbols
+        ):
             symbols.append(symbol)
         if len(symbols) >= maximum:
             break
@@ -568,7 +578,7 @@ def load_current_universe_dataset(strategy: dict) -> dict:
     errors = []
     configured_workers = max(1, int(os.getenv("STOCK_AGENT_HISTORY_FETCH_WORKERS", "2")))
     with ThreadPoolExecutor(max_workers=min(configured_workers, len(symbols)), thread_name_prefix="stock-backtest") as executor:
-        futures = {executor.submit(fetch_daily_history, symbol): symbol for symbol in symbols}
+        futures = {executor.submit(adapter.fetch_history, symbol): symbol for symbol in symbols}
         for future in as_completed(futures):
             symbol = futures[future]
             try:
@@ -584,6 +594,7 @@ def load_current_universe_dataset(strategy: dict) -> dict:
         "benchmark": [],
         "metadata": {
             "universe_mode": "current_watchlist" if watchlist else "current_board_constituents",
+            "market": market,
             "benchmark_mode": "current_universe_equal_weight",
             "point_in_time_complete": False,
             "benchmark_complete": False,

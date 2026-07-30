@@ -14,6 +14,7 @@ from .context import (
 )
 from .llm import call_llm_analysis
 from .market_regime import normalize_market_regime_decision
+from .markets import CN_MARKET, market_profile, strategy_market
 from .parameters import chase_risk_threshold, normalize_portfolio_config
 from .recommendation import RecommendationOutput, RecommendationPlan
 from .universe import normalize_sector_filters, normalize_watchlist
@@ -41,6 +42,7 @@ def decorate_strategy_output(report: str, strategy: dict | None) -> str:
     }
     version = (
         f"使用策略：{strategy.get('name') or strategy.get('id')} ({strategy.get('id')}) · "
+        f"市场：{market_profile(strategy_market(strategy)).label} · "
         f"策略版本：v{strategy.get('revision', 1)} · {stage} · "
         f"信号：{strategy.get('signal', {}).get('model', 'factor_rank_v1')} @ "
         f"{strategy.get('signal', {}).get('run_time', '08:00')}"
@@ -48,22 +50,31 @@ def decorate_strategy_output(report: str, strategy: dict | None) -> str:
     return f"{labels.get(stage, labels['draft'])}\n{version}\n\n{report}"
 
 
-def format_volume_hands(value: float) -> str:
+def format_volume(value: float, *, market: object = CN_MARKET) -> str:
     volume = number(value)
+    unit = market_profile(market).volume_unit
     if volume >= 100_000_000:
-        return f"{volume / 100_000_000:.2f} 亿手"
+        return f"{volume / 100_000_000:.2f} 亿{unit}"
     if volume >= 10_000:
-        return f"{volume / 10_000:.2f} 万手"
-    return f"{volume:.0f} 手"
+        return f"{volume / 10_000:.2f} 万{unit}"
+    return f"{volume:.0f} {unit}"
 
 
-def format_recommendation_snapshot(rows: Iterable[dict], *, limit: int = 3, generated_at: str = "") -> str:
+def format_recommendation_snapshot(
+    rows: Iterable[dict],
+    *,
+    limit: int = 3,
+    generated_at: str = "",
+    market: object | None = None,
+) -> str:
     selected = list(rows)[: max(0, limit)]
     if not selected:
         return ""
     lines = ["📈 **推荐股每小时成交与涨跌跟踪**"]
     if generated_at:
         lines.append(f"更新时间：{generated_at}")
+    normalized_market = market or (selected[0].get("market") if selected else CN_MARKET)
+    profile = market_profile(normalized_market)
     for item in selected:
         percent = number(item.get("change_percent", item.get("percent")))
         price = number(item.get("price"))
@@ -81,8 +92,9 @@ def format_recommendation_snapshot(rows: Iterable[dict], *, limit: int = 3, gene
         )
         lines.append(
             f"- {item.get('name') or item.get('symbol')} ({item.get('symbol')})："
-            f"最新价 ¥{price:.2f}，涨跌幅 {percent:+.2f}%；"
-            f"成交量 {format_volume_hands(volume)}，成交额 {format_cny(turnover)}{score_text}{factor_text}"
+            f"最新价 {profile.currency_symbol}{price:.2f}，涨跌幅 {percent:+.2f}%；"
+            f"成交量 {format_volume(volume, market=profile.code)}，"
+            f"成交额 {format_amount(turnover, market=profile.code)}{score_text}{factor_text}"
         )
     return "\n".join(lines)
 
@@ -99,7 +111,7 @@ def format_market_regime_summary(decision: dict) -> str:
     else:
         detail = f"有效样本 {normalized['sample_size']} 只"
     return (
-        f"🧭 **板块状态**：{normalized['label']}（{normalized['state']}） · "
+        f"🧭 **板块状态 / 市场状态**：{normalized['label']}（{normalized['state']}） · "
         f"目标仓位 {normalized['target_exposure_pct']:.0f}% · {detail} · "
         f"模型 {normalized['model']}"
     )
@@ -135,6 +147,7 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
     eligible = list(plan.candidates)
     error = plan.fetch_error
     market_regime = plan.market_regime
+    profile = market_profile(plan.market)
 
     if not plan.selected_candidates:
         return decorate_strategy_output("\n".join(
@@ -177,10 +190,10 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
                 f"{stock['rating_emoji']} **【推荐 #{index}】{stock['name']} ({stock['symbol']})**",
                 f"  🎯 **评级**: {stock['rating']} (factor_rank_v1：{number(stock['score']):.1f}/100)",
                 *([sector_line] if sector_line else []),
-                f"  💰 **最新价**: ¥{number(stock.get('price')):.2f}",
+                f"  💰 **最新价**: {profile.currency_symbol}{number(stock.get('price')):.2f}",
                 f"  📊 **涨跌幅**: {number(stock.get('percent')):.2f}% ({number(stock.get('change')):+.2f})",
                 f"  🔄 **换手率**: {number(stock.get('turnover_rate')):.2f}%",
-                f"  💵 **成交额**: {number(stock.get('turnover')) / 100_000_000:.1f} 亿",
+                f"  💵 **成交额**: {format_amount(number(stock.get('turnover')), market=plan.market)}",
                 f"  ⚠️ **风险等级**: {stock['risk_level']}",
                 "",
                 "  **📝 推荐理由**:",
@@ -194,6 +207,7 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
         top,
         limit=len(top),
         generated_at=report_time.strftime("%m月%d日 %H:%M"),
+        market=plan.market,
     )
     if snapshot:
         report.extend([snapshot, ""])
@@ -220,8 +234,8 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
             "📌 **数据说明**",
             f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
             f"  • 数据来源：{'；'.join(sources)}",
-            "  • 信号口径：北京时间 08:00 运行，仅使用前一交易日收盘前数据",
-            "  • 任务频率：北京时间工作日 08:00 推荐；开市期间整点跟踪持仓股",
+            "  • 信号口径：北京时间 08:00 运行，仅使用对应市场前一交易日收盘数据",
+            f"  • 任务频率：北京时间工作日 08:00 推荐；{profile.label}开市期间整点跟踪持仓股",
             "",
             "=" * 30,
         ]
@@ -234,6 +248,7 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
     portfolio = normalize_portfolio_config((strategy or {}).get("portfolio"))
     report_time = plan.generated_at
     selected = list(plan.selected_candidates)
+    profile = market_profile(plan.market)
     universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}板块"
     filter_label = f"（板块：{'、'.join(plan.sector_filters)}）" if plan.sector_filters else ""
 
@@ -262,7 +277,7 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
                 [
                     f"{index}. **{stock['name']} ({stock['symbol']})**",
                     (
-                        f"   参考价 ¥{number(stock.get('price')):.2f} · "
+                        f"   参考价 {profile.currency_symbol}{number(stock.get('price')):.2f} · "
                         f"当日涨跌 {number(stock.get('percent', stock.get('change_percent'))):+.2f}% · "
                         f"信号分 {number(stock.get('score', stock.get('signal_score'))):.1f}/100"
                     ),
@@ -284,13 +299,17 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
                 f"回撤 {portfolio['trailing_drawdown_pct']:g}% 退出"
             ),
             f"  • 信号失效：连续 {portfolio['signal_invalid_days']} 个交易日后退出或替换",
-            "  • 执行：A 股 T+1；订单还会经过组合容量、风险准入、费用、滑点与成交量限制",
+            (
+                "  • 执行："
+                + ("美股整股模拟、允许日内卖出" if profile.same_day_sell else "A 股 100 股一手、T+1 可卖")
+                + "；订单还会经过组合容量、风险准入、费用、滑点与成交量限制"
+            ),
             "",
             "📌 **数据与任务说明**",
             f"  • 更新时间：{report_time.strftime('%m月%d日 %H:%M')}",
             f"  • 数据来源：{'；'.join(plan.sources) or '暂无有效行情源'}",
-            "  • 信号口径：北京时间工作日 08:00 运行，仅使用前一交易日收盘前数据",
-            "  • 持仓跟踪：开市期间整点汇报成交量、涨跌幅与退出动作",
+            "  • 信号口径：北京时间工作日 08:00 运行，仅使用对应市场前一交易日收盘数据",
+            f"  • 持仓跟踪：{profile.label}开市期间整点汇报成交量、涨跌幅与退出动作",
             "",
             "仅供策略验证，不构成投资建议。",
         ]
@@ -314,7 +333,10 @@ def generate_report_result(
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
 ) -> RecommendationOutput:
-    watchlist_entries = normalize_watchlist(watchlist)
+    watchlist_entries = normalize_watchlist(
+        watchlist,
+        market=strategy_market(strategy),
+    )
     sectors = normalize_sector_filters(sector_filters)
     plan = collect_recommendation_plan(
         now=now,
@@ -505,6 +527,7 @@ def render_ai_report_result(
             snapshot_rows,
             limit=tracking_limit,
             generated_at=payload.get("generated_at") or "",
+            market=plan.market,
         )
         explained = f"{regime_summary}\n\n{guarded}"
         result = f"{explained}\n\n{snapshot}" if snapshot else explained
@@ -529,9 +552,13 @@ def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = Non
         return analysis
     candidates = payload.get("candidates") or []
     known_symbols = {str(item.get("symbol")) for item in candidates}
-    mentioned_symbols = set(re.findall(r"\b\d{6}\b", analysis))
-    unknown_symbols = mentioned_symbols - known_symbols
-    if unknown_symbols:
+    mentioned_symbols = {
+        symbol
+        for symbol in known_symbols
+        if re.search(rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])", analysis, flags=re.I)
+    }
+    unknown_symbols = set(re.findall(r"\b\d{6}\b", analysis)) - known_symbols
+    if payload.get("market", "cn") == "cn" and unknown_symbols:
         return build_conservative_report(payload, "数据一致性校验失败：AI 输出包含非候选股票代码", strategy=strategy)
     required_symbols = set(payload.get("portfolio_candidates") or [])
     if not required_symbols.issubset(mentioned_symbols):
@@ -545,13 +572,26 @@ def apply_risk_guard(context: str, analysis: str, *, strategy: dict | None = Non
     return build_conservative_report(payload, "AI 原始输出包含对高涨幅股票的过高仓位建议", strategy=strategy)
 
 
-def format_cny(value: float) -> str:
+def format_amount(value: float, *, market: object = CN_MARKET) -> str:
     amount = number(value)
+    profile = market_profile(market)
+    if profile.currency == "USD":
+        if amount >= 1_000_000_000:
+            return f"{profile.currency_symbol}{amount / 1_000_000_000:.2f}B"
+        if amount >= 1_000_000:
+            return f"{profile.currency_symbol}{amount / 1_000_000:.2f}M"
+        if amount >= 1_000:
+            return f"{profile.currency_symbol}{amount / 1_000:.1f}K"
+        return f"{profile.currency_symbol}{amount:.0f}"
     if amount >= 100_000_000:
         return f"{amount / 100_000_000:.1f} 亿"
     if amount >= 10_000:
         return f"{amount / 10_000:.0f} 万"
     return f"{amount:.0f}"
+
+
+def format_cny(value: float) -> str:
+    return format_amount(value, market=CN_MARKET)
 
 
 def market_sentiment_profile(candidates: list[dict], *, strategy: dict | None = None) -> dict:
@@ -612,7 +652,15 @@ def price_position_summary(position: dict | None) -> str:
     return "、".join(parts)
 
 
-def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict, *, strategy: dict | None = None) -> None:
+def append_candidate_explanation(
+    lines: list[str],
+    item: dict,
+    sentiment: dict,
+    *,
+    strategy: dict | None = None,
+    market: object = CN_MARKET,
+) -> None:
+    profile = market_profile(market)
     action = candidate_action(item, sentiment, strategy=strategy)
     pct = number(item.get("change_percent"))
     turnover_rate = number(item.get("turnover_rate"))
@@ -624,13 +672,18 @@ def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict, 
     ignition_summary = ignition_signal_summary(item.get("ignition_signal"))
     source = item.get("source") or "结构化行情"
     reasons = item.get("machine_reasons") or []
+    tick_source_note = (
+        "- 当前版本已尝试接入 10 秒逐笔成交；集合竞价最后一分钟成交量、五档盘口吃单数据仍未稳定接入，不在本报告中伪造判断。"
+        if profile.supports_tick_ignition
+        else f"- {profile.label}逐笔点火与盘口数据尚未接入，本报告不据此生成判断。"
+    )
     lines.extend(
         [
             f"### {item['name']} ({item['symbol']})",
             "**入选理由**",
-            f"- 来自今日 {item.get('board_name', DEFAULT_BOARD_NAME)} 科技 AI 热点股池，实时数据源为{source}。",
-            f"- 涨幅 {pct:.2f}%，换手率 {turnover_rate:.2f}%，成交额 {format_cny(turnover)}，机器信号分 {score:.0f}/100。",
-            f"- 流通市值 {format_cny(float_market_cap)}，用于执行 20-100 亿中小盘筛选。",
+            f"- 来自今日 {item.get('board_name', DEFAULT_BOARD_NAME)} 股票池，实时数据源为{source}。",
+            f"- 涨幅 {pct:.2f}%，换手率 {turnover_rate:.2f}%，成交额 {format_amount(turnover, market=market)}，机器信号分 {score:.0f}/100。",
+            f"- 流通市值 {format_amount(float_market_cap, market=market)}，用于执行当前策略的市值筛选。",
             f"- 价格位置：{position_summary}。",
             f"- {ignition_summary}。",
             f"- PE {pe:.2f}，用于辅助判断估值风险，不单独作为买入依据。",
@@ -642,7 +695,7 @@ def append_candidate_explanation(lines: list[str], item: dict, sentiment: dict, 
         [
             "**风险/降级理由**",
             f"- {action['reason']}。",
-            "- 当前版本已尝试接入 10 秒逐笔成交；集合竞价最后一分钟成交量、五档盘口吃单数据仍未稳定接入，不在本报告中伪造判断。",
+            tick_source_note,
             "**操作建议**",
             f"- 建议：{action['label']}。",
             f"- 单股仓位：{action['position']}；买入拆分：{action['entries']}。",
@@ -661,6 +714,8 @@ def build_conservative_report(payload: dict, reason: str, *, strategy: dict | No
     if not selected:
         selected = (high_risk[:3] + moderate[:2])[:5]
     sentiment = market_sentiment_profile(candidates, strategy=strategy)
+    market = payload.get("market") or strategy_market(strategy)
+    profile = market_profile(market)
     lines = [
         "⚠️ **系统风控修正**",
         "",
@@ -675,12 +730,22 @@ def build_conservative_report(payload: dict, reason: str, *, strategy: dict | No
         return "\n".join(lines)
     for item in selected:
         item.setdefault("board_name", payload.get("board_name") or DEFAULT_BOARD_NAME)
-        append_candidate_explanation(lines, item, sentiment, strategy=strategy)
+        append_candidate_explanation(
+            lines,
+            item,
+            sentiment,
+            strategy=strategy,
+            market=market,
+        )
     lines.extend(
         [
             "## 最终建议",
             f"- 今日不建议追高，涨幅超过 {threshold:g}% 的候选只允许观望或极轻仓试错。",
-            "- 真正买点必须等待 10 秒量价点火、均价线/开盘价/0轴上方；盘口大单被主动吃掉后卖盘变稀疏仍需稳定盘口源确认。",
+            (
+                "- 真正买点需等待 10 秒量价点火、均价线/开盘价/0轴上方；盘口判断仍需稳定盘口源确认。"
+                if profile.supports_tick_ignition
+                else f"- {profile.label}逐笔点火与盘口能力尚未接入；仅使用已声明可用的行情和日线信号。"
+            ),
             "- 仅供参考，不构成投资建议。",
         ]
     )

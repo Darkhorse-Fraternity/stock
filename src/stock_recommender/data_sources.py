@@ -16,8 +16,10 @@ from .config import (
     DEFAULT_TIMEOUT_SECONDS,
     EASTMONEY_FALLBACK_URL,
     EASTMONEY_URL,
+    NASDAQ_100_URL,
     STATIC_FALLBACK,
 )
+from .markets import CN_MARKET, US_MARKET, normalize_market
 from .universe import normalize_stock_symbol, normalize_watchlist
 from .utils import number
 
@@ -285,15 +287,207 @@ def fetch_sina_fallback_quotes(
     return quotes, error
 
 
-def fetch_watchlist_quotes(
-    watchlist: Iterable[object],
+def _market_number(value: object) -> float:
+    text = str(value or "").strip().replace(",", "").replace("$", "").replace("%", "")
+    return number(text)
+
+
+def fetch_nasdaq100_quotes(
+    universe_code: str = "NASDAQ100",
     *,
+    board_name: str = "纳斯达克100",
+    limit: int = 1000,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     urlopen_func: Callable | None = None,
 ) -> tuple[list[dict], str | None]:
-    entries = normalize_watchlist(watchlist)
+    """Fetch the current Nasdaq-100 membership from Nasdaq's public endpoint."""
+
+    if str(universe_code).strip().upper() not in {"NASDAQ100", "NDX"}:
+        return [], f"美股首版仅支持 NASDAQ100 动态成分，收到 {universe_code!r}"
+    request = urllib.request.Request(
+        NASDAQ_100_URL,
+        headers={
+            "Accept": "application/json,text/plain,*/*",
+            "Referer": "https://www.nasdaq.com/market-activity/quotes/nasdaq-ndx-index",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        },
+    )
+    opener = urlopen_func or urllib.request.urlopen
+    try:
+        with opener(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, TimeoutError, socket.timeout, json.JSONDecodeError) as exc:
+        return [], str(exc)
+    data = ((payload.get("data") or {}).get("data") or {})
+    rows = data.get("rows") or []
+    quotes: list[dict] = []
+    for raw in rows[: max(1, int(limit))]:
+        try:
+            symbol = normalize_stock_symbol(raw.get("symbol"), US_MARKET)
+        except ValueError:
+            continue
+        price = _market_number(raw.get("lastSalePrice"))
+        percent = _market_number(raw.get("percentageChange"))
+        change = _market_number(raw.get("netChange"))
+        if str(raw.get("deltaIndicator") or "").strip().lower() == "down":
+            percent = -abs(percent)
+            change = -abs(change)
+        market_cap = _market_number(raw.get("marketCap"))
+        quotes.append(
+            {
+                "symbol": symbol,
+                "name": str(raw.get("companyName") or symbol),
+                "sector": board_name,
+                "sectors": [board_name],
+                "price": price,
+                "percent": percent,
+                "change": change,
+                "volume": 0,
+                "turnover": 0.0,
+                "turnover_rate": 0.0,
+                "volume_ratio": 0.0,
+                "pe": 0.0,
+                "pb": 0.0,
+                "amplitude": 0.0,
+                "high": 0.0,
+                "low": 0.0,
+                "open": 0.0,
+                "prev_close": price - change if price > 0 else 0.0,
+                "total_market_cap": market_cap,
+                "float_market_cap": market_cap,
+                "market": US_MARKET,
+                "currency": "USD",
+                "source": f"Nasdaq {board_name}动态成分",
+            }
+        )
+    quotes.sort(key=lambda item: item["symbol"])
+    return (quotes, None) if quotes else ([], "Nasdaq returned no usable Nasdaq-100 rows")
+
+
+def fetch_sina_us_quotes(
+    *,
+    symbols: Iterable[object],
+    board_name: str = "纳斯达克100",
+    source_label: str | None = None,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    urlopen_func: Callable | None = None,
+) -> tuple[list[dict], str | None]:
+    entries = normalize_watchlist(symbols, market=US_MARKET)
+    metadata = {item["symbol"]: item for item in entries}
+    if not metadata:
+        return [], "美股代码列表为空"
+    opener = urlopen_func or urllib.request.urlopen
+    source = source_label or "新浪财经美股实时行情"
+    batch_size = max(1, int(os.getenv("STOCK_AGENT_SINA_US_QUOTE_BATCH_SIZE", "80")))
+    quotes: list[dict] = []
+    errors: list[str] = []
+    tickers = list(metadata)
+    for offset in range(0, len(tickers), batch_size):
+        batch = tickers[offset : offset + batch_size]
+        quote_symbols = [f"gb_{symbol.lower().replace('.', '$')}" for symbol in batch]
+        params = urllib.parse.urlencode({"list": ",".join(quote_symbols)}, safe=",")
+        request = urllib.request.Request(
+            f"https://hq.sinajs.cn/?{params}",
+            headers={
+                "Accept": "*/*",
+                "Referer": "https://finance.sina.com.cn/stock/usstock/",
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+            },
+        )
+        try:
+            with opener(request, timeout=timeout) as response:
+                text = response.read().decode("gb18030", errors="replace")
+        except (OSError, TimeoutError, socket.timeout) as exc:
+            errors.append(str(exc))
+            continue
+        for match in re.finditer(r'var hq_str_gb_([a-z0-9_$.-]+)="(.*?)";', text, flags=re.I | re.S):
+            raw_symbol = match.group(1).replace("$", ".")
+            try:
+                symbol = normalize_stock_symbol(raw_symbol, US_MARKET)
+            except ValueError:
+                continue
+            fields = match.group(2).split(",")
+            if len(fields) < 15:
+                continue
+            configured = metadata.get(symbol) or {}
+            price = number(fields[1])
+            percent = number(fields[2])
+            change = number(fields[4])
+            open_price = number(fields[5])
+            high = number(fields[6])
+            low = number(fields[7])
+            volume = int(
+                number(fields[27])
+                if len(fields) > 27 and number(fields[27]) > 0
+                else number(fields[10])
+            )
+            market_cap = number(fields[12])
+            pe = number(fields[14])
+            prev_close = number(fields[26]) if len(fields) > 26 else price - change
+            turnover = (
+                number(fields[30])
+                if len(fields) > 30 and number(fields[30]) > 0
+                else price * volume
+            )
+            if price <= 0 or volume <= 0:
+                continue
+            sector = str(configured.get("sector") or board_name)
+            sectors = configured.get("sectors") or ([sector] if sector else [])
+            amplitude = ((high - low) / prev_close * 100) if prev_close > 0 and high > 0 and low > 0 else 0.0
+            quotes.append(
+                {
+                    "symbol": symbol,
+                    "name": str(configured.get("name") or fields[0].strip() or symbol),
+                    "sector": sector,
+                    "sectors": sectors,
+                    "price": round(price, 4),
+                    "percent": round(percent, 4),
+                    "change": round(change, 4),
+                    "volume": volume,
+                    "turnover": round(turnover, 2),
+                    "turnover_rate": 0.0,
+                    "volume_ratio": 0.0,
+                    "pe": round(pe, 4),
+                    "pb": 0.0,
+                    "amplitude": round(amplitude, 4),
+                    "high": round(high, 4),
+                    "low": round(low, 4),
+                    "open": round(open_price, 4),
+                    "prev_close": round(prev_close, 4),
+                    "total_market_cap": market_cap,
+                    "float_market_cap": market_cap,
+                    "market": US_MARKET,
+                    "currency": "USD",
+                    "source": source,
+                    "time": fields[3],
+                }
+            )
+    quotes.sort(key=lambda item: item["symbol"])
+    if not quotes:
+        return [], "；".join(errors) or "Sina returned no usable US quote rows"
+    error = f"新浪美股分批行情部分失败：{'；'.join(sorted(set(errors)))}" if errors else None
+    return quotes, error
+
+
+def fetch_watchlist_quotes(
+    watchlist: Iterable[object],
+    *,
+    market: object = CN_MARKET,
+    timeout: int = DEFAULT_TIMEOUT_SECONDS,
+    urlopen_func: Callable | None = None,
+) -> tuple[list[dict], str | None]:
+    normalized_market = normalize_market(market)
+    entries = normalize_watchlist(watchlist, market=normalized_market)
     if not entries:
         return [], "自选股池为空"
+    if normalized_market == US_MARKET:
+        return fetch_sina_us_quotes(
+            symbols=entries,
+            board_name="未分类",
+            source_label="新浪财经美股实时行情（自选股池）",
+            timeout=timeout,
+            urlopen_func=urlopen_func,
+        )
     return fetch_sina_fallback_quotes(
         symbols=entries,
         board_name="未分类",

@@ -7,6 +7,7 @@ from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from .market_regime import evaluate_market_regime, filter_absolute_momentum
+from .markets import market_profile, strategy_market
 from .portfolio import create_portfolio_account, plan_daily_candidates, process_market_snapshot
 from .signal_engine import extract_signal_features, rank_signal_rows, select_ranked_signals
 from .utils import number
@@ -152,6 +153,7 @@ def replay_portfolio_fold(
     if not test_dates:
         return {"days": [], "fold_return": 0.0, "benchmark_return": 0.0, "maximum_drawdown": 0.0, "coverage_complete": False, "execution_data_coverage_complete": False}
     replay_strategy = _replay_strategy(strategy, cost_multiplier)
+    profile = market_profile(strategy_market(replay_strategy))
     first_time = datetime.combine(test_dates[0], time(8, 0), tzinfo=SHANGHAI)
     account = create_portfolio_account(replay_strategy, now=first_time)
     date_index = {day: index for index, day in enumerate(all_dates)}
@@ -225,14 +227,14 @@ def replay_portfolio_fold(
             if not row:
                 execution_data_coverage_complete = False
                 continue
-            required_execution_fields = (
+            required_execution_fields = [
                 "entry_price",
                 "exit_price",
                 "open_volume",
                 "close_volume",
-                "upper_limit",
-                "lower_limit",
-            )
+            ]
+            if profile.has_daily_price_limits:
+                required_execution_fields.extend(["upper_limit", "lower_limit"])
             if any(row.get(field) is None for field in required_execution_fields):
                 execution_data_coverage_complete = False
             previous = history.get(cutoff_day)
@@ -242,13 +244,13 @@ def replay_portfolio_fold(
         account, _ = process_market_snapshot(
             replay_strategy,
             open_quotes,
-            now=datetime.combine(signal_day, time(9, 35), tzinfo=SHANGHAI),
+            now=datetime.combine(signal_day, time(9, 35), tzinfo=profile.timezone),
             account=account,
         )
         account, events = process_market_snapshot(
             replay_strategy,
             close_quotes,
-            now=datetime.combine(signal_day, time(15, 0), tzinfo=SHANGHAI),
+            now=datetime.combine(signal_day, profile.session_end, tzinfo=profile.timezone),
             account=account,
         )
         nav = _liquidation_nav(account)

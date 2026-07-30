@@ -4,6 +4,7 @@ import os
 import subprocess
 from typing import Callable
 
+from .markets import US_MARKET, strategy_market
 from .parameters import load_strategy_config, normalize_report_delivery
 from .runtime import strategy_runtime_issues
 
@@ -11,6 +12,18 @@ from .runtime import strategy_runtime_issues
 PLATFORM_CHANNELS = {"feishu", "telegram", "discord", "signal"}
 PORTFOLIO_TRACKING_CRON = "0 2,3,5,6,7 * * 1-5"
 PORTFOLIO_RISK_CRON = "*/5 1-7 * * 1-5"
+US_PORTFOLIO_TRACKING_CRON = "0 13-21 * * 1-5"
+US_PORTFOLIO_RISK_CRON = "*/5 13-21 * * 1-5"
+
+
+def portfolio_delivery_crons(config: dict) -> tuple[str, str]:
+    """Return broad UTC windows; the exchange-local schedule guard is final."""
+
+    if strategy_market(config) == US_MARKET:
+        # Covers both EDT (UTC-4) and EST (UTC-5). Invocations outside the
+        # active New York session are rejected by the market schedule guard.
+        return US_PORTFOLIO_TRACKING_CRON, US_PORTFOLIO_RISK_CRON
+    return PORTFOLIO_TRACKING_CRON, PORTFOLIO_RISK_CRON
 
 
 def delivery_target(config: dict) -> str:
@@ -56,9 +69,10 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
         return {"status": "unavailable", "message": "未配置 Hermes job id"}
     delivery = normalize_report_delivery(config.get("delivery"))
     execute = runner or subprocess.run
+    tracking_cron, risk_cron = portfolio_delivery_crons(config)
     auxiliary_jobs = [
-        ("tracking", os.getenv("STOCK_AGENT_HERMES_TRACKING_JOB_ID", "").strip(), PORTFOLIO_TRACKING_CRON),
-        ("risk", os.getenv("STOCK_AGENT_HERMES_RISK_JOB_ID", "").strip(), PORTFOLIO_RISK_CRON),
+        ("tracking", os.getenv("STOCK_AGENT_HERMES_TRACKING_JOB_ID", "").strip(), tracking_cron),
+        ("risk", os.getenv("STOCK_AGENT_HERMES_RISK_JOB_ID", "").strip(), risk_cron),
     ]
     runtime_issues = strategy_runtime_issues(config, execution_kind="scheduled", mode="report") if delivery["enabled"] else []
     try:

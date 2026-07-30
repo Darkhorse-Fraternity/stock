@@ -29,6 +29,7 @@ export interface Parameter {
   options: Option[]
   step: number
   scale: number
+  applicable?: boolean
 }
 
 export interface ReportDelivery {
@@ -135,6 +136,12 @@ export interface StrategySummary {
   active_parameters: number
   is_active: boolean
   delivery: ReportDelivery
+  market: {
+    code: "cn" | "us"
+    label: string
+    currency: string
+    currency_symbol: string
+  }
 }
 
 export interface StrategyLibrary {
@@ -148,6 +155,14 @@ export interface ConfigPayload {
   parameters: Parameter[]
   config: StrategyConfig
   delivery_sync?: DeliverySync
+  market: {
+    code: "cn" | "us"
+    label: string
+    timezone: string
+    currency: string
+    currency_symbol: string
+    lot_size: number
+  }
 }
 
 export interface StrategyUpdate {

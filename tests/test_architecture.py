@@ -13,6 +13,8 @@ class ArchitectureTests(unittest.TestCase):
             "stock_recommender.context",
             "stock_recommender.data_sources",
             "stock_recommender.llm",
+            "stock_recommender.market_adapters",
+            "stock_recommender.markets",
             "stock_recommender.reports",
             "stock_recommender.schedule",
             "stock_recommender.selection",

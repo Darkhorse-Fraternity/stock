@@ -3,14 +3,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Iterable
 
-from .utils import beijing_now
+from .markets import CN_MARKET, is_market_open as market_is_open, market_now
 
 
 DEFAULT_PUBLISH_HOURS = (9, 10, 11, 13, 14, 15)
-MORNING_SESSION = (9 * 60 + 30, 11 * 60 + 30)
-AFTERNOON_SESSION = (13 * 60, 15 * 60)
-
-
 def parse_publish_hours(values: str | Iterable[object] | None) -> tuple[int, ...]:
     if values is None or values == "":
         return DEFAULT_PUBLISH_HOURS
@@ -35,22 +31,19 @@ def parse_publish_hours(values: str | Iterable[object] | None) -> tuple[int, ...
     return tuple(sorted(hours))
 
 
-def is_weekday(now: datetime | None = None) -> bool:
-    return beijing_now(now).weekday() < 5
+def is_weekday(now: datetime | None = None, *, market: object = CN_MARKET) -> bool:
+    return market_now(now, market).weekday() < 5
 
 
-def is_market_open(now: datetime | None = None) -> bool:
-    current = beijing_now(now)
-    if current.weekday() >= 5:
-        return False
-    minute = current.hour * 60 + current.minute
-    return MORNING_SESSION[0] <= minute <= MORNING_SESSION[1] or AFTERNOON_SESSION[0] <= minute <= AFTERNOON_SESSION[1]
+def is_market_open(now: datetime | None = None, *, market: object = CN_MARKET) -> bool:
+    return market_is_open(now, market)
 
 
 def should_publish_now(
     now: datetime | None = None,
     *,
     publish_hours: str | Iterable[object] | None = None,
+    market: object = CN_MARKET,
 ) -> bool:
-    current = beijing_now(now)
-    return is_market_open(current) and current.hour in parse_publish_hours(publish_hours)
+    current = market_now(now, market)
+    return is_market_open(now, market=market) and current.hour in parse_publish_hours(publish_hours)

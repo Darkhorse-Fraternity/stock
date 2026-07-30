@@ -4,15 +4,23 @@ import json
 import re
 from collections.abc import Iterable, Mapping
 
+from .markets import CN_MARKET, US_MARKET, normalize_market
+
 
 _LIST_SEPARATOR = re.compile(r"[,，;；\n]+")
 _SECTOR_SEPARATOR = re.compile(r"[,，;；|\n]+")
 
 
-def normalize_stock_symbol(value: object) -> str:
+def normalize_stock_symbol(value: object, market: object = CN_MARKET) -> str:
     text = str(value or "").strip().upper()
-    match = re.fullmatch(r"(?:SH|SZ)?(\d{6})(?:\.(?:SH|SZ))?", text)
-    if not match:
+    normalized_market = normalize_market(market)
+    if normalized_market == US_MARKET:
+        text = re.sub(r"^(?:US:|\$)", "", text)
+        if not re.fullmatch(r"[A-Z][A-Z0-9]*(?:[.-][A-Z0-9]+)?", text) or len(text) > 15:
+            raise ValueError(f"无效的美股代码：{value!r}")
+        return text
+    match = re.fullmatch(r"(?:SH|SZ|BJ)?(\d{6})(?:\.(?:SH|SZ|BJ))?", text)
+    if match is None:
         raise ValueError(f"无效的 A 股代码：{value!r}")
     return match.group(1)
 
@@ -37,7 +45,7 @@ def normalize_sector_filters(values: str | Iterable[object] | None) -> list[str]
     return normalized
 
 
-def _normalize_watchlist_entry(entry: object) -> dict:
+def _normalize_watchlist_entry(entry: object, *, market: object = CN_MARKET) -> dict:
     if isinstance(entry, str):
         parts = [part.strip() for part in entry.split(":", 2)]
         item: dict[str, object] = {"symbol": parts[0]}
@@ -50,7 +58,7 @@ def _normalize_watchlist_entry(entry: object) -> dict:
     else:
         raise ValueError(f"自选股配置项必须是字符串或对象：{entry!r}")
 
-    symbol = normalize_stock_symbol(item.get("symbol") or item.get("code"))
+    symbol = normalize_stock_symbol(item.get("symbol") or item.get("code"), market)
     name = str(item.get("name") or "").strip()
     sector = str(item.get("sector") or "").strip()
     sectors = normalize_sector_filters(item.get("sectors") or item.get("tags"))
@@ -69,16 +77,19 @@ def _normalize_watchlist_entry(entry: object) -> dict:
     return normalized
 
 
-def normalize_watchlist(entries: str | Iterable[object] | None) -> list[dict]:
+def normalize_watchlist(
+    entries: str | Iterable[object] | None,
+    market: object = CN_MARKET,
+) -> list[dict]:
     if entries is None:
         return []
     if isinstance(entries, str):
-        return parse_watchlist(entries)
+        return parse_watchlist(entries, market=market)
 
     normalized: list[dict] = []
     by_symbol: dict[str, dict] = {}
     for entry in entries:
-        item = _normalize_watchlist_entry(entry)
+        item = _normalize_watchlist_entry(entry, market=market)
         symbol = item["symbol"]
         existing = by_symbol.get(symbol)
         if existing is None:
@@ -102,7 +113,7 @@ def normalize_watchlist(entries: str | Iterable[object] | None) -> list[dict]:
     return normalized
 
 
-def parse_watchlist(value: str | None) -> list[dict]:
+def parse_watchlist(value: str | None, market: object = CN_MARKET) -> list[dict]:
     text = str(value or "").strip()
     if not text:
         return []
@@ -121,12 +132,15 @@ def parse_watchlist(value: str | None) -> list[dict]:
                     entries.append({"symbol": symbol, "sector": metadata})
                 else:
                     entries.append({"symbol": symbol})
-            return normalize_watchlist(entries)
+            return normalize_watchlist(entries, market=market)
         if not isinstance(decoded, list):
             raise ValueError("STOCK_AGENT_WATCHLIST JSON 必须是数组或股票代码映射")
-        return normalize_watchlist(decoded)
+        return normalize_watchlist(decoded, market=market)
 
-    return normalize_watchlist(item for item in _LIST_SEPARATOR.split(text) if item.strip())
+    return normalize_watchlist(
+        (item for item in _LIST_SEPARATOR.split(text) if item.strip()),
+        market=market,
+    )
 
 
 def row_sector_tags(row: Mapping[str, object]) -> list[str]:
@@ -152,14 +166,18 @@ def filter_rows_by_sector(rows: Iterable[dict], sector_filters: str | Iterable[o
     return [row for row in rows if row_matches_sector(row, sector_filters)]
 
 
-def constrain_to_watchlist(rows: Iterable[dict], watchlist: str | Iterable[object]) -> list[dict]:
-    entries = normalize_watchlist(watchlist)
+def constrain_to_watchlist(
+    rows: Iterable[dict],
+    watchlist: str | Iterable[object],
+    market: object = CN_MARKET,
+) -> list[dict]:
+    entries = normalize_watchlist(watchlist, market=market)
     metadata = {item["symbol"]: item for item in entries}
     constrained: list[dict] = []
     seen: set[str] = set()
     for row in rows:
         try:
-            symbol = normalize_stock_symbol(row.get("symbol"))
+            symbol = normalize_stock_symbol(row.get("symbol"), market)
         except ValueError:
             continue
         configured = metadata.get(symbol)

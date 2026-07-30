@@ -10,13 +10,14 @@ from datetime import datetime
 from typing import Callable, Iterable
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME
-from .data_sources import fetch_watchlist_quotes
 from .enrichment import enrich_candidates
+from .market_adapters import get_market_adapter
+from .markets import CN_MARKET, market_profile, order_session_date, strategy_market
 from .parameters import chase_risk_threshold, load_strategy_config, parameter_value
 from .recommendation import RecommendationPlan, build_recommendation_plan
 from .selection import analyze_candidates, attach_ignition_signals, filter_candidates, missing_required_parameter_data, price_position
-from .universe import constrain_to_watchlist, normalize_sector_filters, normalize_watchlist
-from .universe_provider import BoardUniverseProvider, UniverseQuoteBatch
+from .universe import normalize_sector_filters
+from .universe_provider import BoardUniverseProvider, Nasdaq100UniverseProvider, UniverseQuoteBatch
 from .utils import beijing_now, number
 
 
@@ -50,9 +51,10 @@ def prepare_candidates(
     enrich_limit: int | None = None,
     sector_filters: str | Iterable[object] | None = None,
     signal_cutoff=None,
+    market: object = CN_MARKET,
 ) -> CandidatePreparation:
     current = strategy if strategy is not None else load_strategy_config()
-    missing = missing_required_parameter_data(rows, current)
+    missing = missing_required_parameter_data(rows, current, market=market)
     if missing:
         return CandidatePreparation(
             filtered=(),
@@ -64,7 +66,13 @@ def prepare_candidates(
             strategy_filtered_count=0,
             error="行情缺少已启用参数数据：" + "、".join(missing),
         )
-    basic = filter_candidates(rows, current, include_enriched=False, sector_filters=sector_filters)
+    basic = filter_candidates(
+        rows,
+        current,
+        include_enriched=False,
+        sector_filters=sector_filters,
+        market=market,
+    )
     enriched = enrich_candidates(
         basic,
         strategy=current,
@@ -72,9 +80,15 @@ def prepare_candidates(
         financial_fetcher=financial_fetcher,
         limit=enrich_limit,
         signal_cutoff=signal_cutoff,
+        market=market,
     )
     history_ready = [row for row in enriched if isinstance(row.get("signal_features"), dict)]
-    filtered = filter_candidates(enriched, current, sector_filters=sector_filters)
+    filtered = filter_candidates(
+        enriched,
+        current,
+        sector_filters=sector_filters,
+        market=market,
+    )
     errors = [message for row in enriched for message in row.get("enrichment_errors", [])]
     enrichment_error = None
     if basic and not history_ready and errors:
@@ -195,30 +209,42 @@ def collect_analyzed_candidates(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
-    universe_provider: BoardUniverseProvider | None = None,
+    universe_provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
 ) -> CandidateCollection:
     report_time = beijing_now(now)
     strategy = strategy or load_strategy_config()
+    market = strategy_market(strategy)
+    adapter = get_market_adapter(market)
+    history_client = history_fetcher or adapter.fetch_history
+    signal_cutoff = order_session_date(report_time, market)
+    board_code, board_name = adapter.resolve_universe(
+        strategy,
+        code=board_code,
+        name=board_name,
+    )
     configured_watchlist = watchlist if watchlist is not None else parameter_value(strategy, "watchlist", [])
     configured_sectors = sector_filters if sector_filters is not None else parameter_value(strategy, "sector_filters", [])
-    watchlist_entries = normalize_watchlist(configured_watchlist)
+    watchlist_entries = adapter.normalize_watchlist(configured_watchlist)
     sectors = normalize_sector_filters(configured_sectors)
 
     if watchlist_entries:
-        fetcher = watchlist_fetcher or fetch_watchlist_quotes
         try:
-            rows, error = fetcher(watchlist_entries)
+            rows, error = adapter.fetch_watchlist(
+                watchlist_entries,
+                fetcher=watchlist_fetcher,
+            )
         except Exception as exc:
             rows, error = [], str(exc)
-        rows = constrain_to_watchlist(rows, watchlist_entries)
+        rows = adapter.constrain_watchlist(rows, watchlist_entries)
         prepared = prepare_candidates(
             rows,
             strategy=strategy,
-            history_fetcher=history_fetcher,
+            history_fetcher=history_client,
             financial_fetcher=financial_fetcher,
             enrich_limit=enrich_limit,
             sector_filters=sectors,
-            signal_cutoff=report_time.date(),
+            signal_cutoff=signal_cutoff,
+            market=market,
         )
         if prepared.error:
             error = prepared.error
@@ -266,18 +292,25 @@ def collect_analyzed_candidates(
                 if not rows and fallback_fetcher is not None
                 else None
             ),
+            market=market,
         )
     else:
-        batch = BoardUniverseProvider().fetch(board_code, board_name=board_name, now=report_time)
+        batch = adapter.fetch_universe(
+            strategy,
+            code=board_code,
+            name=board_name,
+            now=report_time,
+        )
 
     prepared = prepare_candidates(
         list(batch.rows),
         strategy=strategy,
-        history_fetcher=history_fetcher,
+        history_fetcher=history_client,
         financial_fetcher=financial_fetcher,
         enrich_limit=enrich_limit,
         sector_filters=sectors,
-        signal_cutoff=report_time.date(),
+        signal_cutoff=signal_cutoff,
+        market=market,
     )
     error = batch.error or prepared.error
     analyses = analyze_candidates(prepared.filtered, strategy=strategy)
@@ -318,12 +351,19 @@ def collect_recommendation_plan(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
-    universe_provider: BoardUniverseProvider | None = None,
+    universe_provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
 ) -> RecommendationPlan:
     current = strategy if strategy is not None else load_strategy_config()
+    market = strategy_market(current)
+    adapter = get_market_adapter(market)
+    board_code, board_name = adapter.resolve_universe(
+        current,
+        code=board_code,
+        name=board_name,
+    )
     configured_watchlist = watchlist if watchlist is not None else parameter_value(current, "watchlist", [])
     configured_sectors = sector_filters if sector_filters is not None else parameter_value(current, "sector_filters", [])
-    watchlist_entries = normalize_watchlist(configured_watchlist)
+    watchlist_entries = adapter.normalize_watchlist(configured_watchlist)
     sectors = normalize_sector_filters(configured_sectors)
     collection = collect_analyzed_candidates(
         now=now,
@@ -353,6 +393,7 @@ def collect_recommendation_plan(
         data_quality=collection.data_quality,
         candidate_limit=candidate_limit,
         selection_limit=selection_limit,
+        market=market,
     )
     return plan
 
@@ -365,6 +406,8 @@ def enrich_recommendation_plan_with_ticks(
 ) -> RecommendationPlan:
     """Attach optional intraday tick commentary without changing admission."""
 
+    if not market_profile(plan.market).supports_tick_ignition:
+        return plan
     candidates = [deepcopy(item) for item in plan.candidates]
     attach_ignition_signals(candidates, tick_fetcher=tick_fetcher, tick_limit=tick_limit)
     by_symbol = {str(item.get("symbol")): item for item in candidates}
@@ -373,6 +416,7 @@ def enrich_recommendation_plan_with_ticks(
 
 
 def recommendation_context_payload(plan: RecommendationPlan) -> dict:
+    profile = market_profile(plan.market)
     return {
         "generated_at": plan.generated_at.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "universe_type": plan.universe_type,
@@ -380,6 +424,10 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
         "sector_filters": list(plan.sector_filters),
         "board_code": plan.board_code,
         "board_name": plan.board_name,
+        "market": plan.market,
+        "market_label": profile.label,
+        "currency": profile.currency,
+        "currency_symbol": profile.currency_symbol,
         "source": list(plan.sources),
         "fetch_error": plan.fetch_error,
         "candidate_count": len(plan.candidates),
@@ -404,7 +452,7 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
                 "amplitude": number(item.get("amplitude")),
                 "float_market_cap_cny": number(item.get("float_market_cap")),
                 "source": item.get("source"),
-                "price_position": price_position(item),
+                "price_position": price_position(item, market=plan.market),
                 "ignition_signal": item.get("ignition_signal"),
                 "technical": {
                     "ma5": item.get("ma5"),
@@ -445,13 +493,24 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
 def generate_agent_context_from_plan(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:
     current = strategy if strategy is not None else load_strategy_config()
     payload = recommendation_context_payload(plan)
+    profile = market_profile(plan.market)
     chase_threshold = chase_risk_threshold(current)
     threshold_text = f"{chase_threshold:g}%"
-    universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}板块"
+    universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}股票池"
     filter_label = f"，板块过滤为 {'、'.join(plan.sector_filters)}" if plan.sector_filters else ""
+    data_scope_instruction = (
+        "技术指标统一使用前复权日线；财务指标使用最新已披露报告期，二者时间口径不得混淆。"
+        if profile.code == CN_MARKET
+        else "技术指标使用美股日线；未接入的财务指标已标记为不适用，不得虚构。"
+    )
+    execution_instruction = (
+        "5. 可解释已接入的 10 秒逐笔量价点火，但不得改变已确定的股票列表。"
+        if profile.supports_tick_ignition
+        else "5. 当前市场未接入逐笔点火数据，不得虚构相关成交或盘口判断。"
+    )
     return "\n".join(
         [
-            f"下面是北京时间 {plan.generated_at.strftime('%Y-%m-%d %H:%M')} 拉取的 A 股 {universe_label}候选数据{filter_label}。",
+            f"下面是北京时间 {plan.generated_at.strftime('%Y-%m-%d %H:%M')} 拉取的{profile.label} {universe_label}候选数据{filter_label}。",
             "这些只是结构化行情和机器初筛信号，不是最终投资建议。",
             "",
             "MARKET_DATA_JSON:",
@@ -462,12 +521,13 @@ def generate_agent_context_from_plan(plan: RecommendationPlan, *, strategy: dict
             "请解释 factor_rank_v1 已确定的 portfolio_candidates；不得增删或替换股票：",
             "1. 逐只解释 portfolio_candidates，AI 只生成说明与风险提示，不参与入池决策。",
             "2. 必须区分短线热度、追高风险、流动性、估值风险。",
-            "技术指标统一使用前复权日线；财务指标使用最新已披露报告期，二者时间口径不得混淆。",
+            data_scope_instruction,
             f"3. 对涨幅超过 {threshold_text} 的股票，默认按高风险处理，除非有充分理由。",
             f"4. 硬规则：涨幅超过 {threshold_text} 的股票不得建议中仓或重仓，只能建议观望或轻仓试错。",
-            "5. 如果所有强信号股票都已大涨，优先输出“今日不建议追高”。",
-            "6. 输出包含：推荐排序、理由、风险、建议仓位、免责声明。",
-            "7. 每只推荐股票必须带 6 位股票代码，便于后续每小时跟踪成交量和涨跌幅。",
+            execution_instruction,
+            "6. 如果所有强信号股票都已大涨，优先输出“今日不建议追高”。",
+            "7. 输出包含：推荐排序、理由、风险、建议仓位、免责声明。",
+            "8. 每只推荐股票必须带标准证券代码，便于后续在对应市场开市期间跟踪成交量和涨跌幅。",
         ]
     )
 
@@ -490,7 +550,7 @@ def generate_agent_context(
     watchlist: str | Iterable[object] | None = None,
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
-    universe_provider: BoardUniverseProvider | None = None,
+    universe_provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
 ) -> str:
     current = strategy or load_strategy_config()
     selection_limit = int(current.get("validation", {}).get("top_n", 3))

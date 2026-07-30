@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import json
 import math
 import os
+import re
+import socket
 import statistics
 import time
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import date, datetime
 from typing import Callable, Iterable
 
+from .config import SINA_US_HISTORY_URL
 from .market_history import fetch_daily_history_with_cache
+from .markets import CN_MARKET, US_MARKET, normalize_market, parameter_applicable
 from .parameters import load_strategy_config
 from .signal_engine import extract_signal_features, normalize_signal_history
+from .data_sources import akshare_symbol
 
 
 TECHNICAL_PARAMETER_IDS = {
@@ -228,9 +236,98 @@ def _download_daily_history(symbol: str) -> list[dict]:
         raise RuntimeError(f"东方财富日线不可用：{primary_error}") from primary_error
 
 
+def _download_us_daily_history(symbol: str) -> list[dict]:
+    normalized_symbol = str(symbol or "").strip().upper()
+    callback = f"var _{re.sub(r'[^A-Z0-9]', '_', normalized_symbol)}="
+    params = urllib.parse.urlencode(
+        {
+            "symbol": normalized_symbol,
+            "___qn": "3",
+        }
+    )
+    url = (
+        f"{SINA_US_HISTORY_URL}/"
+        f"{urllib.parse.quote(callback, safe='_=')}/US_MinKService.getDailyK?{params}"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "*/*",
+            "Referer": f"https://stock.finance.sina.com.cn/usstock/quotes/{normalized_symbol}.html",
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+        },
+    )
+    try:
+        with urllib.request.urlopen(
+            request,
+            timeout=float(os.getenv("STOCK_AGENT_ENRICH_TIMEOUT", "8")),
+        ) as response:
+            text = response.read().decode("utf-8", errors="replace")
+    except (OSError, TimeoutError, socket.timeout) as exc:
+        raise RuntimeError(f"新浪美股日线不可用：{exc}") from exc
+    start = text.find("=(")
+    end = text.rfind(");")
+    if start < 0 or end <= start:
+        raise RuntimeError("新浪美股日线响应格式无效")
+    try:
+        payload = json.loads(text[start + 2 : end])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("新浪美股日线 JSON 无法解析") from exc
+    if not isinstance(payload, list):
+        raise RuntimeError("新浪美股日线返回错误")
+    rows = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        rows.append(
+            {
+                "date": item.get("d"),
+                "open": item.get("o"),
+                "close": item.get("c"),
+                "high": item.get("h"),
+                "low": item.get("l"),
+                "volume": item.get("v"),
+                "turnover": item.get("a"),
+            }
+        )
+    if not rows:
+        raise RuntimeError("新浪美股日线返回空数据")
+    return rows
+
+
+def download_cn_sina_daily_history(
+    symbol: str,
+    *,
+    now: datetime,
+) -> list[dict]:
+    from datetime import timedelta
+
+    import akshare as ak
+
+    frame = ak.stock_zh_a_daily(
+        symbol=akshare_symbol(symbol),
+        start_date=(now.date() - timedelta(days=550)).strftime("%Y%m%d"),
+        end_date=(now.date() + timedelta(days=1)).strftime("%Y%m%d"),
+        adjust="qfq",
+    )
+    return [
+        {
+            "date": row.get("date"),
+            "open": row.get("open"),
+            "close": row.get("close"),
+            "high": row.get("high"),
+            "low": row.get("low"),
+            "volume": row.get("volume"),
+            "turnover": row.get("amount"),
+        }
+        for _, row in frame.iterrows()
+    ]
+
+
 def fetch_daily_history(
     symbol: str,
     *,
+    market: object | None = None,
     cache_dir=None,
     cache_ttl_seconds: float | None = None,
     attempts: int | None = None,
@@ -240,6 +337,9 @@ def fetch_daily_history(
     now: datetime | None = None,
     force_refresh: bool = False,
 ) -> list[dict]:
+    normalized_market = normalize_market(
+        market if market is not None else (US_MARKET if not str(symbol).isdigit() else CN_MARKET)
+    )
     ttl = (
         float(cache_ttl_seconds)
         if cache_ttl_seconds is not None
@@ -255,7 +355,9 @@ def fetch_daily_history(
         if backoff_seconds is not None
         else float(os.getenv("STOCK_AGENT_HISTORY_FETCH_BACKOFF_SECONDS", "1"))
     )
-    loader = downloader or _download_daily_history
+    loader = downloader or (
+        _download_us_daily_history if normalized_market == US_MARKET else _download_daily_history
+    )
     options = {}
     if sleep is not None:
         options["sleep"] = sleep
@@ -304,15 +406,26 @@ def enrich_candidates(
     financial_fetcher: Callable[[str], dict] | None = None,
     limit: int | None = None,
     signal_cutoff: date | datetime | str | None = None,
+    market: object = CN_MARKET,
 ) -> list[dict]:
     current = strategy or load_strategy_config()
+    normalized_market = normalize_market(market)
     needs_technical = _requires(current, TECHNICAL_PARAMETER_IDS)
-    needs_financial = _requires(current, FINANCIAL_PARAMETER_IDS)
+    needs_financial = _requires(
+        current,
+        {
+            parameter_id
+            for parameter_id in FINANCIAL_PARAMETER_IDS
+            if parameter_applicable(parameter_id, normalized_market)
+        },
+    )
     candidates = [dict(row) for row in rows]
 
     configured_limit = int(os.getenv("STOCK_AGENT_SIGNAL_UNIVERSE_LIMIT", "0"))
     maximum = limit if limit is not None else (configured_limit if configured_limit > 0 else len(candidates))
     target_count = min(len(candidates), max(0, maximum))
+    # The default history loader infers US tickers and preserves the simple
+    # one-argument callable contract used by injected test/data providers.
     history_client = history_fetcher or fetch_daily_history
     financial_client = financial_fetcher or fetch_financial_record
     signal_config = current.get("signal", {})
@@ -334,6 +447,8 @@ def enrich_candidates(
                 row["signal_features"] = features
             if needs_technical:
                 row.update(calculate_technical_indicators(signal_history))
+                if normalized_market == US_MARKET:
+                    row["technical_source"] = "新浪财经美股日线"
         except Exception as exc:
             errors.append(f"signal: {exc}")
         if needs_financial:

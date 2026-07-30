@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from .config import MAX_FLOAT_MARKET_CAP, MIN_FLOAT_MARKET_CAP
+from .markets import (
+    CN_MARKET,
+    US_MARKET,
+    market_profile,
+    parameter_applicable,
+    strategy_market,
+)
 
 
 GROUPS = [
@@ -60,9 +67,10 @@ def _parameter(
 
 
 PARAMETER_CATALOG = [
+    _parameter("market", "universe", "证券市场", kind="choice", operator="equals", default="cn", active=True, status="live", options=[{"value": "cn", "label": "A股"}, {"value": "us", "label": "美股"}], description="决定代码格式、行情与历史数据源、交易时区、币种及模拟撮合规则"),
     _parameter("board_code", "universe", "板块代码", kind="text", operator="equals", default="BK0800", active=True, status="live", description="当前东方财富概念板块代码"),
     _parameter("board_name", "universe", "板块名称", kind="text", operator="equals", default="人工智能", active=True, status="live", description="默认覆盖科技 AI 方向的人工智能概念板块"),
-    _parameter("watchlist", "universe", "自选股池", kind="tags", operator="in", default=[], status="live", description="填写 6 位股票代码；启用后仅在自选股池中筛选"),
+    _parameter("watchlist", "universe", "自选股池", kind="tags", operator="in", default=[], status="live", description="A 股填写 6 位代码；美股填写 ticker（如 AAPL、MSFT）；启用后仅在自选股池中筛选"),
     _parameter("sector_filters", "universe", "板块过滤", kind="tags", operator="in", default=[], status="live", description="按股票的板块或概念标签过滤，支持多个关键词"),
     _parameter("stock_prefixes", "universe", "股票代码范围", kind="multi", operator="in", default=["0", "3", "6"], active=True, status="live", options=[{"value": "0", "label": "深市主板"}, {"value": "3", "label": "创业板"}, {"value": "6", "label": "沪市/科创板"}, {"value": "8", "label": "北交所"}], description="按证券代码前缀限制市场"),
     _parameter("exclude_st", "universe", "排除 ST/*ST", kind="boolean", operator="equals", default=True, active=True, status="live", description="剔除特别处理股票"),
@@ -942,6 +950,7 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
     summaries = []
     for strategy in store["strategies"]:
         active_parameters = sum(1 for state in strategy["parameters"].values() if state.get("enabled"))
+        profile = market_profile(strategy_market(strategy))
         summaries.append(
             {
                 "id": strategy["id"],
@@ -960,6 +969,12 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
                 "active_parameters": active_parameters,
                 "is_active": strategy["id"] == store["active_strategy_id"],
                 "delivery": deepcopy(strategy["delivery"]),
+                "market": {
+                    "code": profile.code,
+                    "label": profile.label,
+                    "currency": profile.currency,
+                    "currency_symbol": profile.currency_symbol,
+                },
             }
         )
     return {"active_strategy_id": store["active_strategy_id"], "strategies": summaries}
@@ -990,6 +1005,14 @@ def convert_strategy_text(text: str) -> dict:
 
     def set_value(parameter_id: str, value: Any, reason: str) -> None:
         updates[parameter_id] = {"id": parameter_id, "enabled": True, "value": value, "reason": reason}
+
+    market_match = re.search(r"美股|美国股票|纳斯达克|NASDAQ", content, flags=re.I)
+    if market_match:
+        set_value("market", US_MARKET, market_match.group(0))
+    else:
+        market_match = re.search(r"A股|沪深|中国股票", content, flags=re.I)
+        if market_match:
+            set_value("market", CN_MARKET, market_match.group(0))
 
     range_patterns = [
         (r"流通市值[^\d]*(\d+(?:\.\d+)?)\s*(?:到|至|[-~—])\s*(\d+(?:\.\d+)?)\s*亿", "float_market_cap_min", "float_market_cap_max", 100_000_000),
@@ -1052,10 +1075,47 @@ def convert_strategy_text(text: str) -> dict:
 
 def catalog_payload(config: dict | None = None) -> dict:
     current = normalize_strategy_config(config or load_strategy_config())
+    market = strategy_market(current)
+    profile = market_profile(market)
     parameters = []
     for definition in PARAMETER_CATALOG:
         item = deepcopy(definition)
         item.update(current["parameters"][item["id"]])
-        item["effective"] = item["enabled"] and item["status"] in {"live", "derived"}
+        item["applicable"] = parameter_applicable(item["id"], market)
+        if item["id"] in {"price_min", "price_max"}:
+            item["unit"] = profile.currency_symbol
+        elif item["id"] == "turnover_min":
+            item["unit"] = "亿美元" if market == US_MARKET else "亿元"
+        elif item["id"] in {
+            "float_market_cap_min",
+            "float_market_cap_max",
+            "total_market_cap_min",
+            "total_market_cap_max",
+        }:
+            item["unit"] = "亿美元" if market == US_MARKET else "亿元"
+        elif item["id"] == "board_code":
+            item["label"] = "股票池代码"
+            item["description"] = (
+                "当前支持 NASDAQ100/NDX 动态成分"
+                if market == US_MARKET
+                else definition["description"]
+            )
+        item["effective"] = (
+            item["applicable"]
+            and item["enabled"]
+            and item["status"] in {"live", "derived"}
+        )
         parameters.append(item)
-    return {"groups": deepcopy(GROUPS), "config": current, "parameters": parameters}
+    return {
+        "groups": deepcopy(GROUPS),
+        "config": current,
+        "parameters": parameters,
+        "market": {
+            "code": market,
+            "label": profile.label,
+            "timezone": str(profile.timezone),
+            "currency": profile.currency,
+            "currency_symbol": profile.currency_symbol,
+            "lot_size": profile.lot_size,
+        },
+    }

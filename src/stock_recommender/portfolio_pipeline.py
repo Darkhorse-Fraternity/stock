@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .market_regime import filter_absolute_momentum, normalize_market_regime_decision
 from .pipeline import PipelineRunner, StageInput, StageOutput
+from .universe import normalize_stock_symbol
 from .utils import number
 
 
@@ -21,6 +22,7 @@ def _fact(stage_input: StageInput, kind: str) -> dict:
 @dataclass(frozen=True)
 class CandidateNormalizationStage:
     raw_candidates: tuple[dict, ...]
+    symbol_normalizer: Callable[[object], str] = normalize_stock_symbol
     name: str = "candidate_normalization"
     component_version: str = "1.0.0"
 
@@ -29,9 +31,13 @@ class CandidateNormalizationStage:
         used: set[str] = set()
         rejected = 0
         for rank, item in enumerate(self.raw_candidates, 1):
-            symbol = str(item.get("symbol") or "").strip()
+            try:
+                symbol = self.symbol_normalizer(item.get("symbol"))
+            except (TypeError, ValueError):
+                rejected += 1
+                continue
             price = number(item.get("price"), default=number(item.get("entry_price")))
-            if len(symbol) != 6 or not symbol.isdigit() or symbol in used or price <= 0:
+            if symbol in used or price <= 0:
                 rejected += 1
                 continue
             used.add(symbol)
@@ -142,12 +148,16 @@ def run_entry_pipeline(
     run_id: str,
     as_of: str,
     market_regime: dict,
+    symbol_normalizer: Callable[[object], str] = normalize_stock_symbol,
 ) -> tuple[list[dict], list[dict], list[dict]]:
     config = account["portfolio_config"]
     decision = normalize_market_regime_decision(market_regime, strategy)
     runner = PipelineRunner(
         [
-            CandidateNormalizationStage(tuple(dict(item) for item in candidates)),
+            CandidateNormalizationStage(
+                tuple(dict(item) for item in candidates),
+                symbol_normalizer=symbol_normalizer,
+            ),
             MarketRegimeStage(strategy, decision),
             PortfolioCapacityStage(int(config["max_positions"]), number(config["target_weight_pct"])),
             RiskAdmissionStage(bool(config.get("enabled", True)), str(account.get("trading_mode", "RUNNING"))),
