@@ -549,7 +549,7 @@ def load_current_universe_dataset(strategy: dict) -> dict:
     adapter = get_market_adapter(market)
     watchlist = adapter.normalize_watchlist(parameter_value(strategy, "watchlist", []))
     if watchlist:
-        rows, error = adapter.fetch_watchlist(watchlist)
+        rows, error = adapter.fetch_watchlist(watchlist, strategy=strategy)
     else:
         board_code, board_name = adapter.resolve_universe(strategy)
         batch = adapter.fetch_universe(
@@ -578,7 +578,14 @@ def load_current_universe_dataset(strategy: dict) -> dict:
     errors = []
     configured_workers = max(1, int(os.getenv("STOCK_AGENT_HISTORY_FETCH_WORKERS", "2")))
     with ThreadPoolExecutor(max_workers=min(configured_workers, len(symbols)), thread_name_prefix="stock-backtest") as executor:
-        futures = {executor.submit(adapter.fetch_history, symbol): symbol for symbol in symbols}
+        futures = {
+            executor.submit(
+                adapter.fetch_history,
+                symbol,
+                strategy=strategy,
+            ): symbol
+            for symbol in symbols
+        }
         for future in as_completed(futures):
             symbol = futures[future]
             try:

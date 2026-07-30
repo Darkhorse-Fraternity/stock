@@ -10,6 +10,30 @@ export interface Group {
 export interface Option {
   value: string
   label: string
+  description?: string
+  disabled?: boolean
+}
+
+export type UsDataSourcePolicy = "auto" | "alpaca" | "sina"
+
+export interface UsMarketDataProviderStatus {
+  id: "alpaca" | "sina"
+  label: string
+  available: boolean
+  plan: string
+  requires_credentials: boolean
+}
+
+export interface UsMarketDataStatus {
+  selected_policy: UsDataSourcePolicy
+  primary: "alpaca" | "sina"
+  fallback: "sina" | ""
+  effective_source: "alpaca" | "sina" | "unavailable"
+  mode: "primary_ready" | "degraded_fallback" | "unavailable"
+  alpaca_configured: boolean
+  alpaca_feed: string
+  alpaca_history_feed: string
+  providers: UsMarketDataProviderStatus[]
 }
 
 export interface Parameter {
@@ -142,6 +166,7 @@ export interface StrategySummary {
     currency: string
     currency_symbol: string
   }
+  us_market_data?: UsMarketDataStatus | null
 }
 
 export interface StrategyLibrary {
@@ -163,6 +188,7 @@ export interface ConfigPayload {
     currency_symbol: string
     lot_size: number
   }
+  us_market_data: UsMarketDataStatus
 }
 
 export interface StrategyUpdate {

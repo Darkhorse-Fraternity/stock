@@ -17,6 +17,14 @@ from .utils import number
 
 DEFAULT_ALPACA_DATA_URL = "https://data.alpaca.markets"
 _PROVIDER_LABELS = {"alpaca": "Alpaca", "sina": "新浪"}
+US_DATA_SOURCE_AUTO = "auto"
+US_DATA_SOURCE_ALPACA = "alpaca"
+US_DATA_SOURCE_SINA = "sina"
+US_DATA_SOURCE_POLICIES = {
+    US_DATA_SOURCE_AUTO,
+    US_DATA_SOURCE_ALPACA,
+    US_DATA_SOURCE_SINA,
+}
 
 
 class UsMarketDataProvider(ABC):
@@ -507,7 +515,33 @@ class FailoverUsMarketDataProvider(UsMarketDataProvider):
         raise RuntimeError(f"{symbol} 美股日线主源返回空数据")
 
 
-def get_us_market_data_provider() -> UsMarketDataProvider:
+def normalize_us_data_source_policy(value: object = None) -> str:
+    policy = str(value or US_DATA_SOURCE_AUTO).strip().lower()
+    if policy not in US_DATA_SOURCE_POLICIES:
+        raise ValueError(f"不支持的美股数据源策略：{policy}")
+    return policy
+
+
+def strategy_us_data_source(strategy: dict | None) -> str:
+    state = (strategy or {}).get("parameters", {}).get("us_data_source", {})
+    value = state.get("value") if isinstance(state, dict) else state
+    return normalize_us_data_source_policy(value)
+
+
+def get_us_market_data_provider(
+    policy: object | None = None,
+) -> UsMarketDataProvider:
+    if policy is not None:
+        selected = normalize_us_data_source_policy(policy)
+        if selected == US_DATA_SOURCE_ALPACA:
+            return AlpacaUsMarketDataProvider()
+        if selected == US_DATA_SOURCE_SINA:
+            return SinaUsMarketDataProvider()
+        return FailoverUsMarketDataProvider(
+            AlpacaUsMarketDataProvider(),
+            SinaUsMarketDataProvider(),
+        )
+
     primary_name = str(
         os.getenv("STOCK_AGENT_US_DATA_PRIMARY", "alpaca")
     ).strip().lower()
@@ -528,24 +562,69 @@ def get_us_market_data_provider() -> UsMarketDataProvider:
     return FailoverUsMarketDataProvider(primary, providers[fallback_name])
 
 
-def us_market_data_status() -> dict:
+def us_market_data_status(policy: object | None = None) -> dict:
     api_key, api_secret = _alpaca_credentials()
-    primary = str(
-        os.getenv("STOCK_AGENT_US_DATA_PRIMARY", "alpaca")
-    ).strip().lower()
-    fallback = str(
-        os.getenv("STOCK_AGENT_US_DATA_FALLBACK", "sina")
-    ).strip().lower()
     alpaca_configured = bool(api_key and api_secret)
+    if policy is None:
+        primary = str(
+            os.getenv("STOCK_AGENT_US_DATA_PRIMARY", "alpaca")
+        ).strip().lower()
+        fallback = str(
+            os.getenv("STOCK_AGENT_US_DATA_FALLBACK", "sina")
+        ).strip().lower()
+        selected_policy = (
+            US_DATA_SOURCE_AUTO
+            if primary == US_DATA_SOURCE_ALPACA
+            and fallback == US_DATA_SOURCE_SINA
+            else primary
+        )
+    else:
+        selected_policy = normalize_us_data_source_policy(policy)
+        primary = (
+            US_DATA_SOURCE_SINA
+            if selected_policy == US_DATA_SOURCE_SINA
+            else US_DATA_SOURCE_ALPACA
+        )
+        fallback = (
+            US_DATA_SOURCE_SINA
+            if selected_policy == US_DATA_SOURCE_AUTO
+            else ""
+        )
+    if selected_policy == US_DATA_SOURCE_SINA:
+        mode = "primary_ready"
+        effective_source = US_DATA_SOURCE_SINA
+    elif alpaca_configured:
+        mode = "primary_ready"
+        effective_source = US_DATA_SOURCE_ALPACA
+    elif selected_policy == US_DATA_SOURCE_AUTO:
+        mode = "degraded_fallback"
+        effective_source = US_DATA_SOURCE_SINA
+    else:
+        mode = "unavailable"
+        effective_source = "unavailable"
     return {
+        "selected_policy": selected_policy,
         "primary": primary,
         "fallback": fallback,
-        "mode": (
-            "primary_ready"
-            if primary != "alpaca" or alpaca_configured
-            else "degraded_fallback"
-        ),
+        "effective_source": effective_source,
+        "mode": mode,
         "alpaca_configured": alpaca_configured,
+        "providers": [
+            {
+                "id": US_DATA_SOURCE_ALPACA,
+                "label": "Alpaca",
+                "available": alpaca_configured,
+                "plan": "Basic 免费套餐",
+                "requires_credentials": True,
+            },
+            {
+                "id": US_DATA_SOURCE_SINA,
+                "label": "新浪财经",
+                "available": True,
+                "plan": "公开行情接口",
+                "requires_credentials": False,
+            },
+        ],
         "alpaca_feed": str(
             os.getenv("STOCK_AGENT_ALPACA_FEED", "iex")
         ).strip().lower(),

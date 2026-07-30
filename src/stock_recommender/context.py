@@ -215,7 +215,9 @@ def collect_analyzed_candidates(
     strategy = strategy or load_strategy_config()
     market = strategy_market(strategy)
     adapter = get_market_adapter(market)
-    history_client = history_fetcher or adapter.fetch_history
+    history_client = history_fetcher or (
+        lambda symbol: adapter.fetch_history(symbol, strategy=strategy)
+    )
     signal_cutoff = order_session_date(report_time, market)
     board_code, board_name = adapter.resolve_universe(
         strategy,
@@ -232,6 +234,7 @@ def collect_analyzed_candidates(
             rows, error = adapter.fetch_watchlist(
                 watchlist_entries,
                 fetcher=watchlist_fetcher,
+                strategy=strategy,
             )
         except Exception as exc:
             rows, error = [], str(exc)

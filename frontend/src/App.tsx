@@ -60,6 +60,8 @@ import {
   type StrategyLibrary,
   type StrategyRunStatus,
   type StrategySummary,
+  type UsDataSourcePolicy,
+  type UsMarketDataStatus,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
 
@@ -144,7 +146,7 @@ function ValueEditor({ parameter, onChange }: { parameter: Parameter; onChange: 
     return (
       <Select value={String(parameter.value)} onValueChange={onChange}>
         <SelectTrigger className="h-8 min-w-32 bg-background"><SelectValue /></SelectTrigger>
-        <SelectContent>{parameter.options.map((option) => <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>)}</SelectContent>
+        <SelectContent>{parameter.options.map((option) => <SelectItem key={option.value} value={option.value} disabled={option.disabled}>{option.label}</SelectItem>)}</SelectContent>
       </Select>
     )
   }
@@ -173,6 +175,119 @@ function ValueEditor({ parameter, onChange }: { parameter: Parameter; onChange: 
     )
   }
   return <Input className="h-8 min-w-[88px] sm:min-w-40" value={String(parameter.value ?? "")} onChange={(event) => onChange(event.target.value)} />
+}
+
+function DataSourceSettings({
+  parameter,
+  status,
+  onChange,
+}: {
+  parameter: Parameter
+  status: UsMarketDataStatus
+  onChange: (value: UsDataSourcePolicy) => void
+}) {
+  const policy = String(parameter.value || "auto") as UsDataSourcePolicy
+  const effectiveSource = policy === "sina"
+    ? "sina"
+    : status.alpaca_configured
+      ? "alpaca"
+      : policy === "auto"
+        ? "sina"
+        : "unavailable"
+  const sourceCopy = effectiveSource === "alpaca"
+    ? { label: `Alpaca ${status.alpaca_feed.toUpperCase()}`, tone: "text-emerald-700", dot: "bg-emerald-500" }
+    : effectiveSource === "sina"
+      ? { label: "新浪财经", tone: "text-amber-700", dot: "bg-amber-500" }
+      : { label: "不可用", tone: "text-destructive", dot: "bg-destructive" }
+
+  return (
+    <section className="mb-5 overflow-hidden rounded-lg border bg-background shadow-xs">
+      <div className="grid gap-0 lg:grid-cols-[minmax(280px,0.9fr)_minmax(420px,1.35fr)]">
+        <div className="border-b p-5 lg:border-b-0 lg:border-r">
+          <div className="mb-4 flex items-start justify-between gap-4">
+            <div>
+              <div className="mb-1 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+                <Database className="size-3.5" />
+                策略级数据路由
+              </div>
+              <h3 className="text-base font-semibold">美股数据源</h3>
+            </div>
+            <Badge variant={effectiveSource === "unavailable" ? "warning" : "success"}>
+              {effectiveSource === "unavailable" ? "需要配置" : "运行可用"}
+            </Badge>
+          </div>
+          <Select value={policy} onValueChange={(value: UsDataSourcePolicy) => onChange(value)}>
+            <SelectTrigger className="w-full bg-background"><SelectValue /></SelectTrigger>
+            <SelectContent>
+              {parameter.options.map((option) => (
+                <SelectItem key={option.value} value={option.value} disabled={option.disabled}>
+                  <div className="flex flex-col py-0.5">
+                    <span>{option.label}</span>
+                    {option.description && <span className="text-[11px] text-muted-foreground">{option.description}</span>}
+                  </div>
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <p className="mt-3 text-xs leading-5 text-muted-foreground">
+            选择会随策略版本保存，回测、推荐、持仓风控和盘中报告使用同一数据路由。
+          </p>
+        </div>
+
+        <div className="p-5">
+          <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs text-muted-foreground">当前实际来源</div>
+              <div className={cn("mt-1 flex items-center gap-2 text-sm font-semibold", sourceCopy.tone)}>
+                <span className={cn("size-2 rounded-full", sourceCopy.dot)} />
+                {sourceCopy.label}
+              </div>
+            </div>
+            <span className="font-mono text-[11px] text-muted-foreground">
+              policy/{policy}
+            </span>
+          </div>
+
+          <div className="relative grid grid-cols-2 gap-3 before:absolute before:left-1/2 before:top-5 before:h-px before:w-8 before:-translate-x-1/2 before:bg-border">
+            {status.providers.map((provider) => {
+              const active = provider.id === effectiveSource
+              return (
+                <div key={provider.id} className={cn("relative rounded-md border px-3 py-3", active ? "border-primary/40 bg-primary/[0.035]" : "bg-muted/20")}>
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-sm font-medium">{provider.label}</span>
+                    <span className={cn("size-2 rounded-full", provider.available ? "bg-emerald-500" : "bg-muted-foreground/35")} />
+                  </div>
+                  <div className="mt-1 text-[11px] text-muted-foreground">{provider.plan}</div>
+                  <div className="mt-2 text-[11px]">
+                    {provider.available ? "已就绪" : "未配置 API Key"}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
+          <div className={cn(
+            "mt-4 rounded-md border px-3 py-2.5 text-xs leading-5",
+            effectiveSource === "unavailable"
+              ? "border-destructive/25 bg-destructive/5 text-destructive"
+              : !status.alpaca_configured
+                ? "border-amber-200 bg-amber-50 text-amber-800"
+                : "border-emerald-200 bg-emerald-50 text-emerald-800",
+          )}>
+            {!status.alpaca_configured
+              ? policy === "auto"
+                ? "Alpaca Basic 免费，但仍需 API Key 做身份识别和限流。当前自动模式会使用新浪备用源，配置 Key 后自动切回 Alpaca。"
+                : policy === "alpaca"
+                  ? "仅 Alpaca 模式当前不可运行：请先在服务器 .env 配置 API Key。生成 Key 不代表开通付费套餐。"
+                  : "当前固定使用新浪；Alpaca Basic 免费，但需要服务器 API Key 才能使用。"
+              : policy === "sina"
+                ? "Alpaca 已就绪，但该策略按配置固定使用新浪。"
+                : "Alpaca Basic 已就绪。密钥只保存在服务器环境变量，不进入策略配置。"}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
 }
 
 function ParameterTable({ parameters, onUpdate }: { parameters: Parameter[]; onUpdate: (id: string, patch: Partial<Parameter>) => void }) {
@@ -663,6 +778,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const [dirty, setDirty] = useState(false)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [deliverySync, setDeliverySync] = useState<ConfigPayload["delivery_sync"] | null>(initialData.delivery_sync || null)
+  const [dataSourceStatus, setDataSourceStatus] = useState(initialData.us_market_data)
 
   const updateParameter = (id: string, patch: Partial<Parameter>) => {
     setParameters((current) => current.map((item) => item.id === id ? { ...item, ...patch, effective: (patch.enabled ?? item.enabled) && item.status !== "planned" } : item))
@@ -686,6 +802,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
 
   const activeCount = parameters.filter((item) => item.enabled).length
   const marketCode = String(parameters.find((item) => item.id === "market")?.value || "cn") === "us" ? "us" : "cn"
+  const dataSourceParameter = parameters.find((item) => item.id === "us_data_source")
   const isParameterApplicable = (item: Parameter) => (
     marketCode !== "us"
     || (item.applicable !== false && !usInapplicableParameters.has(item.id))
@@ -694,6 +811,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const plannedActiveCount = parameters.filter((item) => isParameterApplicable(item) && item.enabled && item.status === "planned").length
   const availableCount = parameters.filter((item) => isParameterApplicable(item) && item.status !== "planned").length
   const visibleParameters = useMemo(() => parameters.filter((item) => {
+    if (item.id === "us_data_source") return false
     if (marketCode === "us" && (item.applicable === false || usInapplicableParameters.has(item.id))) return false
     if (activeGroup !== "all" && item.group !== activeGroup) return false
     if (statusFilter === "enabled" && !item.enabled) return false
@@ -717,6 +835,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
       setParameters(payload.parameters)
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
+      setDataSourceStatus(payload.us_market_data)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
@@ -732,6 +851,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
       setParameters(payload.parameters)
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
+      setDataSourceStatus(payload.us_market_data)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
@@ -850,6 +970,13 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
               syncing={syncDeliveryMutation.isPending}
             />
           ) : <section>
+            {marketCode === "us" && dataSourceParameter && (activeGroup === "all" || activeGroup === "universe") && (
+              <DataSourceSettings
+                parameter={dataSourceParameter}
+                status={dataSourceStatus}
+                onChange={(value) => updateParameter("us_data_source", { enabled: true, value })}
+              />
+            )}
             <div className="mb-4 flex flex-col gap-3 xl:flex-row xl:items-center xl:justify-between">
               <div className="relative w-full max-w-md"><Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-9" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索参数名称、说明或参数键" /></div>
               <div className="flex items-center gap-2 overflow-x-auto pb-1 xl:pb-0">

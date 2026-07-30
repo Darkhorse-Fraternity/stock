@@ -17,6 +17,10 @@ from .markets import (
     parameter_applicable,
     strategy_market,
 )
+from .us_data_providers import (
+    strategy_us_data_source,
+    us_market_data_status,
+)
 
 
 GROUPS = [
@@ -68,6 +72,34 @@ def _parameter(
 
 PARAMETER_CATALOG = [
     _parameter("market", "universe", "证券市场", kind="choice", operator="equals", default="cn", active=True, status="live", options=[{"value": "cn", "label": "A股"}, {"value": "us", "label": "美股"}], description="决定代码格式、行情与历史数据源、交易时区、币种及模拟撮合规则"),
+    _parameter(
+        "us_data_source",
+        "universe",
+        "美股数据源",
+        kind="choice",
+        operator="equals",
+        default="auto",
+        active=True,
+        status="live",
+        options=[
+            {
+                "value": "auto",
+                "label": "自动切换",
+                "description": "优先使用 Alpaca，主源不可用时自动降级至新浪",
+            },
+            {
+                "value": "alpaca",
+                "label": "仅 Alpaca",
+                "description": "免费 Basic 套餐仍需在服务器配置 API Key",
+            },
+            {
+                "value": "sina",
+                "label": "仅新浪",
+                "description": "直接使用新浪公开美股行情接口",
+            },
+        ],
+        description="按策略选择美股行情与历史数据源；API Key 只保存在服务器环境变量中",
+    ),
     _parameter("board_code", "universe", "板块代码", kind="text", operator="equals", default="BK0800", active=True, status="live", description="当前东方财富概念板块代码"),
     _parameter("board_name", "universe", "板块名称", kind="text", operator="equals", default="人工智能", active=True, status="live", description="默认覆盖科技 AI 方向的人工智能概念板块"),
     _parameter("watchlist", "universe", "自选股池", kind="tags", operator="in", default=[], status="live", description="A 股填写 6 位代码；美股填写 ticker（如 AAPL、MSFT）；启用后仅在自选股池中筛选"),
@@ -951,6 +983,11 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
     for strategy in store["strategies"]:
         active_parameters = sum(1 for state in strategy["parameters"].values() if state.get("enabled"))
         profile = market_profile(strategy_market(strategy))
+        data_source = (
+            us_market_data_status(strategy_us_data_source(strategy))
+            if profile.code == US_MARKET
+            else None
+        )
         summaries.append(
             {
                 "id": strategy["id"],
@@ -975,6 +1012,7 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
                     "currency": profile.currency,
                     "currency_symbol": profile.currency_symbol,
                 },
+                "us_market_data": data_source,
             }
         )
     return {"active_strategy_id": store["active_strategy_id"], "strategies": summaries}
@@ -1077,11 +1115,21 @@ def catalog_payload(config: dict | None = None) -> dict:
     current = normalize_strategy_config(config or load_strategy_config())
     market = strategy_market(current)
     profile = market_profile(market)
+    data_source = us_market_data_status(strategy_us_data_source(current))
     parameters = []
     for definition in PARAMETER_CATALOG:
         item = deepcopy(definition)
         item.update(current["parameters"][item["id"]])
-        item["applicable"] = parameter_applicable(item["id"], market)
+        item["applicable"] = (
+            market == US_MARKET
+            if item["id"] == "us_data_source"
+            else parameter_applicable(item["id"], market)
+        )
+        if item["id"] == "us_data_source":
+            for option in item["options"]:
+                if option["value"] == "alpaca" and not data_source["alpaca_configured"]:
+                    option["disabled"] = True
+                    option["label"] = "仅 Alpaca（未配置 Key）"
         if item["id"] in {"price_min", "price_max"}:
             item["unit"] = profile.currency_symbol
         elif item["id"] == "turnover_min":
@@ -1118,4 +1166,5 @@ def catalog_payload(config: dict | None = None) -> dict:
             "currency_symbol": profile.currency_symbol,
             "lot_size": profile.lot_size,
         },
+        "us_market_data": data_source,
     }

@@ -15,6 +15,7 @@ from .portfolio import plan_daily_candidates
 from .recommendation import RecommendationPlan, recommendation_tracking_entries
 from .reports import format_recommendation_snapshot
 from .runtime import assert_strategy_runnable
+from .us_data_providers import strategy_us_data_source
 from .utils import beijing_now, number
 
 
@@ -74,6 +75,12 @@ def save_daily_selection(
         "board_code": plan.board_code,
         "board_name": plan.board_name,
         "market": plan.market,
+        "us_data_source": (
+            strategy_us_data_source(strategy)
+            if plan.market == "us"
+            else None
+        ),
+        "actual_data_sources": list(plan.sources),
         "benchmark_mode": "board_constituent_equal_weight",
         "benchmark_initial_change_pct": benchmark_change,
         "benchmark_error": benchmark_error,
@@ -172,7 +179,10 @@ def generate_saved_tracking_report(
         if quote_fetcher is not None:
             rows, error = quote_fetcher(entries)
         else:
-            rows, error = adapter.fetch_watchlist(entries)
+            rows, error = adapter.fetch_watchlist(
+                entries,
+                data_source_policy=state.get("us_data_source"),
+            )
     except Exception as exc:
         rows, error = [], str(exc)
     rows = adapter.constrain_watchlist(rows, entries)

@@ -18,7 +18,10 @@ from .markets import (
 )
 from .universe import constrain_to_watchlist, normalize_stock_symbol, normalize_watchlist
 from .universe_provider import BoardUniverseProvider, Nasdaq100UniverseProvider, UniverseQuoteBatch
-from .us_data_providers import get_us_market_data_provider
+from .us_data_providers import (
+    get_us_market_data_provider,
+    strategy_us_data_source,
+)
 
 
 class MarketAdapter(ABC):
@@ -66,12 +69,21 @@ class MarketAdapter(ABC):
         entries: Iterable[object],
         *,
         fetcher: Callable | None = None,
+        strategy: dict | None = None,
+        data_source_policy: object | None = None,
     ) -> tuple[list[dict], str | None]:
         if fetcher is not None:
             return fetcher(entries)
         return fetch_watchlist_quotes(entries, market=self.market)
 
-    def fetch_history(self, symbol: str, **kwargs) -> list[dict]:
+    def fetch_history(
+        self,
+        symbol: str,
+        *,
+        strategy: dict | None = None,
+        data_source_policy: object | None = None,
+        **kwargs,
+    ) -> list[dict]:
         return enrichment.fetch_daily_history(symbol, market=self.market, **kwargs)
 
     def execution_config(self, config: dict) -> dict:
@@ -93,7 +105,12 @@ class MarketAdapter(ABC):
         return None
 
     @abstractmethod
-    def universe_provider(self) -> BoardUniverseProvider | Nasdaq100UniverseProvider:
+    def universe_provider(
+        self,
+        strategy: dict | None = None,
+        *,
+        data_source_policy: object | None = None,
+    ) -> BoardUniverseProvider | Nasdaq100UniverseProvider:
         raise NotImplementedError
 
     def fetch_universe(
@@ -110,7 +127,12 @@ class MarketAdapter(ABC):
             code=code,
             name=name,
         )
-        return (provider or self.universe_provider()).fetch(
+        return (
+            provider
+            or self.universe_provider(
+                strategy,
+            )
+        ).fetch(
             universe_code,
             board_name=universe_name,
             now=now,
@@ -120,7 +142,12 @@ class MarketAdapter(ABC):
 class AShareMarketAdapter(MarketAdapter):
     market = CN_MARKET
 
-    def universe_provider(self) -> BoardUniverseProvider:
+    def universe_provider(
+        self,
+        strategy: dict | None = None,
+        *,
+        data_source_policy: object | None = None,
+    ) -> BoardUniverseProvider:
         return BoardUniverseProvider()
 
     def benchmark_fetcher(self) -> Callable:
@@ -141,9 +168,31 @@ class AShareMarketAdapter(MarketAdapter):
 class UsStockMarketAdapter(MarketAdapter):
     market = US_MARKET
 
-    def universe_provider(self) -> Nasdaq100UniverseProvider:
+    def _provider(
+        self,
+        strategy: dict | None = None,
+        data_source_policy: object | None = None,
+    ):
+        if strategy is None and data_source_policy is None:
+            return get_us_market_data_provider()
+        policy = (
+            data_source_policy
+            if data_source_policy is not None
+            else strategy_us_data_source(strategy)
+        )
+        return get_us_market_data_provider(policy)
+
+    def universe_provider(
+        self,
+        strategy: dict | None = None,
+        *,
+        data_source_policy: object | None = None,
+    ) -> Nasdaq100UniverseProvider:
         return Nasdaq100UniverseProvider(
-            quote_fetcher=get_us_market_data_provider().fetch_quotes,
+            quote_fetcher=self._provider(
+                strategy,
+                data_source_policy,
+            ).fetch_quotes,
         )
 
     def benchmark_fetcher(self) -> Callable:
@@ -154,16 +203,25 @@ class UsStockMarketAdapter(MarketAdapter):
         entries: Iterable[object],
         *,
         fetcher: Callable | None = None,
+        strategy: dict | None = None,
+        data_source_policy: object | None = None,
     ) -> tuple[list[dict], str | None]:
         if fetcher is not None:
             return fetcher(entries)
-        return get_us_market_data_provider().fetch_quotes(
+        return self._provider(strategy, data_source_policy).fetch_quotes(
             symbols=entries,
             board_name="未分类",
         )
 
-    def fetch_history(self, symbol: str, **kwargs) -> list[dict]:
-        provider = get_us_market_data_provider()
+    def fetch_history(
+        self,
+        symbol: str,
+        *,
+        strategy: dict | None = None,
+        data_source_policy: object | None = None,
+        **kwargs,
+    ) -> list[dict]:
+        provider = self._provider(strategy, data_source_policy)
         return enrichment.fetch_daily_history(
             symbol,
             market=self.market,

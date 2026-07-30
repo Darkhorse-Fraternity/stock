@@ -39,8 +39,12 @@ from stock_recommender.universe_provider import (
     UniverseQuoteBatch,
 )
 from stock_recommender.us_data_providers import (
+    AlpacaUsMarketDataProvider,
     AlpacaMarketDataClient,
     FailoverUsMarketDataProvider,
+    SinaUsMarketDataProvider,
+    get_us_market_data_provider,
+    strategy_us_data_source,
     us_market_data_status,
 )
 
@@ -403,6 +407,102 @@ class UsMarketAdapterTests(unittest.TestCase):
         self.assertTrue(status["alpaca_configured"])
         self.assertNotIn("key", status)
         self.assertNotIn("secret", status)
+
+    def test_strategy_data_source_policy_selects_provider_without_global_state(self):
+        strategy = us_strategy()
+        self.assertEqual(strategy_us_data_source(strategy), "auto")
+
+        strategy["parameters"]["us_data_source"] = {
+            "enabled": True,
+            "value": "sina",
+        }
+        self.assertEqual(strategy_us_data_source(strategy), "sina")
+        self.assertIsInstance(
+            get_us_market_data_provider("sina"),
+            SinaUsMarketDataProvider,
+        )
+        self.assertIsInstance(
+            get_us_market_data_provider("alpaca"),
+            AlpacaUsMarketDataProvider,
+        )
+        self.assertIsInstance(
+            get_us_market_data_provider("auto"),
+            FailoverUsMarketDataProvider,
+        )
+        with self.assertRaisesRegex(ValueError, "不支持的美股数据源策略"):
+            get_us_market_data_provider("unknown")
+
+    def test_catalog_disables_alpaca_only_without_key_and_exposes_fallback(self):
+        strategy = us_strategy()
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "STOCK_AGENT_ALPACA_API_KEY_ID": "",
+                "STOCK_AGENT_ALPACA_API_SECRET_KEY": "",
+                "APCA_API_KEY_ID": "",
+                "APCA_API_SECRET_KEY": "",
+            },
+            clear=False,
+        ):
+            payload = catalog_payload(strategy)
+
+        parameter = next(
+            item
+            for item in payload["parameters"]
+            if item["id"] == "us_data_source"
+        )
+        options = {item["value"]: item for item in parameter["options"]}
+        self.assertTrue(parameter["applicable"])
+        self.assertTrue(parameter["effective"])
+        self.assertTrue(options["alpaca"]["disabled"])
+        self.assertFalse(options["auto"].get("disabled", False))
+        self.assertEqual(payload["us_market_data"]["selected_policy"], "auto")
+        self.assertEqual(payload["us_market_data"]["effective_source"], "sina")
+        self.assertEqual(payload["us_market_data"]["mode"], "degraded_fallback")
+
+    def test_alpaca_only_without_key_does_not_silently_fallback(self):
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "STOCK_AGENT_ALPACA_API_KEY_ID": "",
+                "STOCK_AGENT_ALPACA_API_SECRET_KEY": "",
+                "APCA_API_KEY_ID": "",
+                "APCA_API_SECRET_KEY": "",
+            },
+            clear=False,
+        ):
+            provider = get_us_market_data_provider("alpaca")
+            rows, error = provider.fetch_quotes(symbols=["AAPL"])
+            status = us_market_data_status("alpaca")
+
+        self.assertEqual(rows, [])
+        self.assertIn("Alpaca 凭证未配置", error)
+        self.assertEqual(status["mode"], "unavailable")
+        self.assertEqual(status["effective_source"], "unavailable")
+
+    def test_us_adapter_routes_quotes_using_strategy_policy(self):
+        strategy = us_strategy()
+        strategy["parameters"]["us_data_source"] = {
+            "enabled": True,
+            "value": "sina",
+        }
+        provider = mock.Mock()
+        provider.fetch_quotes.return_value = (
+            [{"symbol": "AAPL", "price": 210}],
+            None,
+        )
+        with mock.patch(
+            "stock_recommender.market_adapters.get_us_market_data_provider",
+            return_value=provider,
+        ) as factory:
+            rows, error = UsStockMarketAdapter().fetch_watchlist(
+                [{"symbol": "AAPL"}],
+                strategy=strategy,
+            )
+
+        factory.assert_called_once_with("sina")
+        self.assertEqual(rows[0]["symbol"], "AAPL")
+        self.assertIsNone(error)
 
     def test_nasdaq_provider_rejects_partial_membership_and_uses_fresh_snapshot(self):
         membership = [

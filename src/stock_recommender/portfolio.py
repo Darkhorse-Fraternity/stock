@@ -1149,7 +1149,11 @@ def monitor_portfolio(
     entries = [{"symbol": symbol, "name": account.get("positions", {}).get(symbol, {}).get("name", symbol)} for symbol in symbols]
     adapter = get_market_adapter(account.get("market") or strategy_market(strategy))
     try:
-        rows, error = adapter.fetch_watchlist(entries, fetcher=quote_fetcher)
+        rows, error = adapter.fetch_watchlist(
+            entries,
+            fetcher=quote_fetcher,
+            strategy=strategy,
+        )
     except Exception as exc:
         rows, error = [], str(exc)
     rows = adapter.constrain_watchlist(rows, entries)
@@ -1268,6 +1272,7 @@ def build_strategy_performance(
             rows, quote_error = adapter.fetch_watchlist(
                 [{"symbol": symbol} for symbol in symbols],
                 fetcher=quote_fetcher,
+                strategy=strategy,
             )
         except Exception as exc:
             rows, quote_error = [], str(exc)
