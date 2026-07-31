@@ -17,6 +17,15 @@ from .markets import (
     parameter_applicable,
     strategy_market,
 )
+from .portfolio_engine.config import (
+    default_exposure_policy,
+    default_margin_policy,
+    default_short_policy,
+    normalize_exposure_policy,
+    normalize_margin_policy,
+    normalize_short_policy,
+    validate_strategy_policies,
+)
 from .us_data_providers import (
     strategy_us_data_source,
     us_market_data_status,
@@ -188,7 +197,7 @@ DELIVERY_CHANNELS = {"feishu", "telegram", "discord", "signal", "origin", "local
 DELIVERY_FREQUENCIES = {"daily", "weekdays"}
 STRATEGY_STAGES = {"draft", "backtesting", "paper", "live", "paused", "archived"}
 LOCKED_STRATEGY_STAGES = {"live", "archived"}
-STRATEGY_STORE_VERSION = 5
+STRATEGY_STORE_VERSION = 6
 
 
 class StrategyLifecycleError(ValueError):
@@ -556,6 +565,9 @@ def default_strategy_config() -> dict:
         "lifecycle": default_strategy_lifecycle(),
         "signal": default_signal_config(),
         "allocation": default_allocation_config(),
+        "exposure_policy": default_exposure_policy(),
+        "margin_policy": default_margin_policy(),
+        "short_policy": default_short_policy(),
         "validation": default_validation_config(),
         "portfolio": default_portfolio_config(),
         "delivery": default_report_delivery(),
@@ -586,6 +598,11 @@ def normalize_strategy_config(config: dict | None) -> dict:
     normalized["lifecycle"] = normalize_strategy_lifecycle(config.get("lifecycle"))
     normalized["signal"] = normalize_signal_config(config.get("signal"))
     normalized["allocation"] = normalize_allocation_config(config.get("allocation"))
+    normalized["exposure_policy"] = normalize_exposure_policy(
+        config.get("exposure_policy")
+    )
+    normalized["margin_policy"] = normalize_margin_policy(config.get("margin_policy"))
+    normalized["short_policy"] = normalize_short_policy(config.get("short_policy"))
     normalized["validation"] = normalize_validation_config(config.get("validation"))
     normalized["portfolio"] = normalize_portfolio_config(config.get("portfolio"))
     normalized["validation"]["signal_time"] = normalized["signal"]["run_time"]
@@ -595,16 +612,19 @@ def normalize_strategy_config(config: dict | None) -> dict:
     )
     normalized["delivery"] = normalize_report_delivery(config.get("delivery"))
     provided = config.get("parameters")
-    if not isinstance(provided, dict):
-        return normalized
-    for parameter_id, state in provided.items():
-        definition = PARAMETERS_BY_ID.get(parameter_id)
-        if not definition or not isinstance(state, dict):
-            continue
-        normalized["parameters"][parameter_id] = {
-            "enabled": bool(state.get("enabled", False)),
-            "value": _normalize_value(definition, state.get("value", definition["default"])),
-        }
+    if isinstance(provided, dict):
+        for parameter_id, state in provided.items():
+            definition = PARAMETERS_BY_ID.get(parameter_id)
+            if not definition or not isinstance(state, dict):
+                continue
+            normalized["parameters"][parameter_id] = {
+                "enabled": bool(state.get("enabled", False)),
+                "value": _normalize_value(
+                    definition,
+                    state.get("value", definition["default"]),
+                ),
+            }
+    validate_strategy_policies(normalized)
     return normalized
 
 
@@ -672,6 +692,9 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             "lifecycle",
             "signal",
             "allocation",
+            "exposure_policy",
+            "margin_policy",
+            "short_policy",
             "validation",
             "portfolio",
             "delivery",
@@ -739,6 +762,36 @@ def find_strategy_config(strategy_id: str, path: str | Path | None = None) -> di
     return None
 
 
+def _append_strategy_revision(
+    store: dict,
+    source: dict,
+    candidate: dict | None = None,
+) -> dict:
+    now = _timestamp()
+    revision = deepcopy(candidate if candidate is not None else source)
+    revision_number = int(source.get("revision", 1)) + 1
+    revision.update(
+        {
+            "id": uuid.uuid4().hex,
+            "revision": revision_number,
+            "parent_strategy_id": source["id"],
+            "name": f"{revision['name']} v{revision_number}"[:80],
+            "created_at": now,
+            "updated_at": now,
+            "lifecycle": default_strategy_lifecycle(),
+        }
+    )
+    revision["validation"]["last_backtest"] = None
+    revision["validation"]["approval_gate"] = {
+        "passed": False,
+        "checks": [],
+        "evaluated_at": None,
+    }
+    revision["delivery"]["enabled"] = False
+    store["strategies"].append(revision)
+    return revision
+
+
 def save_strategy_config(config: dict, path: str | Path | None = None, strategy_id: str | None = None) -> dict:
     store = load_strategy_store(path)
     target_id = strategy_id or config.get("id") or store["active_strategy_id"]
@@ -747,6 +800,20 @@ def save_strategy_config(config: dict, path: str | Path | None = None, strategy_
     for index, existing in enumerate(store["strategies"]):
         if existing["id"] != target_id:
             continue
+        policy_changed = any(
+            normalized[section] != existing.get(section)
+            for section in ("exposure_policy", "margin_policy", "short_policy")
+        )
+        if policy_changed:
+            revision = _append_strategy_revision(store, existing, normalized)
+            saved_store = save_strategy_store(store, path)
+            return deepcopy(
+                next(
+                    item
+                    for item in saved_store["strategies"]
+                    if item["id"] == revision["id"]
+                )
+            )
         changed_model = normalized["signal"] != existing.get("signal") or normalized["allocation"] != existing.get("allocation") or normalized["parameters"] != existing["parameters"] or normalized["portfolio"] != existing.get("portfolio") or any(
             normalized["validation"].get(key) != existing["validation"].get(key)
             for key in default_validation_config()
@@ -937,25 +1004,15 @@ def create_strategy_revision(strategy_id: str, *, path: str | Path | None = None
     source = next((item for item in store["strategies"] if item["id"] == strategy_id), None)
     if source is None:
         raise KeyError(strategy_id)
-    now = _timestamp()
-    revision = deepcopy(source)
-    revision.update(
-        {
-            "id": uuid.uuid4().hex,
-            "revision": int(source.get("revision", 1)) + 1,
-            "parent_strategy_id": source["id"],
-            "name": f"{source['name']} v{int(source.get('revision', 1)) + 1}"[:80],
-            "created_at": now,
-            "updated_at": now,
-            "lifecycle": default_strategy_lifecycle(),
-        }
+    revision = _append_strategy_revision(store, source)
+    saved_store = save_strategy_store(store, path)
+    return deepcopy(
+        next(
+            item
+            for item in saved_store["strategies"]
+            if item["id"] == revision["id"]
+        )
     )
-    revision["validation"]["last_backtest"] = None
-    revision["validation"]["approval_gate"] = {"passed": False, "checks": [], "evaluated_at": None}
-    revision["delivery"]["enabled"] = False
-    store["strategies"].append(revision)
-    save_strategy_store(store, path)
-    return deepcopy(revision)
 
 
 def duplicate_strategy(strategy_id: str, *, path: str | Path | None = None) -> dict:

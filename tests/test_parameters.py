@@ -1,10 +1,12 @@
 import json
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 from stock_recommender.parameters import (
     PARAMETER_CATALOG,
+    STRATEGY_STORE_VERSION,
     StrategyLifecycleError,
     activate_strategy,
     create_strategy,
@@ -15,12 +17,27 @@ from stock_recommender.parameters import (
     default_strategy_config,
     load_strategy_config,
     load_strategy_store,
+    normalize_strategy_config,
+    record_backtest_evaluation,
     save_strategy_config,
 )
 from stock_recommender.selection import filter_candidates
 
 
 class ParameterCatalogTests(unittest.TestCase):
+    def test_strategy_store_schema_version_is_six(self):
+        self.assertEqual(STRATEGY_STORE_VERSION, 6)
+
+    def test_legacy_strategy_normalizes_to_explicit_long_only_policies(self):
+        strategy = normalize_strategy_config(
+            {"version": 5, "name": "旧策略", "parameters": {}}
+        )
+
+        self.assertEqual(strategy["version"], 6)
+        self.assertEqual(strategy["exposure_policy"]["mode"], "LONG_ONLY")
+        self.assertIn("margin_policy", strategy)
+        self.assertIn("short_policy", strategy)
+
     def test_catalog_covers_common_stock_screening_dimensions(self):
         groups = {item["group"] for item in PARAMETER_CATALOG}
         self.assertTrue(
@@ -150,10 +167,85 @@ class ParameterCatalogTests(unittest.TestCase):
     def test_store_rejects_malformed_json_instead_of_starting_empty(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "strategies.json"
-            path.write_text('{"version": 5,', encoding="utf-8")
+            path.write_text('{"version": 6,', encoding="utf-8")
 
             with self.assertRaisesRegex(StrategyLifecycleError, "JSON"):
                 load_strategy_store(path=path)
+
+    def test_policy_changes_create_inactive_revision_and_preserve_original(self):
+        changes = (
+            ("exposure_policy", "max_positions", 9),
+            ("margin_policy", "financing_apr_pct", 7.0),
+            ("short_policy", "stop_loss_pct", 5.0),
+        )
+        for section, field, value in changes:
+            with self.subTest(section=section), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "strategies.json"
+                original = create_strategy("待修订策略", path=path)
+                original["delivery"]["enabled"] = True
+                save_strategy_config(original, path=path)
+                evaluated = record_backtest_evaluation(
+                    original["id"],
+                    {
+                        "cumulative_return_pct": 12.0,
+                        "approval_gate": {
+                            "passed": True,
+                            "checks": [{"code": "PASS"}],
+                        },
+                    },
+                    path=path,
+                )
+                candidate = deepcopy(evaluated)
+                candidate[section][field] = value
+
+                revision = save_strategy_config(candidate, path=path)
+                store = load_strategy_store(path=path)
+                stored_original = next(
+                    item for item in store["strategies"] if item["id"] == original["id"]
+                )
+
+                self.assertNotEqual(revision["id"], original["id"])
+                self.assertEqual(revision["revision"], 2)
+                self.assertEqual(revision["parent_strategy_id"], original["id"])
+                self.assertEqual(revision[section][field], value)
+                self.assertEqual(revision["lifecycle"]["stage"], "draft")
+                self.assertIsNone(revision["validation"]["last_backtest"])
+                self.assertEqual(
+                    revision["validation"]["approval_gate"],
+                    {"passed": False, "checks": [], "evaluated_at": None},
+                )
+                self.assertFalse(revision["delivery"]["enabled"])
+                self.assertEqual(store["active_strategy_id"], original["id"])
+                self.assertEqual(len(store["strategies"]), 2)
+                self.assertEqual(
+                    stored_original[section][field], evaluated[section][field]
+                )
+                self.assertEqual(stored_original["lifecycle"]["stage"], "paper")
+                self.assertTrue(
+                    stored_original["validation"]["approval_gate"]["passed"]
+                )
+
+    def test_policy_revision_includes_other_model_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategies.json"
+            original = create_strategy("组合修订", path=path)
+            candidate = deepcopy(original)
+            candidate["margin_policy"]["financing_apr_pct"] = 7.0
+            candidate["parameters"]["price_min"] = {
+                "enabled": True,
+                "value": 10,
+            }
+
+            revision = save_strategy_config(candidate, path=path)
+            store = load_strategy_store(path=path)
+            stored_original = next(
+                item for item in store["strategies"] if item["id"] == original["id"]
+            )
+
+            self.assertEqual(revision["parameters"]["price_min"]["value"], 10)
+            self.assertEqual(revision["margin_policy"]["financing_apr_pct"], 7.0)
+            self.assertEqual(stored_original["parameters"]["price_min"]["value"], 0.01)
+            self.assertEqual(store["active_strategy_id"], original["id"])
 
     def test_available_saved_parameters_affect_filtering(self):
         config = default_strategy_config()
