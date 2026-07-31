@@ -6,9 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any, Mapping, TypeAlias
 
 from ..pipeline import StageOutput
+
+
+SignalRow: TypeAlias = Mapping[str, Any]
+EventCalendar: TypeAlias = Mapping[str, int | None]
 
 
 class PositionSide(str, Enum):

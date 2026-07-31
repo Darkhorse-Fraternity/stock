@@ -5,7 +5,13 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping, Protocol
 
-from .contracts import DecisionBatch, ExecutionFill, MarketSnapshot, OrderIntent
+from .contracts import (
+    DecisionBatch,
+    EventCalendar,
+    ExecutionFill,
+    MarketSnapshot,
+    OrderIntent,
+)
 
 
 class QuoteProvider(Protocol):
@@ -29,7 +35,7 @@ class EventCalendarProvider(Protocol):
         self,
         symbols: tuple[str, ...],
         occurred_at: datetime,
-    ) -> Mapping[str, int | None]: ...
+    ) -> EventCalendar: ...
 
 
 class LedgerStore(Protocol):
