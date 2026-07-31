@@ -311,6 +311,33 @@ class ShortTrendBreakdownTests(unittest.TestCase):
                         (),
                     )
 
+    def test_overflowing_integers_are_safely_rejected_for_required_numbers(self):
+        numeric_fields = (
+            "momentum20",
+            "momentum60",
+            "price",
+            "ma20",
+            "ma60",
+            "volatility20",
+            "turnover",
+            "one_day_return",
+        )
+        model = ShortTrendBreakdownV1()
+        for field in numeric_fields:
+            for sign, value in (("positive", 10**10000), ("negative", -(10**10000))):
+                with self.subTest(field=field, sign=sign):
+                    try:
+                        signals = model.evaluate(
+                            [make_row(**{field: value})],
+                            event_calendar={"TEST": None},
+                        )
+                    except Exception as exc:
+                        self.fail(
+                            f"{field} {sign} overflow raised "
+                            f"{type(exc).__name__}"
+                        )
+                    self.assertEqual(signals, ())
+
     def test_invalid_rows_do_not_change_deterministic_valid_result(self):
         valid = make_row(symbol="VALID")
         invalid = make_row(symbol="INVALID", momentum20=math.nan)

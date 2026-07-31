@@ -32,7 +32,10 @@ _RANKING_FIELDS = (
 def _finite_number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
     return number if math.isfinite(number) else None
 
 
