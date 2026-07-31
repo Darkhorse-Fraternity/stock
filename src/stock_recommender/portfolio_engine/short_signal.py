@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime
 from typing import ClassVar, Iterable, Mapping
 
 from .config import ShortPolicy
@@ -14,6 +13,7 @@ from .contracts import (
     PositionSide,
     SignalCandidate,
     SignalRow,
+    normalize_cutoff_date,
 )
 
 
@@ -39,22 +39,6 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _date_value(value: object) -> date | None:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
-    if len(text) < 10:
-        return None
-    try:
-        return date.fromisoformat(text[:10])
-    except ValueError:
-        return None
-
-
 def _policy_value(policy: object, field_name: str, default: object) -> object:
     if isinstance(policy, Mapping):
         return policy.get(field_name, default)
@@ -63,14 +47,25 @@ def _policy_value(policy: object, field_name: str, default: object) -> object:
 
 def _normalized_values(
     rows: list[dict[str, object]], field_name: str
-) -> dict[int, float]:
+) -> dict[int, float] | None:
     values = [float(row[field_name]) for row in rows]
+    if not all(math.isfinite(value) for value in values):
+        return None
     low = min(values)
     high = max(values)
+    if not math.isfinite(low) or not math.isfinite(high):
+        return None
     if high == low:
         return {id(row): 0.5 for row in rows}
     width = high - low
-    return {id(row): (float(row[field_name]) - low) / width for row in rows}
+    if not math.isfinite(width) or width <= 0:
+        return None
+    normalized = {
+        id(row): (float(row[field_name]) - low) / width for row in rows
+    }
+    if not all(math.isfinite(value) for value in normalized.values()):
+        return None
+    return normalized
 
 
 def _duplicate_winner_key(
@@ -112,10 +107,12 @@ class ShortTrendBreakdownV1:
         if not admitted:
             return ()
 
-        normalized = {
-            field_name: _normalized_values(admitted, field_name)
-            for field_name in _RANKING_FIELDS
-        }
+        normalized: dict[str, dict[int, float]] = {}
+        for field_name in _RANKING_FIELDS:
+            values = _normalized_values(admitted, field_name)
+            if values is None:
+                return ()
+            normalized[field_name] = values
         ranked: list[tuple[float, str, dict[str, object], dict[str, float]]] = []
         for row in admitted:
             components = {
@@ -126,7 +123,12 @@ class ShortTrendBreakdownV1:
                 sum(components.values()) / len(_RANKING_FIELDS),
                 6,
             )
+            if not math.isfinite(score):
+                continue
             ranked.append((score, str(row["symbol"]), row, components))
+
+        if not ranked:
+            return ()
 
         # Duplicate symbols use the highest score, then the latest cutoff, then
         # canonical normalized/core facts. Input position never selects a winner.
@@ -246,7 +248,9 @@ class ShortTrendBreakdownV1:
             volatility20 = float(values["volatility20"])
             turnover = float(values["turnover"])
             one_day_return = float(values["one_day_return"])
-            cutoff = _date_value(raw.get("cutoff_date", raw.get("as_of")))
+            cutoff = normalize_cutoff_date(raw.get("cutoff_date"))
+            if cutoff is None:
+                cutoff = normalize_cutoff_date(raw.get("as_of"))
             if cutoff is None:
                 continue
             if not (
@@ -262,10 +266,25 @@ class ShortTrendBreakdownV1:
                 and one_day_return > -0.10
             ):
                 continue
+            momentum_persistence = (-momentum20 / 2.0) + (
+                -momentum60 / 2.0
+            )
+            ranking_values = {
+                "negative_momentum_persistence": momentum_persistence,
+                "below_ma60_distance": (ma60 - price) / ma60,
+                "inverse_volatility": 1.0 / (1.0 + volatility20),
+                "liquidity": math.log1p(
+                    turnover / MINIMUM_DAILY_USD_TURNOVER
+                ),
+            }
+            if not all(
+                math.isfinite(value) for value in ranking_values.values()
+            ):
+                continue
             admitted.append(
                 {
                     "symbol": symbol,
-                    "cutoff_date": cutoff.isoformat(),
+                    "cutoff_date": cutoff,
                     "momentum20": momentum20,
                     "momentum60": momentum60,
                     "price": price,
@@ -275,15 +294,7 @@ class ShortTrendBreakdownV1:
                     "turnover": turnover,
                     "one_day_return": one_day_return,
                     "event_sessions": event_sessions,
-                    "negative_momentum_persistence": (
-                        -momentum20 - momentum60
-                    )
-                    / 2.0,
-                    "below_ma60_distance": (ma60 - price) / ma60,
-                    "inverse_volatility": 1.0 / (1.0 + volatility20),
-                    "liquidity": math.log1p(
-                        turnover / MINIMUM_DAILY_USD_TURNOVER
-                    ),
+                    **ranking_values,
                 }
             )
         return admitted

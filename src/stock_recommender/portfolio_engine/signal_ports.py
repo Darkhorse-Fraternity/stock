@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Protocol
+from typing import Iterable, Mapping, Protocol
 
 from ..signal_engine import SIGNAL_MODEL_ID
 from .contracts import (
@@ -11,6 +11,7 @@ from .contracts import (
     PositionSide,
     SignalCandidate,
     SignalRow,
+    normalize_cutoff_date,
 )
 
 
@@ -51,6 +52,18 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _selection_cutoff_date(row: Mapping[str, object]) -> str | None:
+    values = [row.get("cutoff_date"), row.get("as_of")]
+    signal_features = row.get("signal_features")
+    if isinstance(signal_features, Mapping):
+        values.append(signal_features.get("history_latest_date"))
+    for value in values:
+        cutoff = normalize_cutoff_date(value)
+        if cutoff is not None:
+            return cutoff
+    return None
+
+
 class FactorRankLongAdapter:
     """Adapt already-selected ``factor_rank_v1`` rows without reranking them."""
 
@@ -81,12 +94,9 @@ class FactorRankLongAdapter:
                 continue
             thesis_id = str(row.get("thesis_id") or "").strip()
             if not thesis_id:
-                cutoff = str(
-                    row.get("cutoff_date")
-                    or row.get("as_of")
-                    or row.get("history_latest_date")
-                    or "selection"
-                ).strip()
+                cutoff = _selection_cutoff_date(row)
+                if cutoff is None:
+                    continue
                 thesis_id = f"{self.model_id}:{symbol}:{cutoff}"
             candidates.append(
                 SignalCandidate(

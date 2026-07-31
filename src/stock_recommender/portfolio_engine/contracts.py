@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
@@ -13,6 +13,25 @@ from ..pipeline import StageOutput
 
 SignalRow: TypeAlias = Mapping[str, Any]
 EventCalendar: TypeAlias = Mapping[str, int | None]
+
+
+def normalize_cutoff_date(value: object) -> str | None:
+    """Return an input-local ISO date without consulting a clock or timezone."""
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    try:
+        if len(text) == 10:
+            return date.fromisoformat(text).isoformat()
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.date().isoformat()
+    except ValueError:
+        return None
 
 
 class PositionSide(str, Enum):

@@ -1,5 +1,9 @@
+import json
 import math
+import sys
 import unittest
+from collections.abc import Mapping
+from datetime import date, datetime, timedelta, timezone
 
 from stock_recommender.portfolio_engine.config import ShortPolicy
 from stock_recommender.portfolio_engine.contracts import PositionSide
@@ -29,7 +33,54 @@ def make_row(**updates):
     return row
 
 
+def make_factor_selection(**updates):
+    row = {
+        "symbol": "AAPL",
+        "score": 72.5,
+        "signal_score": 72.5,
+        "signal_model": "factor_rank_v1",
+        "requested_weight_pct": 10.0,
+        "signal_features": {
+            "momentum20": 0.12,
+            "momentum60": 0.25,
+            "trend": 2.0,
+            "volume_ratio": 1.3,
+            "inverse_volatility": -0.20,
+            "drawdown": -0.05,
+            "history_latest_date": "2026-07-30",
+        },
+    }
+    row.update(updates)
+    return row
+
+
+def plain_value(value):
+    if isinstance(value, Mapping):
+        return {key: plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [plain_value(item) for item in value]
+    return value
+
+
 class ShortTrendBreakdownTests(unittest.TestCase):
+    def assert_finite_signal_payload(self, signals):
+        for item in signals:
+            payload = {
+                "score": item.score,
+                "requested_weight_pct": item.requested_weight_pct,
+                "facts": plain_value(item.facts),
+            }
+            stack = [payload]
+            while stack:
+                value = stack.pop()
+                if isinstance(value, Mapping):
+                    stack.extend(value.values())
+                elif isinstance(value, (list, tuple)):
+                    stack.extend(value)
+                elif isinstance(value, float):
+                    self.assertTrue(math.isfinite(value), repr(payload))
+            json.dumps(payload, allow_nan=False)
+
     def test_admits_persistent_liquid_breakdown(self):
         row = make_row(
             symbol="WEAK",
@@ -391,6 +442,67 @@ class ShortTrendBreakdownTests(unittest.TestCase):
         self.assertEqual(forward[0].thesis_id, reverse[0].thesis_id)
         self.assertEqual(forward[0].facts, reverse[0].facts)
 
+    def test_extreme_finite_inputs_never_emit_nonfinite_ranking_values(self):
+        normal = make_row(symbol="NORMAL")
+        for momentum in (-1.7e308, -sys.float_info.max):
+            with self.subTest(momentum=momentum):
+                extreme_rows = (
+                    make_row(
+                        symbol="MOMENTUM",
+                        momentum20=momentum,
+                        momentum60=momentum,
+                    ),
+                    make_row(
+                        symbol="DISTANCE",
+                        ma20=sys.float_info.max,
+                        ma60=sys.float_info.max,
+                    ),
+                    make_row(
+                        symbol="INVERSE_VOL",
+                        volatility20=1e306,
+                    ),
+                    make_row(
+                        symbol="LIQUIDITY",
+                        turnover=sys.float_info.max,
+                    ),
+                )
+                rows = (normal, *extreme_rows)
+                calendar = {row["symbol"]: None for row in rows}
+                signals = ShortTrendBreakdownV1(
+                    policy=ShortPolicy(
+                        maximum_volatility_20d_pct=sys.float_info.max
+                    )
+                ).evaluate(rows, event_calendar=calendar)
+
+                self.assertTrue(signals)
+                self.assert_finite_signal_payload(signals)
+
+    def test_extreme_duplicate_winner_is_independent_of_input_order(self):
+        normal = make_row(symbol="EXTREME_DUP")
+        extreme = make_row(
+            symbol="EXTREME_DUP",
+            momentum20=-sys.float_info.max,
+            momentum60=-sys.float_info.max,
+        )
+        model = ShortTrendBreakdownV1()
+
+        forward = model.evaluate(
+            [normal, extreme], event_calendar={"EXTREME_DUP": None}
+        )
+        reverse = model.evaluate(
+            [extreme, normal], event_calendar={"EXTREME_DUP": None}
+        )
+
+        fingerprint = lambda item: (
+            item.symbol,
+            item.thesis_id,
+            plain_value(item.facts),
+        )
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(fingerprint(forward[0]), fingerprint(reverse[0]))
+        self.assert_finite_signal_payload(forward)
+        self.assert_finite_signal_payload(reverse)
+
 
 class SignalRegistryTests(unittest.TestCase):
     def test_duplicate_model_id_is_rejected_without_overwriting_original(self):
@@ -464,6 +576,82 @@ class FactorRankLongAdapterTests(unittest.TestCase):
             signals[0].facts["name"], "Lower score deliberately first"
         )
         self.assertEqual(signals[0].facts["reasons"], ("fact one",))
+
+    def test_normalizes_equivalent_top_level_cutoff_representations(self):
+        representations = (
+            "2026-07-30",
+            date(2026, 7, 30),
+            datetime(
+                2026,
+                7,
+                30,
+                23,
+                45,
+                tzinfo=timezone(timedelta(hours=-7)),
+            ),
+        )
+
+        thesis_ids = {
+            FactorRankLongAdapter()
+            .evaluate(
+                [make_factor_selection(cutoff_date=cutoff)],
+                event_calendar={},
+            )[0]
+            .thesis_id
+            for cutoff in representations
+        }
+
+        self.assertEqual(thesis_ids, {"factor_rank_v1:AAPL:2026-07-30"})
+
+    def test_cutoff_lookup_prefers_top_level_then_real_nested_feature_date(self):
+        top_level = make_factor_selection(
+            cutoff_date="2026-07-30",
+            as_of="2026-07-29",
+            signal_features={
+                **make_factor_selection()["signal_features"],
+                "history_latest_date": "2026-07-28",
+            },
+        )
+        as_of = make_factor_selection(
+            as_of=date(2026, 7, 29),
+            signal_features={
+                **make_factor_selection()["signal_features"],
+                "history_latest_date": "2026-07-28",
+            },
+        )
+        nested = make_factor_selection(
+            signal_features={
+                **make_factor_selection()["signal_features"],
+                "history_latest_date": date(2026, 7, 28),
+            }
+        )
+
+        signals = FactorRankLongAdapter().evaluate(
+            [top_level, as_of, nested], event_calendar={}
+        )
+
+        self.assertEqual(
+            [item.thesis_id for item in signals],
+            [
+                "factor_rank_v1:AAPL:2026-07-30",
+                "factor_rank_v1:AAPL:2026-07-29",
+                "factor_rank_v1:AAPL:2026-07-28",
+            ],
+        )
+
+    def test_missing_or_invalid_fallback_cutoff_is_safely_rejected(self):
+        missing = make_factor_selection(signal_features={})
+        invalid = make_factor_selection(
+            cutoff_date="not-a-date",
+            as_of=None,
+            signal_features={"history_latest_date": "also-invalid"},
+        )
+
+        signals = FactorRankLongAdapter().evaluate(
+            [missing, invalid], event_calendar={}
+        )
+
+        self.assertEqual(signals, ())
 
 
 if __name__ == "__main__":
