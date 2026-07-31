@@ -60,7 +60,21 @@ class DeliveryTests(unittest.TestCase):
             result = sync_hermes_delivery(strategy, runner=runner)
 
         self.assertEqual(result["status"], "synced")
-        self.assertEqual(calls[0], ["hermes", "cron", "edit", "job-1", "--schedule", "0 0 * * *", "--deliver", "feishu:oc_test"])
+        self.assertEqual(
+            calls[0],
+            [
+                "hermes",
+                "cron",
+                "edit",
+                "job-1",
+                "--name",
+                "科技 AI 板块短线筛选 股票推荐",
+                "--schedule",
+                "0 0 * * *",
+                "--deliver",
+                "feishu:oc_test",
+            ],
+        )
         self.assertEqual(calls[1], ["hermes", "cron", "resume", "job-1"])
 
     def test_sync_pauses_disabled_job(self):
@@ -97,8 +111,36 @@ class DeliveryTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "synced")
         self.assertEqual([job["kind"] for job in result["jobs"]], ["daily", "tracking", "risk"])
-        self.assertIn(["hermes", "cron", "edit", "hourly-job", "--schedule", "0 2,3,5,6,7 * * 1-5", "--deliver", "feishu:oc_test"], calls)
-        self.assertIn(["hermes", "cron", "edit", "risk-job", "--schedule", "*/5 1-7 * * 1-5", "--deliver", "feishu:oc_test"], calls)
+        self.assertIn(
+            [
+                "hermes",
+                "cron",
+                "edit",
+                "hourly-job",
+                "--name",
+                "科技 AI 板块短线筛选 推荐股盘中跟踪",
+                "--schedule",
+                "0 2,3,5,6,7 * * 1-5",
+                "--deliver",
+                "feishu:oc_test",
+            ],
+            calls,
+        )
+        self.assertIn(
+            [
+                "hermes",
+                "cron",
+                "edit",
+                "risk-job",
+                "--name",
+                "科技 AI 板块短线筛选 策略风险退出监控",
+                "--schedule",
+                "*/5 1-7 * * 1-5",
+                "--deliver",
+                "feishu:oc_test",
+            ],
+            calls,
+        )
 
     def test_missing_active_strategy_does_not_modify_hermes(self):
         with patch("stock_recommender.delivery.load_strategy_config", return_value=default_strategy_config()):

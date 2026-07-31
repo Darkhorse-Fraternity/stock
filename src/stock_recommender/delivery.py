@@ -14,6 +14,11 @@ PORTFOLIO_TRACKING_CRON = "0 2,3,5,6,7 * * 1-5"
 PORTFOLIO_RISK_CRON = "*/5 1-7 * * 1-5"
 US_PORTFOLIO_TRACKING_CRON = "0 13-21 * * 1-5"
 US_PORTFOLIO_RISK_CRON = "*/5 13-21 * * 1-5"
+DELIVERY_JOB_SUFFIXES = {
+    "daily": "股票推荐",
+    "tracking": "推荐股盘中跟踪",
+    "risk": "策略风险退出监控",
+}
 
 
 def portfolio_delivery_crons(config: dict) -> tuple[str, str]:
@@ -35,6 +40,12 @@ def delivery_target(config: dict) -> str:
             raise ValueError(f"{channel} 推送需要填写接收目标")
         return target if target.startswith(f"{channel}:") else f"{channel}:{target}"
     return channel
+
+
+def delivery_job_name(config: dict, kind: str) -> str:
+    strategy_name = str(config.get("name") or "股票策略").strip()[:60]
+    suffix = DELIVERY_JOB_SUFFIXES.get(kind, "策略任务")
+    return f"{strategy_name} {suffix}"
 
 
 def delivery_cron(config: dict) -> str:
@@ -99,7 +110,18 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
         target = delivery_target(config)
         schedule = delivery_cron(config)
         edit = execute(
-            [hermes_bin, "cron", "edit", job_id, "--schedule", schedule, "--deliver", target],
+            [
+                hermes_bin,
+                "cron",
+                "edit",
+                job_id,
+                "--name",
+                delivery_job_name(config, "daily"),
+                "--schedule",
+                schedule,
+                "--deliver",
+                target,
+            ],
             capture_output=True,
             text=True,
             timeout=15,
@@ -115,7 +137,18 @@ def sync_hermes_delivery(config: dict, *, runner: Callable | None = None) -> dic
                 if not target_job_id:
                     continue
                 edit = execute(
-                    [hermes_bin, "cron", "edit", target_job_id, "--schedule", target_schedule, "--deliver", target],
+                    [
+                        hermes_bin,
+                        "cron",
+                        "edit",
+                        target_job_id,
+                        "--name",
+                        delivery_job_name(config, kind),
+                        "--schedule",
+                        target_schedule,
+                        "--deliver",
+                        target,
+                    ],
                     capture_output=True,
                     text=True,
                     timeout=15,
