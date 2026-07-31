@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
-from types import MappingProxyType
 from typing import Any
 
 from ..pipeline import PipelineContractError, StageInput, StageOutput
@@ -20,7 +19,7 @@ from .config import (
     VALID_EXPOSURE_MODES,
     ExposurePolicy,
 )
-from .contracts import PositionSide, TargetPosition
+from .contracts import PositionSide, TargetPosition, _deep_freeze, _deep_thaw
 
 
 NET_TARGETS_FACT = "net_targets"
@@ -35,10 +34,58 @@ class ExposureDiagnostic:
     rejections: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
 
     def __post_init__(self) -> None:
+        numeric_fields = (
+            "gross_exposure_pct",
+            "net_exposure_pct",
+            "long_exposure_pct",
+            "short_exposure_pct",
+        )
+        for field_name in numeric_fields:
+            raw_value = getattr(self, field_name)
+            if isinstance(raw_value, bool) or not isinstance(
+                raw_value, (int, float)
+            ):
+                raise ValueError(f"{field_name} must be a finite number")
+            try:
+                value = float(raw_value)
+            except (OverflowError, TypeError, ValueError) as exc:
+                raise ValueError(f"{field_name} must be a finite number") from exc
+            if not math.isfinite(value):
+                raise ValueError(f"{field_name} must be a finite number")
+            object.__setattr__(self, field_name, value)
+        for field_name in (
+            "gross_exposure_pct",
+            "long_exposure_pct",
+            "short_exposure_pct",
+        ):
+            if getattr(self, field_name) < 0:
+                raise ValueError(f"{field_name} must be nonnegative")
+        if not math.isclose(
+            self.gross_exposure_pct,
+            self.long_exposure_pct + self.short_exposure_pct,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("gross exposure must equal long plus short exposure")
+        if not math.isclose(
+            self.net_exposure_pct,
+            self.long_exposure_pct - self.short_exposure_pct,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            raise ValueError("net exposure must equal long minus short exposure")
+        frozen_rejections: list[Mapping[str, Any]] = []
+        for item in self.rejections:
+            if not isinstance(item, Mapping):
+                raise TypeError(
+                    "exposure rejection must be a mapping, got "
+                    f"{type(item).__name__}"
+                )
+            frozen_rejections.append(_deep_freeze(item))
         object.__setattr__(
             self,
             "rejections",
-            tuple(MappingProxyType(dict(item)) for item in self.rejections),
+            tuple(frozen_rejections),
         )
 
     def __deepcopy__(self, memo: dict[int, object]) -> ExposureDiagnostic:
@@ -395,9 +442,7 @@ class ExposureBudgetStage:
                     "net_exposure_pct": diagnostic.net_exposure_pct,
                     "long_exposure_pct": diagnostic.long_exposure_pct,
                     "short_exposure_pct": diagnostic.short_exposure_pct,
-                    "rejections": tuple(
-                        dict(item) for item in diagnostic.rejections
-                    ),
+                    "rejections": _deep_thaw(diagnostic.rejections),
                 },
             ),
         )

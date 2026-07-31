@@ -51,15 +51,99 @@ class PositionEffect(str, Enum):
     CLOSE = "CLOSE"
 
 
+def _unsupported_immutable_type(value: object) -> TypeError:
+    return TypeError(
+        "unsupported mutable or unknown immutable value type: "
+        f"{type(value).__name__}"
+    )
+
+
 def _deep_freeze(value: Any) -> Any:
+    """Recursively copy supported values into a provably immutable graph."""
+
+    return _deep_freeze_value(value, set())
+
+
+def _deep_freeze_value(value: Any, active: set[int]) -> Any:
+    if value is None or isinstance(
+        value,
+        (bool, int, float, str, bytes, Enum, date, datetime, _DeeplyImmutable),
+    ):
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        try:
+            return bytes(value)
+        except (TypeError, ValueError) as exc:
+            raise _unsupported_immutable_type(value) from exc
     if isinstance(value, Mapping):
-        return MappingProxyType(
-            {key: _deep_freeze(item) for key, item in value.items()}
-        )
+        identity = id(value)
+        if identity in active:
+            raise TypeError(f"cyclic mutable container type: {type(value).__name__}")
+        active.add(identity)
+        try:
+            frozen: dict[Any, Any] = {}
+            for raw_key, raw_item in value.items():
+                key = _deep_freeze_value(raw_key, active)
+                try:
+                    hash(key)
+                except TypeError as exc:
+                    raise TypeError(
+                        "mapping key cannot be frozen as hashable: "
+                        f"{type(raw_key).__name__}"
+                    ) from exc
+                if key in frozen:
+                    raise TypeError(
+                        "mapping keys collide after immutable conversion: "
+                        f"{type(raw_key).__name__}"
+                    )
+                frozen[key] = _deep_freeze_value(raw_item, active)
+            return MappingProxyType(frozen)
+        finally:
+            active.remove(identity)
     if isinstance(value, (list, tuple)):
-        return tuple(_deep_freeze(item) for item in value)
+        identity = id(value)
+        if identity in active:
+            raise TypeError(f"cyclic mutable container type: {type(value).__name__}")
+        active.add(identity)
+        try:
+            return tuple(_deep_freeze_value(item, active) for item in value)
+        finally:
+            active.remove(identity)
     if isinstance(value, (set, frozenset)):
-        return frozenset(_deep_freeze(item) for item in value)
+        identity = id(value)
+        if identity in active:
+            raise TypeError(f"cyclic mutable container type: {type(value).__name__}")
+        active.add(identity)
+        try:
+            frozen_items: list[Any] = []
+            for raw_item in value:
+                item = _deep_freeze_value(raw_item, active)
+                try:
+                    hash(item)
+                except TypeError as exc:
+                    raise TypeError(
+                        "set item cannot be frozen as hashable: "
+                        f"{type(raw_item).__name__}"
+                    ) from exc
+                frozen_items.append(item)
+            return frozenset(frozen_items)
+        finally:
+            active.remove(identity)
+    raise _unsupported_immutable_type(value)
+
+
+def _deep_thaw(value: Any) -> Any:
+    """Project a frozen graph into deepcopy-compatible pipeline facts."""
+
+    if isinstance(value, Mapping):
+        return {
+            _deep_thaw(key): _deep_thaw(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, tuple):
+        return tuple(_deep_thaw(item) for item in value)
+    if isinstance(value, frozenset):
+        return frozenset(_deep_thaw(item) for item in value)
     return value
 
 

@@ -101,6 +101,11 @@ def stage_input(*facts):
     )
 
 
+class MutableLeaf:
+    def __init__(self, value="mutable"):
+        self.value = value
+
+
 class TargetNettingTests(unittest.TestCase):
     def test_same_symbol_opposing_targets_are_netted(self):
         targets = net_signal_candidates(
@@ -432,6 +437,78 @@ class ExposureAllocationTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             diagnostic.rejections[0]["reason"] = "changed"
 
+    def test_direct_diagnostic_rejects_nonfinite_and_negative_exposures(self):
+        for field_name in (
+            "gross_exposure_pct",
+            "net_exposure_pct",
+            "long_exposure_pct",
+            "short_exposure_pct",
+        ):
+            for value in (math.nan, math.inf, -math.inf):
+                with self.subTest(field=field_name, value=value), self.assertRaises(
+                    ValueError
+                ):
+                    ExposureDiagnostic(**{field_name: value})
+
+        for field_name in (
+            "gross_exposure_pct",
+            "long_exposure_pct",
+            "short_exposure_pct",
+        ):
+            with self.subTest(field=field_name), self.assertRaises(ValueError):
+                ExposureDiagnostic(**{field_name: -1.0})
+
+    def test_direct_diagnostic_requires_consistent_exposure_totals(self):
+        with self.assertRaises(ValueError):
+            ExposureDiagnostic(
+                gross_exposure_pct=12.0,
+                net_exposure_pct=5.0,
+                long_exposure_pct=8.0,
+                short_exposure_pct=3.0,
+            )
+        with self.assertRaises(ValueError):
+            ExposureDiagnostic(
+                gross_exposure_pct=11.0,
+                net_exposure_pct=4.0,
+                long_exposure_pct=8.0,
+                short_exposure_pct=3.0,
+            )
+
+    def test_diagnostic_recursively_freezes_rejection_payloads(self):
+        mutable_items = ["cap"]
+        mutable_bytes = bytearray(b"proof")
+        rejection = {
+            "reason": "POSITION_CAP",
+            "details": {
+                "items": mutable_items,
+                "proof": mutable_bytes,
+            },
+        }
+
+        diagnostic = ExposureDiagnostic(rejections=(rejection,))
+        mutable_items.append("mutated")
+        mutable_bytes[0] = ord("X")
+        rejection["details"]["new"] = True
+
+        self.assertEqual(
+            diagnostic.rejections[0]["details"]["items"],
+            ("cap",),
+        )
+        self.assertEqual(
+            diagnostic.rejections[0]["details"]["proof"],
+            b"proof",
+        )
+        self.assertNotIn("new", diagnostic.rejections[0]["details"])
+        self.assertIs(deepcopy(diagnostic), diagnostic)
+        with self.assertRaises(TypeError):
+            diagnostic.rejections[0]["details"]["new"] = True
+
+    def test_diagnostic_rejects_unknown_mutable_rejection_leaf(self):
+        with self.assertRaisesRegex(TypeError, "MutableLeaf"):
+            ExposureDiagnostic(
+                rejections=({"reason": "INVALID", "value": MutableLeaf()},)
+            )
+
 
 class TargetExposureStageTests(unittest.TestCase):
     def test_stages_emit_versioned_target_and_diagnostic_facts(self):
@@ -602,6 +679,119 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
         ):
             with self.subTest(type=type(value).__name__):
                 self.assertIs(deepcopy(value), value)
+
+    def test_binary_buffers_are_copied_to_immutable_bytes(self):
+        now = datetime.now(timezone.utc)
+
+        def build_candidate(payload):
+            return SignalCandidate(
+                symbol="AAPL",
+                side=PositionSide.LONG,
+                score=0.9,
+                requested_weight_pct=10.0,
+                model_id="long-v1",
+                thesis_id="thesis-1",
+                facts={"payload": payload},
+            ), lambda value: value.facts["payload"]
+
+        def build_market(payload):
+            return MarketSnapshot(
+                id="market-1",
+                occurred_at=now,
+                quotes={"AAPL": {"payload": payload}},
+            ), lambda value: value.quotes["AAPL"]["payload"]
+
+        def build_event(payload):
+            return PortfolioEvent(
+                id="event-1",
+                type="TEST",
+                occurred_at=now,
+                data={"payload": payload},
+            ), lambda value: value.data["payload"]
+
+        def build_decision(payload):
+            return DecisionBatch(
+                run_key="run-1",
+                strategy_id="strategy-1",
+                strategy_revision=1,
+                portfolio_snapshot_id="portfolio-1",
+                market_snapshot_id="market-1",
+                diagnostics=({"payload": payload},),
+            ), lambda value: value.diagnostics[0]["payload"]
+
+        for name, builder in (
+            ("candidate", build_candidate),
+            ("market", build_market),
+            ("event", build_event),
+            ("decision", build_decision),
+        ):
+            with self.subTest(contract=name):
+                source_bytes = bytearray(b"buffer")
+                view_source = bytearray(b"memory")
+                payload = {
+                    "buffer": source_bytes,
+                    "view": memoryview(view_source),
+                }
+                value, payload_of = builder(payload)
+                source_bytes[0] = ord("X")
+                view_source[0] = ord("Y")
+
+                self.assertEqual(payload_of(value)["buffer"], b"buffer")
+                self.assertEqual(payload_of(value)["view"], b"memory")
+                self.assertIs(deepcopy(value), value)
+
+    def test_unknown_mutable_leaves_are_rejected_by_mapping_contracts(self):
+        now = datetime.now(timezone.utc)
+        factories = (
+            lambda leaf: SignalCandidate(
+                symbol="AAPL",
+                side=PositionSide.LONG,
+                score=0.9,
+                requested_weight_pct=10.0,
+                model_id="long-v1",
+                thesis_id="thesis-1",
+                facts={"nested": {"leaf": leaf}},
+            ),
+            lambda leaf: MarketSnapshot(
+                id="market-1",
+                occurred_at=now,
+                quotes={"AAPL": {"leaf": leaf}},
+            ),
+            lambda leaf: PortfolioEvent(
+                id="event-1",
+                type="TEST",
+                occurred_at=now,
+                data={"nested": {"leaf": leaf}},
+            ),
+            lambda leaf: DecisionBatch(
+                run_key="run-1",
+                strategy_id="strategy-1",
+                strategy_revision=1,
+                portfolio_snapshot_id="portfolio-1",
+                market_snapshot_id="market-1",
+                diagnostics=({"nested": {"leaf": leaf}},),
+            ),
+        )
+
+        for factory in factories:
+            with self.subTest(factory=factory), self.assertRaisesRegex(
+                TypeError, "MutableLeaf"
+            ):
+                factory(MutableLeaf())
+
+    def test_mutable_mapping_keys_are_rejected(self):
+        mutable_key = MutableLeaf("key")
+
+        with self.assertRaisesRegex(TypeError, "MutableLeaf"):
+            SignalCandidate(
+                symbol="AAPL",
+                side=PositionSide.LONG,
+                score=0.9,
+                requested_weight_pct=10.0,
+                model_id="long-v1",
+                thesis_id="thesis-1",
+                facts={mutable_key: "value"},
+            )
 
 
 if __name__ == "__main__":
