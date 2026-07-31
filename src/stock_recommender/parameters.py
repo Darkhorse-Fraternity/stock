@@ -205,6 +205,12 @@ class StrategyLifecycleError(ValueError):
     pass
 
 
+class _StrategyStoreProjection(dict):
+    def __init__(self, payload: dict, *, source_version: int):
+        super().__init__(payload)
+        self.source_version = source_version
+
+
 def strategy_config_path() -> Path:
     return Path(os.getenv("STOCK_AGENT_CONFIG", "data/strategy_config.json")).expanduser()
 
@@ -675,7 +681,9 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
         }
     ):
         raise StrategyLifecycleError(
-            f"不支持的策略配置版本，仅接受 version={STRATEGY_STORE_VERSION}"
+            "不支持或无效的策略配置 schema version；"
+            f"当前 version={STRATEGY_STORE_VERSION}，"
+            f"version={_LEGACY_STRATEGY_STORE_VERSION} 仅支持只读迁移投影"
         )
     if not isinstance(payload.get("strategies"), list):
         raise StrategyLifecycleError("策略配置缺少 strategies 列表")
@@ -688,10 +696,14 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             raise StrategyLifecycleError("strategies 只能包含策略对象")
         item_version = item.get("version")
         if isinstance(item_version, bool) or not isinstance(item_version, int):
-            raise StrategyLifecycleError("策略版本必须是整数 schema version")
+            raise StrategyLifecycleError(
+                "策略 schema version 无效，必须是整数；"
+                f"当前 version={STRATEGY_STORE_VERSION}，"
+                f"version={_LEGACY_STRATEGY_STORE_VERSION} 仅支持只读迁移投影"
+            )
         if item_version != source_version:
             raise StrategyLifecycleError(
-                f"策略版本必须与 store version={source_version} 一致"
+                f"策略 version={item_version} 与 store version={source_version} 不一致"
             )
         strategy_id = item.get("id")
         if not isinstance(strategy_id, str) or not strategy_id.strip():
@@ -732,11 +744,17 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     if configured_active_id is not None:
         if not isinstance(configured_active_id, str) or configured_active_id not in used_ids:
             raise StrategyLifecycleError("active_strategy_id 必须指向现有策略")
-    return {
+    normalized_store = {
         "version": STRATEGY_STORE_VERSION,
         "active_strategy_id": configured_active_id,
         "strategies": strategies,
     }
+    if source_version == _LEGACY_STRATEGY_STORE_VERSION:
+        return _StrategyStoreProjection(
+            normalized_store,
+            source_version=source_version,
+        )
+    return normalized_store
 
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
@@ -751,6 +769,13 @@ def load_strategy_store(path: str | Path | None = None) -> dict:
 
 
 def save_strategy_store(store: dict, path: str | Path | None = None) -> dict:
+    if (
+        isinstance(store, _StrategyStoreProjection)
+        and store.source_version == _LEGACY_STRATEGY_STORE_VERSION
+    ):
+        raise StrategyLifecycleError(
+            "version=5 策略配置是只读迁移投影；请先执行原子迁移再写入"
+        )
     config_path = Path(path) if path is not None else strategy_config_path()
     normalized = _normalize_strategy_store(store)
     config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -780,6 +805,37 @@ def find_strategy_config(strategy_id: str, path: str | Path | None = None) -> di
     return None
 
 
+def _strategy_family_root_id(strategy: dict, strategies_by_id: dict[str, dict]) -> str:
+    current = strategy
+    seen: set[str] = set()
+    while True:
+        current_id = str(current.get("id") or "")
+        if current_id in seen:
+            return min(seen)
+        seen.add(current_id)
+        parent_id = str(current.get("parent_strategy_id") or "")
+        if not parent_id:
+            return current_id
+        parent = strategies_by_id.get(parent_id)
+        if parent is None:
+            return parent_id
+        current = parent
+
+
+def _next_strategy_family_revision(store: dict, source: dict) -> int:
+    strategies_by_id = {
+        str(item["id"]): item
+        for item in store["strategies"]
+    }
+    source_root = _strategy_family_root_id(source, strategies_by_id)
+    family_revisions = [
+        int(item.get("revision", 1))
+        for item in store["strategies"]
+        if _strategy_family_root_id(item, strategies_by_id) == source_root
+    ]
+    return max(family_revisions, default=int(source.get("revision", 1))) + 1
+
+
 def _append_strategy_revision(
     store: dict,
     source: dict,
@@ -787,7 +843,7 @@ def _append_strategy_revision(
 ) -> dict:
     now = _timestamp()
     revision = deepcopy(candidate if candidate is not None else source)
-    revision_number = int(source.get("revision", 1)) + 1
+    revision_number = _next_strategy_family_revision(store, source)
     revision.update(
         {
             "id": uuid.uuid4().hex,

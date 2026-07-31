@@ -78,6 +78,56 @@ class ParameterCatalogTests(unittest.TestCase):
             self.assertIn("short_policy", loaded_strategy)
             self.assertEqual(persisted, legacy_store)
 
+    def test_v5_projection_rejects_ordinary_write_paths_without_touching_file(self):
+        operations = (
+            (
+                "activate",
+                lambda path: activate_strategy("legacy-strategy", path=path),
+            ),
+            (
+                "save_config",
+                lambda path: save_strategy_config(
+                    load_strategy_config(path=path),
+                    path=path,
+                ),
+            ),
+        )
+        for name, operation in operations:
+            with self.subTest(operation=name), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "strategies.json"
+                strategy = default_strategy_config()
+                strategy.update({"version": 5, "id": "legacy-strategy"})
+                for section in (
+                    "exposure_policy",
+                    "margin_policy",
+                    "short_policy",
+                ):
+                    strategy.pop(section)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 5,
+                            "active_strategy_id": "legacy-strategy",
+                            "strategies": [strategy],
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                original_bytes = path.read_bytes()
+
+                with self.assertRaisesRegex(
+                    StrategyLifecycleError,
+                    "只读|迁移|version=5",
+                ):
+                    operation(path)
+
+                self.assertEqual(path.read_bytes(), original_bytes)
+                self.assertEqual(
+                    json.loads(path.read_text(encoding="utf-8"))["version"],
+                    5,
+                )
+
     def test_strategy_store_rejects_unknown_schema_versions(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "strategies.json"
@@ -371,6 +421,25 @@ class ParameterCatalogTests(unittest.TestCase):
             self.assertEqual(revision["parameters"]["price_min"]["value"], 10)
             self.assertEqual(revision["margin_policy"]["financing_apr_pct"], 7.0)
             self.assertEqual(stored_original["parameters"]["price_min"]["value"], 0.01)
+            self.assertEqual(store["active_strategy_id"], original["id"])
+
+    def test_consecutive_policy_revisions_use_unique_family_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "strategies.json"
+            original = create_strategy("连续修订", path=path)
+            first_candidate = deepcopy(original)
+            first_candidate["margin_policy"]["financing_apr_pct"] = 7.0
+            first = save_strategy_config(first_candidate, path=path)
+            second_candidate = deepcopy(original)
+            second_candidate["short_policy"]["stop_loss_pct"] = 5.0
+
+            second = save_strategy_config(second_candidate, path=path)
+            store = load_strategy_store(path=path)
+
+            self.assertEqual((first["revision"], second["revision"]), (2, 3))
+            self.assertEqual(first["parent_strategy_id"], original["id"])
+            self.assertEqual(second["parent_strategy_id"], original["id"])
+            self.assertEqual(len({item["id"] for item in store["strategies"]}), 3)
             self.assertEqual(store["active_strategy_id"], original["id"])
 
     def test_available_saved_parameters_affect_filtering(self):

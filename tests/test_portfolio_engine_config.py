@@ -131,6 +131,33 @@ class PortfolioEngineConfigTests(unittest.TestCase):
                         {"market": market, "exposure_policy": {"mode": mode}}
                     )
 
+    def test_conflicting_market_sources_are_rejected(self):
+        for direct, parameter in (("us", "cn"), ("cn", "us")):
+            with self.subTest(direct=direct, parameter=parameter), self.assertRaises(
+                StrategyPolicyError
+            ):
+                validate_strategy_policies(
+                    {
+                        "market": direct,
+                        "parameters": {
+                            "market": {"enabled": True, "value": parameter}
+                        },
+                        "exposure_policy": {"mode": "LONG_SHORT"},
+                    }
+                )
+
+    def test_equivalent_market_sources_are_allowed_after_normalization(self):
+        for direct, parameter in (("USA", "美股"), ("CN", "A股")):
+            strategy = {
+                "market": direct,
+                "parameters": {
+                    "market": {"enabled": True, "value": parameter}
+                },
+                "exposure_policy": {"mode": "LONG_ONLY"},
+            }
+
+            validate_strategy_policies(strategy)
+
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(StrategyPolicyError):
             normalize_exposure_policy({"mode": "UNLIMITED"})
@@ -306,6 +333,118 @@ class PortfolioEngineContractTests(unittest.TestCase):
 
         self.assertIsNot(first.facts, second.facts)
 
+    def test_mapping_contracts_defensively_freeze_nested_values(self):
+        facts = {
+            "model": {
+                "items": [
+                    {"score": 0.9, "labels": {"trend", "quality"}},
+                ]
+            }
+        }
+        quotes = {
+            "AAPL": {
+                "price": 100.0,
+                "levels": [{"bid": 99.0}],
+            }
+        }
+        event_data = {"reasons": ["risk"], "details": {"level": "warning"}}
+        candidate = SignalCandidate(
+            symbol="AAPL",
+            side=PositionSide.LONG,
+            score=0.9,
+            requested_weight_pct=10.0,
+            model_id="long-v1",
+            thesis_id="thesis-1",
+            facts=facts,
+        )
+        snapshot = MarketSnapshot(
+            id="market-1",
+            occurred_at=datetime.now(timezone.utc),
+            quotes=quotes,
+        )
+        event = PortfolioEvent(
+            id="event-1",
+            type="RISK",
+            occurred_at=datetime.now(timezone.utc),
+            data=event_data,
+        )
+
+        facts["model"]["items"][0]["score"] = 0.1
+        facts["model"]["items"][0]["labels"].add("mutated")
+        quotes["AAPL"]["price"] = 1.0
+        quotes["AAPL"]["levels"][0]["bid"] = 1.0
+        event_data["reasons"].append("mutated")
+        event_data["details"]["level"] = "mutated"
+
+        self.assertEqual(candidate.facts["model"]["items"][0]["score"], 0.9)
+        self.assertNotIn(
+            "mutated",
+            candidate.facts["model"]["items"][0]["labels"],
+        )
+        self.assertEqual(snapshot.quotes["AAPL"]["price"], 100.0)
+        self.assertEqual(snapshot.quotes["AAPL"]["levels"][0]["bid"], 99.0)
+        self.assertEqual(event.data["reasons"], ("risk",))
+        self.assertEqual(event.data["details"]["level"], "warning")
+        with self.assertRaises(TypeError):
+            candidate.facts["model"]["new"] = True
+        with self.assertRaises(TypeError):
+            snapshot.quotes["AAPL"]["price"] = 2.0
+        with self.assertRaises(TypeError):
+            event.data["details"]["level"] = "changed"
+
+    def test_decision_batch_defensively_freezes_diagnostics_and_stage_outputs(self):
+        diagnostics = [
+            {
+                "code": "SAFE",
+                "details": {"reasons": ["bounded"], "tags": {"policy"}},
+            }
+        ]
+        stage_facts = [{"kind": "signals", "items": [{"symbol": "AAPL"}]}]
+        stage_diagnostics = [{"code": "STAGE_SAFE", "meta": {"items": [1]}}]
+        output = StageOutput(
+            stage="signal",
+            component_version="1",
+            facts=tuple(stage_facts),
+            diagnostics=tuple(stage_diagnostics),
+        )
+        batch = DecisionBatch(
+            run_key="run-1",
+            strategy_id="strategy-1",
+            strategy_revision=1,
+            portfolio_snapshot_id="portfolio-1",
+            market_snapshot_id="market-1",
+            diagnostics=tuple(diagnostics),
+            stage_outputs=(output,),
+        )
+
+        diagnostics[0]["code"] = "MUTATED"
+        diagnostics[0]["details"]["reasons"].append("mutated")
+        diagnostics[0]["details"]["tags"].add("mutated")
+        stage_facts[0]["items"][0]["symbol"] = "MUTATED"
+        stage_diagnostics[0]["meta"]["items"].append(2)
+
+        self.assertEqual(batch.diagnostic_codes, ("SAFE",))
+        self.assertEqual(
+            batch.diagnostics[0]["details"]["reasons"],
+            ("bounded",),
+        )
+        self.assertEqual(
+            batch.diagnostics[0]["details"]["tags"],
+            frozenset({"policy"}),
+        )
+        self.assertEqual(
+            batch.stage_outputs[0].facts[0]["items"][0]["symbol"],
+            "AAPL",
+        )
+        self.assertEqual(
+            batch.stage_outputs[0].diagnostics[0]["meta"]["items"],
+            (1,),
+        )
+        with self.assertRaises(TypeError):
+            batch.diagnostics[0]["code"] = "CHANGED"
+        with self.assertRaises(TypeError):
+            batch.stage_outputs[0].facts[0]["kind"] = "changed"
+
     def test_decision_batch_reuses_stage_output_and_reports_codes(self):
         output = StageOutput(stage="signal", component_version="1")
         batch = DecisionBatch(
@@ -318,7 +457,8 @@ class PortfolioEngineContractTests(unittest.TestCase):
             stage_outputs=(output,),
         )
 
-        self.assertIs(batch.stage_outputs[0], output)
+        self.assertIsInstance(batch.stage_outputs[0], StageOutput)
+        self.assertIsNot(batch.stage_outputs[0], output)
         self.assertEqual(batch.diagnostic_codes, ("BLOCKED",))
 
 

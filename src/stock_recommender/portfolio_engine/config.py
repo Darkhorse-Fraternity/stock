@@ -6,7 +6,7 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
-from ..markets import CN_MARKET, normalize_market
+from ..markets import CN_MARKET, normalize_market, strategy_market
 
 
 SYSTEM_MAX_POSITIONS = 10
@@ -371,16 +371,28 @@ def normalize_short_policy(value: object) -> dict[str, Any]:
 
 
 def _strategy_market(strategy: Mapping[str, Any]) -> str:
-    direct = strategy.get("market")
-    if direct is not None:
-        return normalize_market(direct)
+    has_direct_market = "market" in strategy and strategy.get("market") is not None
     parameters = strategy.get("parameters")
-    if not isinstance(parameters, Mapping):
-        return CN_MARKET
-    state = parameters.get("market")
-    if not isinstance(state, Mapping) or not state.get("enabled", True):
-        return CN_MARKET
-    return normalize_market(state.get("value"))
+    has_parameter_market = isinstance(parameters, Mapping) and "market" in parameters
+    direct_market = (
+        normalize_market(strategy.get("market"))
+        if has_direct_market
+        else None
+    )
+    parameter_market = (
+        strategy_market({"parameters": parameters})
+        if has_parameter_market
+        else None
+    )
+    if (
+        direct_market is not None
+        and parameter_market is not None
+        and direct_market != parameter_market
+    ):
+        raise StrategyPolicyError(
+            "策略 market 与 parameters.market 冲突，必须使用同一市场"
+        )
+    return direct_market or parameter_market or CN_MARKET
 
 
 def validate_strategy_policies(strategy: Mapping[str, Any]) -> None:

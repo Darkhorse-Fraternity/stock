@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from types import MappingProxyType
 from typing import Any, Mapping
 
 from ..pipeline import StageOutput
@@ -27,6 +28,28 @@ class PositionEffect(str, Enum):
     CLOSE = "CLOSE"
 
 
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _deep_freeze(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
+
+
+def _freeze_stage_output(output: StageOutput) -> StageOutput:
+    return StageOutput(
+        stage=output.stage,
+        component_version=output.component_version,
+        schema_version=output.schema_version,
+        facts=tuple(_deep_freeze(item) for item in output.facts),
+        diagnostics=tuple(_deep_freeze(item) for item in output.diagnostics),
+    )
+
+
 @dataclass(frozen=True)
 class SignalCandidate:
     symbol: str
@@ -36,6 +59,9 @@ class SignalCandidate:
     model_id: str
     thesis_id: str
     facts: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "facts", _deep_freeze(self.facts))
 
 
 @dataclass(frozen=True)
@@ -81,6 +107,9 @@ class MarketSnapshot:
     occurred_at: datetime
     quotes: Mapping[str, Mapping[str, Any]]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "quotes", _deep_freeze(self.quotes))
+
 
 @dataclass(frozen=True)
 class ExecutionFill:
@@ -102,6 +131,9 @@ class PortfolioEvent:
     occurred_at: datetime
     data: Mapping[str, Any]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "data", _deep_freeze(self.data))
+
 
 @dataclass(frozen=True)
 class DecisionBatch:
@@ -115,6 +147,18 @@ class DecisionBatch:
     events: tuple[PortfolioEvent, ...] = ()
     diagnostics: tuple[Mapping[str, Any], ...] = ()
     stage_outputs: tuple[StageOutput, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "diagnostics",
+            tuple(_deep_freeze(item) for item in self.diagnostics),
+        )
+        object.__setattr__(
+            self,
+            "stage_outputs",
+            tuple(_freeze_stage_output(item) for item in self.stage_outputs),
+        )
 
     @property
     def diagnostic_codes(self) -> tuple[str, ...]:
