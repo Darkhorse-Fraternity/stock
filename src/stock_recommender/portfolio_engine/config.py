@@ -372,8 +372,13 @@ def normalize_short_policy(value: object) -> dict[str, Any]:
 
 def _strategy_market(strategy: Mapping[str, Any]) -> str:
     has_direct_market = "market" in strategy and strategy.get("market") is not None
+    has_parameters = "parameters" in strategy
     parameters = strategy.get("parameters")
+    if has_parameters and not isinstance(parameters, Mapping):
+        raise StrategyPolicyError("策略 parameters 必须是配置对象")
     has_parameter_market = isinstance(parameters, Mapping) and "market" in parameters
+    if has_parameter_market and not isinstance(parameters.get("market"), Mapping):
+        raise StrategyPolicyError("策略 parameters.market 必须是配置对象")
     direct_market = (
         normalize_market(strategy.get("market"))
         if has_direct_market

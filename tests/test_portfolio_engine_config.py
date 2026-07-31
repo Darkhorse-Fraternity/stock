@@ -158,6 +158,32 @@ class PortfolioEngineConfigTests(unittest.TestCase):
 
             validate_strategy_policies(strategy)
 
+    def test_non_mapping_parameters_are_rejected_as_invalid_policy_input(self):
+        for parameters in (None, "us", [], True):
+            with self.subTest(parameters=parameters), self.assertRaisesRegex(
+                StrategyPolicyError,
+                "parameters|market|市场",
+            ):
+                validate_strategy_policies(
+                    {
+                        "parameters": parameters,
+                        "exposure_policy": {"mode": "LONG_ONLY"},
+                    }
+                )
+
+    def test_non_mapping_parameter_market_state_is_rejected(self):
+        for state in (None, "us", [], True):
+            with self.subTest(state=state), self.assertRaisesRegex(
+                StrategyPolicyError,
+                "parameters.market|market|市场",
+            ):
+                validate_strategy_policies(
+                    {
+                        "parameters": {"market": state},
+                        "exposure_policy": {"mode": "LONG_ONLY"},
+                    }
+                )
+
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(StrategyPolicyError):
             normalize_exposure_policy({"mode": "UNLIMITED"})
