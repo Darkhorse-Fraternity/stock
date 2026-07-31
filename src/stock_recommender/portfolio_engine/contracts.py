@@ -73,8 +73,18 @@ def _freeze_stage_output(output: StageOutput) -> StageOutput:
     )
 
 
+class _DeeplyImmutable:
+    """Mark recursively frozen domain values as safe to reuse on deepcopy."""
+
+    __slots__ = ()
+
+    def __deepcopy__(self, memo: dict[int, object]) -> _DeeplyImmutable:
+        memo[id(self)] = self
+        return self
+
+
 @dataclass(frozen=True)
-class SignalCandidate:
+class SignalCandidate(_DeeplyImmutable):
     symbol: str
     side: PositionSide
     score: float
@@ -88,7 +98,7 @@ class SignalCandidate:
 
 
 @dataclass(frozen=True)
-class TargetPosition:
+class TargetPosition(_DeeplyImmutable):
     symbol: str
     side: PositionSide
     target_weight_pct: float
@@ -103,7 +113,7 @@ def _require_positive_quantity(quantity: int) -> None:
 
 
 @dataclass(frozen=True)
-class OrderIntent:
+class OrderIntent(_DeeplyImmutable):
     id: str
     symbol: str
     position_side: PositionSide
@@ -125,7 +135,7 @@ class OrderIntent:
 
 
 @dataclass(frozen=True)
-class MarketSnapshot:
+class MarketSnapshot(_DeeplyImmutable):
     id: str
     occurred_at: datetime
     quotes: Mapping[str, Mapping[str, Any]]
@@ -135,7 +145,7 @@ class MarketSnapshot:
 
 
 @dataclass(frozen=True)
-class ExecutionFill:
+class ExecutionFill(_DeeplyImmutable):
     intent_id: str
     symbol: str
     quantity: int
@@ -148,7 +158,7 @@ class ExecutionFill:
 
 
 @dataclass(frozen=True)
-class PortfolioEvent:
+class PortfolioEvent(_DeeplyImmutable):
     id: str
     type: str
     occurred_at: datetime
@@ -159,7 +169,7 @@ class PortfolioEvent:
 
 
 @dataclass(frozen=True)
-class DecisionBatch:
+class DecisionBatch(_DeeplyImmutable):
     run_key: str
     strategy_id: str
     strategy_revision: int
