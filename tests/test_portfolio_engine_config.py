@@ -113,6 +113,24 @@ class PortfolioEngineConfigTests(unittest.TestCase):
                     {"market": "us", "exposure_policy": {"mode": mode}}
                 )
 
+    def test_us_market_aliases_can_enable_leverage_or_short(self):
+        for market in ("USA", "美股"):
+            for mode in ("LONG_LEVERAGED", "LONG_SHORT"):
+                with self.subTest(market=market, mode=mode):
+                    validate_strategy_policies(
+                        {"market": market, "exposure_policy": {"mode": mode}}
+                    )
+
+    def test_cn_market_aliases_still_reject_leverage_or_short(self):
+        for market in ("CN", "A股"):
+            for mode in ("LONG_LEVERAGED", "LONG_SHORT"):
+                with self.subTest(market=market, mode=mode), self.assertRaises(
+                    StrategyPolicyError
+                ):
+                    validate_strategy_policies(
+                        {"market": market, "exposure_policy": {"mode": mode}}
+                    )
+
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(StrategyPolicyError):
             normalize_exposure_policy({"mode": "UNLIMITED"})

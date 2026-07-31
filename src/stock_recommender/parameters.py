@@ -198,6 +198,7 @@ DELIVERY_FREQUENCIES = {"daily", "weekdays"}
 STRATEGY_STAGES = {"draft", "backtesting", "paper", "live", "paused", "archived"}
 LOCKED_STRATEGY_STAGES = {"live", "archived"}
 STRATEGY_STORE_VERSION = 6
+_LEGACY_STRATEGY_STORE_VERSION = 5
 
 
 class StrategyLifecycleError(ValueError):
@@ -664,7 +665,11 @@ def _timestamp() -> str:
 def _normalize_strategy_store(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
         raise StrategyLifecycleError("策略配置必须是对象")
-    if payload.get("version") != STRATEGY_STORE_VERSION:
+    source_version = payload.get("version")
+    if source_version not in {
+        _LEGACY_STRATEGY_STORE_VERSION,
+        STRATEGY_STORE_VERSION,
+    }:
         raise StrategyLifecycleError(
             f"不支持的策略配置版本，仅接受 version={STRATEGY_STORE_VERSION}"
         )
@@ -677,9 +682,9 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     for item in payload["strategies"]:
         if not isinstance(item, dict):
             raise StrategyLifecycleError("strategies 只能包含策略对象")
-        if item.get("version") != STRATEGY_STORE_VERSION:
+        if item.get("version") != source_version:
             raise StrategyLifecycleError(
-                f"策略版本不受支持，仅接受 version={STRATEGY_STORE_VERSION}"
+                f"策略版本必须与 store version={source_version} 一致"
             )
         strategy_id = item.get("id")
         if not isinstance(strategy_id, str) or not strategy_id.strip():
@@ -688,18 +693,19 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             raise StrategyLifecycleError("策略 id 不能包含首尾空白")
         if strategy_id in used_ids:
             raise StrategyLifecycleError(f"策略 id 重复: {strategy_id}")
-        required_sections = (
+        required_sections = [
             "lifecycle",
             "signal",
             "allocation",
-            "exposure_policy",
-            "margin_policy",
-            "short_policy",
             "validation",
             "portfolio",
             "delivery",
             "parameters",
-        )
+        ]
+        if source_version == STRATEGY_STORE_VERSION:
+            required_sections.extend(
+                ("exposure_policy", "margin_policy", "short_policy")
+            )
         missing_sections = [
             section for section in required_sections if not isinstance(item.get(section), dict)
         ]
@@ -707,7 +713,12 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             raise StrategyLifecycleError(
                 f"策略 {strategy_id} 缺少配置段: {', '.join(missing_sections)}"
             )
-        strategy = normalize_strategy_config(item)
+        strategy_payload = item
+        if source_version == _LEGACY_STRATEGY_STORE_VERSION:
+            strategy_payload = deepcopy(item)
+            for section in ("exposure_policy", "margin_policy", "short_policy"):
+                strategy_payload.pop(section, None)
+        strategy = normalize_strategy_config(strategy_payload)
         strategy["id"] = strategy_id
         used_ids.add(strategy_id)
         strategies.append(strategy)

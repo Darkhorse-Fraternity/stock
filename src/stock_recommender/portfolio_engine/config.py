@@ -6,6 +6,8 @@ import math
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
+from ..markets import CN_MARKET, normalize_market
+
 
 SYSTEM_MAX_POSITIONS = 10
 SYSTEM_MAX_GROSS_EXPOSURE_PCT = 150.0
@@ -371,14 +373,14 @@ def normalize_short_policy(value: object) -> dict[str, Any]:
 def _strategy_market(strategy: Mapping[str, Any]) -> str:
     direct = strategy.get("market")
     if direct is not None:
-        return str(direct).strip().lower()
+        return normalize_market(direct)
     parameters = strategy.get("parameters")
     if not isinstance(parameters, Mapping):
-        return "cn"
+        return CN_MARKET
     state = parameters.get("market")
     if not isinstance(state, Mapping) or not state.get("enabled", True):
-        return "cn"
-    return str(state.get("value") or "cn").strip().lower()
+        return CN_MARKET
+    return normalize_market(state.get("value"))
 
 
 def validate_strategy_policies(strategy: Mapping[str, Any]) -> None:
