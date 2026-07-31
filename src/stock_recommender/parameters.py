@@ -596,6 +596,11 @@ def normalize_strategy_config(config: dict | None) -> dict:
     return normalized
 
 
+_PARAMETER_LIST_LIMITS = {
+    "watchlist": 200,
+}
+
+
 def _normalize_value(definition: dict, value: Any) -> Any:
     kind = definition["kind"]
     if kind == "boolean":
@@ -605,7 +610,8 @@ def _normalize_value(definition: dict, value: Any) -> Any:
     if kind in {"multi", "tags"}:
         if not isinstance(value, list):
             return deepcopy(definition["default"])
-        return [str(item).strip()[:60] for item in value if str(item).strip()][:30]
+        limit = _PARAMETER_LIST_LIMITS.get(str(definition.get("id") or ""), 30)
+        return [str(item).strip()[:60] for item in value if str(item).strip()][:limit]
     try:
         number = float(value)
     except (TypeError, ValueError):
