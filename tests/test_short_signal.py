@@ -279,6 +279,38 @@ class ShortTrendBreakdownTests(unittest.TestCase):
                     (),
                 )
 
+    def test_parseable_numeric_strings_and_booleans_are_safely_rejected(self):
+        parseable_strings = {
+            "momentum20": "-0.12",
+            "momentum60": "-0.25",
+            "price": "70",
+            "ma20": "80.0",
+            "ma60": "95.0",
+            "volatility20": "0.45",
+            "turnover": "50000000",
+            "one_day_return": "-0.03",
+        }
+        model = ShortTrendBreakdownV1()
+        for field, value in parseable_strings.items():
+            with self.subTest(field=field, kind="numeric_string"):
+                self.assertEqual(
+                    model.evaluate(
+                        [make_row(**{field: value})],
+                        event_calendar={"TEST": None},
+                    ),
+                    (),
+                )
+        for field in parseable_strings:
+            for value in (False, True):
+                with self.subTest(field=field, value=value, kind="bool"):
+                    self.assertEqual(
+                        model.evaluate(
+                            [make_row(**{field: value})],
+                            event_calendar={"TEST": None},
+                        ),
+                        (),
+                    )
+
     def test_invalid_rows_do_not_change_deterministic_valid_result(self):
         valid = make_row(symbol="VALID")
         invalid = make_row(symbol="INVALID", momentum20=math.nan)
@@ -292,6 +324,45 @@ class ShortTrendBreakdownTests(unittest.TestCase):
             [(item.symbol, item.score, item.thesis_id) for item in first],
             [(item.symbol, item.score, item.thesis_id) for item in second],
         )
+
+    def test_duplicate_symbol_tie_selects_latest_cutoff_independent_of_order(self):
+        older = make_row(
+            symbol="DUP",
+            cutoff_date="2026-07-29",
+            momentum20=-0.20,
+            momentum60=-0.30,
+            price=60.0,
+            ma20=90.0,
+            ma60=100.0,
+            volatility20=0.70,
+            turnover=20_000_000,
+        )
+        newer = make_row(
+            symbol="DUP",
+            cutoff_date="2026-07-30",
+            momentum20=-0.05,
+            momentum60=-0.10,
+            price=80.0,
+            ma20=90.0,
+            ma60=100.0,
+            volatility20=0.20,
+            turnover=60_000_000,
+        )
+        model = ShortTrendBreakdownV1()
+
+        forward = model.evaluate(
+            [older, newer], event_calendar={"DUP": None}
+        )
+        reverse = model.evaluate(
+            [newer, older], event_calendar={"DUP": None}
+        )
+
+        self.assertEqual(len(forward), 1)
+        self.assertEqual(forward[0].score, 0.5)
+        self.assertEqual(forward[0].facts["cutoff_date"], "2026-07-30")
+        self.assertEqual(forward[0].symbol, reverse[0].symbol)
+        self.assertEqual(forward[0].thesis_id, reverse[0].thesis_id)
+        self.assertEqual(forward[0].facts, reverse[0].facts)
 
 
 class SignalRegistryTests(unittest.TestCase):

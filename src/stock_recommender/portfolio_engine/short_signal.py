@@ -30,12 +30,9 @@ _RANKING_FIELDS = (
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    number = float(value)
     return number if math.isfinite(number) else None
 
 
@@ -73,6 +70,29 @@ def _normalized_values(
     return {id(row): (float(row[field_name]) - low) / width for row in rows}
 
 
+def _duplicate_winner_key(
+    item: tuple[float, str, dict[str, object], dict[str, float]],
+) -> tuple[float, str, tuple[float, ...], tuple[float, ...]]:
+    score, _, row, components = item
+    normalized_components = tuple(
+        components[field_name] for field_name in _RANKING_FIELDS
+    )
+    core_facts = tuple(
+        float(row[field_name])
+        for field_name in (
+            "momentum20",
+            "momentum60",
+            "price",
+            "ma20",
+            "ma60",
+            "volatility20",
+            "turnover",
+            "one_day_return",
+        )
+    )
+    return score, str(row["cutoff_date"]), normalized_components, core_facts
+
+
 @dataclass(frozen=True)
 class ShortTrendBreakdownV1:
     policy: ShortPolicy | Mapping[str, object] = field(default_factory=ShortPolicy)
@@ -105,13 +125,26 @@ class ShortTrendBreakdownV1:
             )
             ranked.append((score, str(row["symbol"]), row, components))
 
-        ranked.sort(key=lambda item: (-item[0], item[1]))
+        # Duplicate symbols use the highest score, then the latest cutoff, then
+        # canonical normalized/core facts. Input position never selects a winner.
+        by_symbol: dict[
+            str,
+            tuple[float, str, dict[str, object], dict[str, float]],
+        ] = {}
+        for item in ranked:
+            symbol = item[1]
+            previous = by_symbol.get(symbol)
+            if previous is None or _duplicate_winner_key(
+                item
+            ) > _duplicate_winner_key(previous):
+                by_symbol[symbol] = item
+
+        ranked = sorted(
+            by_symbol.values(),
+            key=lambda item: (-item[0], item[1]),
+        )
         candidates: list[SignalCandidate] = []
-        used_symbols: set[str] = set()
         for score, symbol, row, components in ranked:
-            if symbol in used_symbols:
-                continue
-            used_symbols.add(symbol)
             cutoff_date = row["cutoff_date"]
             thesis_id = self._thesis_id(symbol, str(cutoff_date))
             candidates.append(
