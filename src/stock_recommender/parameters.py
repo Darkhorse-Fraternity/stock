@@ -666,10 +666,14 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     if not isinstance(payload, dict):
         raise StrategyLifecycleError("策略配置必须是对象")
     source_version = payload.get("version")
-    if source_version not in {
-        _LEGACY_STRATEGY_STORE_VERSION,
-        STRATEGY_STORE_VERSION,
-    }:
+    if (
+        isinstance(source_version, bool)
+        or not isinstance(source_version, int)
+        or source_version not in {
+            _LEGACY_STRATEGY_STORE_VERSION,
+            STRATEGY_STORE_VERSION,
+        }
+    ):
         raise StrategyLifecycleError(
             f"不支持的策略配置版本，仅接受 version={STRATEGY_STORE_VERSION}"
         )
@@ -682,7 +686,10 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     for item in payload["strategies"]:
         if not isinstance(item, dict):
             raise StrategyLifecycleError("strategies 只能包含策略对象")
-        if item.get("version") != source_version:
+        item_version = item.get("version")
+        if isinstance(item_version, bool) or not isinstance(item_version, int):
+            raise StrategyLifecycleError("策略版本必须是整数 schema version")
+        if item_version != source_version:
             raise StrategyLifecycleError(
                 f"策略版本必须与 store version={source_version} 一致"
             )

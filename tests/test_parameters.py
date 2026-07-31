@@ -91,6 +91,56 @@ class ParameterCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(StrategyLifecycleError, "version=6"):
                 load_strategy_store(path=path)
 
+    def test_strategy_store_rejects_non_integer_store_schema_versions(self):
+        for invalid_version in ([], {}, True, False):
+            with (
+                self.subTest(version=invalid_version),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "strategies.json"
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": invalid_version,
+                            "active_strategy_id": None,
+                            "strategies": [],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    StrategyLifecycleError,
+                    "版本|version",
+                ):
+                    load_strategy_store(path=path)
+
+    def test_strategy_store_rejects_non_integer_strategy_schema_versions(self):
+        for invalid_version in ([], {}, True, False):
+            with (
+                self.subTest(version=invalid_version),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                path = Path(directory) / "strategies.json"
+                strategy = default_strategy_config()
+                strategy.update({"version": invalid_version, "id": "strategy-1"})
+                path.write_text(
+                    json.dumps(
+                        {
+                            "version": 6,
+                            "active_strategy_id": "strategy-1",
+                            "strategies": [strategy],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                with self.assertRaisesRegex(
+                    StrategyLifecycleError,
+                    "版本|version",
+                ):
+                    load_strategy_store(path=path)
+
     def test_v5_store_cannot_enable_policy_fields_from_the_new_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "strategies.json"
