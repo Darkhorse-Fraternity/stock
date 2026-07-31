@@ -296,6 +296,7 @@ class StockAgentTests(unittest.TestCase):
             from stock_recommender.parameters import default_strategy_config
             strategy = default_strategy_config()
             strategy["lifecycle"]["stage"] = "paper"
+            strategy["delivery"]["schedule_mode"] = "fixed"
             with mock.patch.dict("os.environ", env, clear=True), mock.patch(
                 "stock_recommender.cli.load_strategy_config", return_value=strategy
             ), mock.patch(
@@ -316,6 +317,7 @@ class StockAgentTests(unittest.TestCase):
         )
         strategy = default_strategy_config()
         strategy["lifecycle"]["stage"] = "paper"
+        strategy["delivery"]["schedule_mode"] = "fixed"
         calls = []
         render_options = {}
 

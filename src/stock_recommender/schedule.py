@@ -39,6 +39,22 @@ def is_market_open(now: datetime | None = None, *, market: object = CN_MARKET) -
     return market_is_open(now, market)
 
 
+def should_publish_at_market_open(
+    now: datetime | None = None,
+    *,
+    market: object = CN_MARKET,
+) -> bool:
+    from .markets import market_profile
+
+    current = market_now(now, market)
+    session_start = market_profile(market).session_start
+    return (
+        is_market_open(now, market=market)
+        and current.hour == session_start.hour
+        and current.minute == session_start.minute
+    )
+
+
 def should_publish_now(
     now: datetime | None = None,
     *,

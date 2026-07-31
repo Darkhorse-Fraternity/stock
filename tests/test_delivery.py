@@ -28,7 +28,14 @@ class DeliveryTests(unittest.TestCase):
 
     def test_early_beijing_weekday_schedule_shifts_utc_weekdays(self):
         strategy = default_strategy_config()
-        strategy["delivery"].update({"hour": 7, "minute": 30, "frequency": "weekdays"})
+        strategy["delivery"].update(
+            {
+                "schedule_mode": "fixed",
+                "hour": 7,
+                "minute": 30,
+                "frequency": "weekdays",
+            }
+        )
 
         self.assertEqual(delivery_cron(strategy), "30 23 * * 0-4")
 
@@ -47,6 +54,7 @@ class DeliveryTests(unittest.TestCase):
 
         strategy = default_strategy_config()
         strategy["lifecycle"]["stage"] = "paper"
+        strategy["delivery"]["schedule_mode"] = "fixed"
         strategy["delivery"].update({"enabled": True, "channel": "feishu", "target": "oc_test", "hour": 8, "minute": 0, "frequency": "daily"})
         with patch.dict(os.environ, {"STOCK_AGENT_HERMES_JOB_ID": "job-1", "STOCK_AGENT_HERMES_BIN": "hermes"}):
             result = sync_hermes_delivery(strategy, runner=runner)

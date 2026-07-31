@@ -212,6 +212,7 @@ def default_report_delivery() -> dict:
     return {
         "enabled": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_ENABLED", "0") == "1",
         "channel": channel if channel in DELIVERY_CHANNELS else "feishu",
+        "schedule_mode": "market_open",
         "target": os.getenv("STOCK_AGENT_DEFAULT_DELIVERY_TARGET", "")[:200],
         "hour": min(23, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_HOUR", 8))),
         "minute": min(59, max(0, _environment_int("STOCK_AGENT_DEFAULT_DELIVERY_MINUTE", 0))),
@@ -226,6 +227,12 @@ def normalize_report_delivery(value: object) -> dict:
     if not isinstance(value, dict):
         return normalized
     channel = str(value.get("channel") or normalized["channel"]).strip().lower()
+    raw_schedule_mode = value.get("schedule_mode")
+    if raw_schedule_mode is None and ({"hour", "minute"} & value.keys()):
+        raw_schedule_mode = "fixed"
+    schedule_mode = str(
+        raw_schedule_mode or normalized["schedule_mode"]
+    ).strip().lower()
     frequency = str(value.get("frequency") or normalized["frequency"]).strip().lower()
     try:
         hour = int(value.get("hour", normalized["hour"]))
@@ -236,6 +243,11 @@ def normalize_report_delivery(value: object) -> dict:
         {
             "enabled": bool(value.get("enabled", normalized["enabled"])),
             "channel": channel if channel in DELIVERY_CHANNELS else "feishu",
+            "schedule_mode": (
+                schedule_mode
+                if schedule_mode in {"market_open", "fixed"}
+                else "market_open"
+            ),
             "target": str(value.get("target") or "").strip()[:200],
             "hour": min(23, max(0, hour)),
             "minute": min(59, max(0, minute)),
@@ -983,6 +995,34 @@ def delete_strategy(strategy_id: str, *, path: str | Path | None = None) -> dict
     return save_strategy_store(store, path)
 
 
+def _strategy_delivery_payload(config: dict) -> dict:
+    from zoneinfo import ZoneInfo
+
+    delivery = normalize_report_delivery(config.get("delivery"))
+    if delivery["schedule_mode"] != "market_open":
+        return delivery
+
+    profile = market_profile(strategy_market(config))
+    exchange_now = datetime.now(profile.timezone)
+    exchange_open = datetime.combine(
+        exchange_now.date(),
+        profile.session_start,
+        tzinfo=profile.timezone,
+    )
+    shanghai_open = exchange_open.astimezone(ZoneInfo("Asia/Shanghai"))
+    delivery.update(
+        {
+            "hour": shanghai_open.hour,
+            "minute": shanghai_open.minute,
+            "schedule_label": (
+                f"{profile.label}开盘 {profile.session_start.strftime('%H:%M')}"
+                "（自动时区）"
+            ),
+        }
+    )
+    return delivery
+
+
 def strategy_library_payload(path: str | Path | None = None) -> dict:
     store = load_strategy_store(path)
     summaries = []
@@ -1011,7 +1051,7 @@ def strategy_library_payload(path: str | Path | None = None) -> dict:
                 "allocation": deepcopy(strategy["allocation"]),
                 "active_parameters": active_parameters,
                 "is_active": strategy["id"] == store["active_strategy_id"],
-                "delivery": deepcopy(strategy["delivery"]),
+                "delivery": _strategy_delivery_payload(strategy),
                 "market": {
                     "code": profile.code,
                     "label": profile.label,

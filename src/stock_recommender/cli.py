@@ -14,7 +14,11 @@ from .markets import strategy_market
 from .portfolio import format_action_notifications, format_portfolio_summary, monitor_portfolio
 from .reports import append_performance_link, render_ai_report_result, render_report_result
 from .runtime import assert_strategy_runnable
-from .schedule import parse_publish_hours, should_publish_now
+from .schedule import (
+    parse_publish_hours,
+    should_publish_at_market_open,
+    should_publish_now,
+)
 from .tracking import save_daily_selection
 from .universe import normalize_sector_filters
 
@@ -60,6 +64,19 @@ def main() -> None:
         return
     mode = os.getenv("STOCK_AGENT_MODE", "report").strip().lower()
     execution_kind = os.getenv("STOCK_AGENT_EXECUTION_KIND", "scheduled").strip().lower()
+    automatic_market_open_guard = (
+        execution_kind == "scheduled"
+        and mode in {"report", "ai"}
+        and str(
+            strategy.get("delivery", {}).get("schedule_mode", "fixed")
+        ).strip().lower()
+        == "market_open"
+    )
+    if automatic_market_open_guard and not should_publish_at_market_open(
+        market=market
+    ):
+        return
+
     assert_strategy_runnable(strategy, execution_kind=execution_kind, mode=mode)
     adapter = get_market_adapter(market)
     board_code, board_name = adapter.resolve_universe(

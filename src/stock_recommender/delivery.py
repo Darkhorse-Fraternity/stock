@@ -39,6 +39,13 @@ def delivery_target(config: dict) -> str:
 
 def delivery_cron(config: dict) -> str:
     delivery = normalize_report_delivery(config.get("delivery"))
+    if delivery["schedule_mode"] == "market_open":
+        if strategy_market(config) == US_MARKET:
+            # New York 09:30 is 13:30 UTC in daylight time and 14:30 UTC
+            # in standard time. The CLI exchange-local guard suppresses the
+            # inactive window, so the job remains DST-safe without resyncing.
+            return "30 13,14 * * 1-5"
+        return "30 1 * * 1-5"
     local_minutes = delivery["hour"] * 60 + delivery["minute"]
     utc_minutes = (local_minutes - 8 * 60) % (24 * 60)
     hour, minute = divmod(utc_minutes, 60)
