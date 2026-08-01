@@ -103,14 +103,14 @@ class UsMarketAdapterTests(unittest.TestCase):
 
         self.assertEqual(resolve({"market": "us"}), "us")
         self.assertEqual(
-            resolve({"parameters": {"market": {"value": "us"}}}),
+            resolve({"parameters": {"market": {"enabled": True, "value": "us"}}}),
             "us",
         )
         self.assertEqual(
             resolve(
                 {
                     "market": "us",
-                    "parameters": {"market": {"value": "us"}},
+                    "parameters": {"market": {"enabled": True, "value": "us"}},
                 }
             ),
             "us",
@@ -124,10 +124,26 @@ class UsMarketAdapterTests(unittest.TestCase):
             {},
             {"market": "moon"},
             {"market": ""},
-            {"market": "us", "parameters": {"market": {"value": "cn"}}},
+            {
+                "market": "us",
+                "parameters": {"market": {"enabled": True, "value": "cn"}},
+            },
             {"parameters": None},
             {"parameters": {"market": "us"}},
-            {"parameters": {"market": {"value": None}}},
+            {"parameters": {"market": {"enabled": True, "value": None}}},
+        )
+        for strategy in invalid:
+            with self.subTest(strategy=strategy), self.assertRaises(ValueError):
+                resolve(strategy)
+
+    def test_strict_strategy_market_rejects_disabled_or_malformed_nested_identity(self):
+        resolve = markets.strict_strategy_market
+
+        invalid = (
+            {"market": "us", "parameters": {"market": {"enabled": False, "value": "us"}}},
+            {"market": "us", "parameters": {"market": {"value": "us"}}},
+            {"market": "us", "parameters": {"market": {"enabled": 1, "value": "us"}}},
+            {"parameters": {"market": {"enabled": "true", "value": "us"}}},
         )
         for strategy in invalid:
             with self.subTest(strategy=strategy), self.assertRaises(ValueError):

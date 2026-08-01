@@ -688,6 +688,33 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                 engine.plan_and_commit(changed)
             self.assertEqual(ledger.commit_calls, 1)
 
+    def test_process_cost_multiplier_is_part_of_idempotency_identity(self):
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(signal_registry={}, ledger_store=ledger)
+            request = ProcessRequest(
+                run_key="process:cost-multiplier-retry",
+                strategy=strategy("LONG_ONLY"),
+                account=ledger.load("strategy-us"),
+                market=market("cost-multiplier-market", occurred_at=NOW + timedelta(minutes=1)),
+                borrow=BorrowSnapshot.unavailable("cost-multiplier-borrow"),
+                cost_multiplier=1.5,
+            )
+
+            first = engine.process_and_commit(request)
+            repeated = engine.process_and_commit(request)
+
+            self.assertEqual(repeated, first)
+            self.assertEqual(ledger.commit_calls, 1)
+            self.assertNotEqual(
+                service.request_fingerprint(request),
+                service.request_fingerprint(replace(request, cost_multiplier=2.0)),
+            )
+            with self.assertRaisesRegex(LedgerError, "different request|run_key"):
+                engine.process_and_commit(replace(request, cost_multiplier=2.0))
+            self.assertEqual(ledger.commit_calls, 1)
+
     def test_request_fingerprint_covers_every_plan_and_process_input(self):
         base_plan = PlanRequest(
             run_key="plan:fingerprint",

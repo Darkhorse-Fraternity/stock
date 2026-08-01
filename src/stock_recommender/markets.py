@@ -154,6 +154,8 @@ def strict_strategy_market(strategy: Mapping[str, object]) -> str:
             market_parameter = parameters.get("market")
             if not isinstance(market_parameter, Mapping):
                 raise ValueError("strategy parameters.market must be a mapping")
+            if market_parameter.get("enabled") is not True:
+                raise ValueError("strategy parameters.market.enabled must be true")
             if "value" not in market_parameter:
                 raise ValueError("strategy parameters.market.value is required")
             nested = market_parameter.get("value")

@@ -24,6 +24,7 @@ from .portfolio_engine.contracts import (
     OrderIntent,
     PlanRequest,
     PortfolioEvent,
+    PositionEffect,
     ProcessRequest,
     SignalCandidate,
 )
@@ -322,10 +323,13 @@ class EngineReplayResult:
     final_nav: float
     final_positions: tuple[tuple[Any, ...], ...]
     event_types: tuple[str, ...]
+    closed_trades: int
     metrics: Mapping[str, float]
     metadata: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        if type(self.closed_trades) is not int or self.closed_trades < 0:
+            raise ValueError("closed_trades must be a nonnegative integer")
         object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
         object.__setattr__(self, "metadata", MappingProxyType(dict(self.metadata)))
 
@@ -461,6 +465,8 @@ def replay_engine_frames(
     nav_series: list[float] = []
     event_types: list[str] = []
     seen_event_ids: set[str] = set()
+    intents_by_id: dict[str, OrderIntent] = {}
+    closed_intent_ids: set[str] = set()
     estimated_any = False
     history_complete = True
     all_aprs: list[float] = []
@@ -509,6 +515,15 @@ def replay_engine_frames(
                     )
                 )
             total_fees += sum(fill.fees for fill in batch.fills)
+            intents_by_id.update((intent.id, intent) for intent in batch.intents)
+            for progress in batch.execution_progress:
+                intent = intents_by_id.get(progress.intent_id)
+                if (
+                    progress.status == "FILLED"
+                    and intent is not None
+                    and intent.position_effect is PositionEffect.CLOSE
+                ):
+                    closed_intent_ids.add(progress.intent_id)
             signal_frames.append(_signal_semantic_fingerprints(batch))
             intent_frames.append(
                 tuple(_intent_semantic_fingerprint(item) for item in batch.intents)
@@ -564,6 +579,7 @@ def replay_engine_frames(
         final_nav=final_snapshot.metrics.equity,
         final_positions=final_positions,
         event_types=tuple(event_types),
+        closed_trades=len(closed_intent_ids),
         metrics={
             "transaction_fees": total_fees,
             "financing_cost": final_snapshot.metrics.accrued_financing_cost,
@@ -1036,11 +1052,7 @@ def replay_portfolio_fold(
         "coverage_complete": coverage_complete,
         "execution_data_coverage_complete": execution_data_coverage_complete,
         "event_calendar_coverage_complete": event_calendar_coverage_complete,
-        "closed_trades": sum(
-            1
-            for event_type in replay.event_types
-            if event_type == "POSITION_CLOSED"
-        ),
+        "closed_trades": replay.closed_trades,
         "final_positions": len(replay.final_positions),
         "event_fingerprints": replay.event_fingerprints,
         "fill_fingerprints": replay.fill_fingerprints,

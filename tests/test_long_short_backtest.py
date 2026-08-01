@@ -50,6 +50,24 @@ class StaticSignals:
         )
 
 
+class RowWeightSignals:
+    model_id = "long-row-weight-v1"
+
+    def evaluate(self, rows, event_calendar):
+        del event_calendar
+        row = rows[0]
+        return (
+            SignalCandidate(
+                symbol=str(row["symbol"]),
+                side=PositionSide.LONG,
+                score=1.0,
+                requested_weight_pct=float(row["requested_weight_pct"]),
+                model_id=self.model_id,
+                thesis_id="long-row-weight-v1:L:2026-07-31",
+            ),
+        )
+
+
 def long_short_strategy() -> dict:
     exposure = default_exposure_policy()
     exposure["mode"] = "LONG_SHORT"
@@ -82,6 +100,38 @@ def long_short_strategy() -> dict:
             "max_bar_participation_pct": 100.0,
         },
     }
+
+
+def long_only_replay_strategy(*, model_id: str) -> dict:
+    value = long_short_strategy()
+    value["id"] = f"backtest-{model_id}"
+    value["signal"]["model"] = model_id
+    value["exposure_policy"]["mode"] = "LONG_ONLY"
+    return value
+
+
+def single_market(
+    snapshot_id: str,
+    occurred_at: datetime,
+    *,
+    price: float = 100.0,
+    bar_volume: int = 1_000_000,
+) -> MarketSnapshot:
+    return MarketSnapshot(
+        id=snapshot_id,
+        occurred_at=occurred_at,
+        quotes={
+            "L": {
+                "price": price,
+                "bar_open": price,
+                "bar_high": price,
+                "bar_low": price,
+                "bar_volume": bar_volume,
+                "volume_ratio": 1.0,
+                "one_day_return": 0.0,
+            }
+        },
+    )
 
 
 def market(snapshot_id: str, occurred_at: datetime, price: float = 100.0) -> MarketSnapshot:
@@ -320,6 +370,106 @@ def production_short_dataset(*, days: int = 100) -> dict:
 
 
 class LongShortBacktestTests(unittest.TestCase):
+    def test_replay_counts_one_close_only_after_partial_close_becomes_filled(self):
+        strategy_value = long_only_replay_strategy(model_id="long-static-v1")
+        strategy_value["portfolio"]["max_bar_participation_pct"] = 100.0
+        result = replay_engine_frames(
+            strategy=strategy_value,
+            frames=(
+                EngineReplayFrame.plan(
+                    single_market("close-plan", CUTOFF),
+                    analyzed_rows=({"symbol": "L"},),
+                    event_calendar={"L": None},
+                ),
+                EngineReplayFrame.process(
+                    single_market("close-open", CUTOFF + timedelta(days=3, minutes=1)),
+                ),
+                EngineReplayFrame.process(
+                    single_market(
+                        "close-risk",
+                        CUTOFF + timedelta(days=3, minutes=2),
+                        price=90.0,
+                    ),
+                ),
+                EngineReplayFrame.process(
+                    single_market(
+                        "close-partial",
+                        CUTOFF + timedelta(days=3, minutes=3),
+                        price=90.0,
+                        bar_volume=60,
+                    ),
+                ),
+                EngineReplayFrame.process(
+                    single_market(
+                        "close-filled",
+                        CUTOFF + timedelta(days=3, minutes=4),
+                        price=90.0,
+                    ),
+                    record_nav=True,
+                ),
+            ),
+            borrow_book=estimated_borrow_book(),
+            signal_registry={
+                "long-static-v1": StaticSignals(
+                    "long-static-v1", PositionSide.LONG, ("L",)
+                )
+            },
+        )
+        close_intent_id = next(
+            item[0]
+            for frame in result.intent_fingerprints
+            for item in frame
+            if item[4] == "CLOSE"
+        )
+        close_statuses = [
+            item[4]
+            for frame in result.fill_fingerprints
+            for item in frame
+            if item[0] == close_intent_id
+        ]
+
+        self.assertEqual(close_statuses, ["PARTIAL", "FILLED"])
+        self.assertEqual(result.closed_trades, 1)
+        self.assertEqual(result.final_positions, ())
+
+    def test_replay_does_not_count_filled_reduce_as_closed_trade(self):
+        strategy_value = long_only_replay_strategy(model_id=RowWeightSignals.model_id)
+        strategy_value["portfolio"]["max_bar_participation_pct"] = 100.0
+        result = replay_engine_frames(
+            strategy=strategy_value,
+            frames=(
+                EngineReplayFrame.plan(
+                    single_market("reduce-plan-open", CUTOFF),
+                    analyzed_rows=({"symbol": "L", "requested_weight_pct": 10.0},),
+                    event_calendar={"L": None},
+                ),
+                EngineReplayFrame.process(
+                    single_market("reduce-open", CUTOFF + timedelta(days=3, minutes=1)),
+                ),
+                EngineReplayFrame.plan(
+                    single_market("reduce-plan", CUTOFF + timedelta(days=3, minutes=2)),
+                    analyzed_rows=({"symbol": "L", "requested_weight_pct": 5.0},),
+                    event_calendar={"L": None},
+                ),
+                EngineReplayFrame.process(
+                    single_market("reduce-filled", CUTOFF + timedelta(days=3, minutes=3)),
+                    record_nav=True,
+                ),
+            ),
+            borrow_book=estimated_borrow_book(),
+            signal_registry={RowWeightSignals.model_id: RowWeightSignals()},
+        )
+
+        self.assertTrue(
+            any(
+                item[4] == "REDUCE"
+                for frame in result.intent_fingerprints
+                for item in frame
+            )
+        )
+        self.assertEqual(result.closed_trades, 0)
+        self.assertEqual(result.final_positions[0][2], 50)
+
     def test_top_level_us_market_uses_complete_us_borrow_history(self):
         result = replay(
             mode="backtest",
@@ -387,6 +537,38 @@ class LongShortBacktestTests(unittest.TestCase):
         self.assertTrue(result["metadata"]["event_calendar_history_complete"])
         self.assertTrue(checks["borrow_history"]["passed"])
         self.assertTrue(checks["event_calendar"]["passed"])
+
+    def test_walk_forward_propagates_filled_close_count_to_top_level_metrics(self):
+        dataset = production_short_dataset()
+        execution_prices = {
+            "2024-03-20": (100.0, 100.0),
+            "2024-03-21": (100.0, 120.0),
+            "2024-03-22": (120.0, 120.0),
+        }
+        for rows in dataset["panel"].values():
+            for row in rows:
+                prices = execution_prices.get(row["date"])
+                if prices is None:
+                    continue
+                entry_price, exit_price = prices
+                row.update(
+                    {
+                        "open": entry_price,
+                        "close": exit_price,
+                        "high": max(entry_price, exit_price) + 1.0,
+                        "low": min(entry_price, exit_price) - 1.0,
+                        "entry_price": entry_price,
+                        "exit_price": exit_price,
+                    }
+                )
+
+        result = run_walk_forward_backtest(dataset, production_short_strategy())
+
+        self.assertGreater(result["metrics"]["closed_trades"], 0)
+        self.assertEqual(
+            result["metrics"]["closed_trades"],
+            sum(fold["closed_trades"] for fold in result["folds"]),
+        )
 
     def test_production_walk_forward_never_reads_future_event_calendar(self):
         strategy = production_short_strategy()
