@@ -40,12 +40,35 @@ SHORT_STOP_LOSS = "SHORT_STOP_LOSS"
 LONG_TRAILING_STOP = "LONG_TRAILING_STOP"
 SHORT_TRAILING_STOP = "SHORT_TRAILING_STOP"
 SHORT_SQUEEZE = "SHORT_SQUEEZE"
+SQUEEZE_DATA_INVALID = "SQUEEZE_DATA_INVALID"
 
 FORCED_DELEVERAGING_COST_RATE = 0.001
 _POSITION_MODES = frozenset({NORMAL, COVER_ONLY})
 _PORTFOLIO_STATES = frozenset(
     {NORMAL, WARNING, DERISK, MANUAL_HALT, INSOLVENT_HALT, REDUCE_ONLY, MARGIN_CALL}
 )
+_RISK_REASON_SEMANTICS = {
+    LONG_STOP_LOSS: frozenset(
+        {(PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE)}
+    ),
+    LONG_TRAILING_STOP: frozenset(
+        {(PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE)}
+    ),
+    SHORT_STOP_LOSS: frozenset(
+        {(PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE)}
+    ),
+    SHORT_TRAILING_STOP: frozenset(
+        {(PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE)}
+    ),
+    MARGIN_CALL: frozenset(
+        {
+            (PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE),
+            (PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE),
+        }
+    ),
+    SHORT_SQUEEZE: frozenset({(PositionSide.SHORT, None, None)}),
+    SQUEEZE_DATA_INVALID: frozenset({(PositionSide.SHORT, None, None)}),
+}
 
 
 class RiskError(ValueError):
@@ -211,6 +234,15 @@ class RiskDecision(_ImmutableRiskValue):
             self.intent.reason,
         ):
             raise ValueError("risk intent id must match its immutable decision inputs")
+        if self.reason is not None:
+            allowed = _RISK_REASON_SEMANTICS.get(self.reason)
+            actual = (
+                self.updated_position.side,
+                None if self.intent is None else self.intent.order_side,
+                self.position_effect,
+            )
+            if allowed is None or actual not in allowed:
+                raise ValueError("reason is inconsistent with risk decision semantics")
         if self.updated_position.position_mode != self.position_mode:
             raise ValueError("updated_position mode must match position_mode")
 
@@ -543,7 +575,7 @@ def evaluate_squeeze(
     volume_ratio = _quote_number(quote, ("volume_ratio", "relative_volume"))
     if daily_rise is None or volume_ratio is None:
         updated = replace(short_position, position_mode=original_mode)
-        return RiskDecision("SQUEEZE_DATA_INVALID", None, original_mode, updated)
+        return RiskDecision(SQUEEZE_DATA_INVALID, None, original_mode, updated)
     triggered = (
         daily_rise >= float(policy.squeeze_rise_pct)
         and volume_ratio >= float(policy.squeeze_volume_ratio)
@@ -672,7 +704,7 @@ def _value_risk_account(
     raw_prices: Mapping[str, object],
     *,
     equity_override: Decimal | None = None,
-) -> tuple[PortfolioMetrics, tuple[str, ...], bool, Decimal]:
+) -> tuple[PortfolioMetrics, tuple[str, ...], bool, Decimal, float]:
     valuation_account, prices, missing, complete = _valuation_context(
         account, raw_prices
     )
@@ -711,8 +743,7 @@ def _value_risk_account(
         if gross == 0
         else float(exact_equity / gross * Decimal(100))
     )
-    metrics = replace(metrics, margin_rate_pct=stable_margin_rate)
-    return metrics, missing, complete, exact_equity
+    return metrics, missing, complete, exact_equity, stable_margin_rate
 
 
 def _margin_policy(value: object) -> tuple[MarginPolicy, float, float]:
@@ -747,12 +778,25 @@ def _margin_state(
     metrics: PortfolioMetrics,
     maintenance: float,
     threshold: float,
+    *,
+    exact_equity: Decimal | None = None,
+    stable_margin_rate: float | None = None,
 ) -> str:
     if _gross(metrics) == 0:
         return NORMAL
-    if metrics.equity <= 0 or metrics.margin_rate_pct < maintenance:
+    equity_insolvent = (
+        metrics.equity <= 0
+        if exact_equity is None
+        else exact_equity <= Decimal(0)
+    )
+    margin_rate = (
+        metrics.margin_rate_pct
+        if stable_margin_rate is None
+        else stable_margin_rate
+    )
+    if equity_insolvent or margin_rate < maintenance:
         return MARGIN_CALL
-    if metrics.margin_rate_pct < threshold:
+    if margin_rate < threshold:
         return REDUCE_ONLY
     return NORMAL
 
@@ -767,15 +811,21 @@ def evaluate_forced_deleveraging(
     if type(account) is not AccountSnapshot:
         raise TypeError("account must be AccountSnapshot")
     raw_prices = _raw_prices(prices)
-    _, maintenance, threshold = _margin_policy(margin_policy)
-    initial_metrics, missing, complete, exact_equity = _value_risk_account(
-        account, raw_prices
+    resolved_policy, maintenance, threshold = _margin_policy(margin_policy)
+    threshold_decimal = Decimal(str(maintenance)) + Decimal(
+        str(resolved_policy.liquidation_buffer_pct)
     )
+    (
+        initial_metrics,
+        missing,
+        complete,
+        exact_equity,
+        initial_rate,
+    ) = _value_risk_account(account, raw_prices)
     diagnostics: list[Mapping[str, object]] = [
         {"code": "MISSING_PRICE", "symbol": symbol} for symbol in missing
     ]
-    initial_rate = initial_metrics.margin_rate_pct
-    if complete and initial_metrics.equity <= 0:
+    if complete and exact_equity <= Decimal(0):
         return ForcedDeleveragingResult(
             state=INSOLVENT_HALT,
             diagnostics=tuple(diagnostics),
@@ -783,7 +833,13 @@ def evaluate_forced_deleveraging(
             initial_margin_rate_pct=initial_rate,
             final_margin_rate_pct=initial_rate,
         )
-    state = _margin_state(initial_metrics, maintenance, threshold)
+    state = _margin_state(
+        initial_metrics,
+        maintenance,
+        threshold,
+        exact_equity=exact_equity,
+        stable_margin_rate=initial_rate,
+    )
     if state != MARGIN_CALL:
         return ForcedDeleveragingResult(
             state=state,
@@ -793,7 +849,6 @@ def evaluate_forced_deleveraging(
             final_margin_rate_pct=initial_rate,
         )
 
-    before_required = _gross(initial_metrics) * threshold / 100.0
     candidates: list[ForcedDeleveragingCandidate] = []
     for held in sorted(account.positions, key=lambda item: item.symbol):
         price = _market_price(raw_prices, held.symbol)
@@ -802,7 +857,7 @@ def evaluate_forced_deleveraging(
         intent = _close_intent(held, MARGIN_CALL, account.id)
         try:
             candidate_account = project_account_for_intent(account, intent, raw_prices)
-            candidate_metrics, _, _, _ = _value_risk_account(
+            _value_risk_account(
                 candidate_account,
                 raw_prices,
                 equity_override=exact_equity,
@@ -816,7 +871,6 @@ def evaluate_forced_deleveraging(
                 }
             )
             continue
-        after_required = _gross(candidate_metrics) * threshold / 100.0
         risk_contribution = price * held.quantity
         if not math.isfinite(risk_contribution):
             diagnostics.append(
@@ -826,7 +880,12 @@ def evaluate_forced_deleveraging(
         candidates.append(
             ForcedDeleveragingCandidate(
                 symbol=held.symbol,
-                margin_released=max(0.0, before_required - after_required),
+                margin_released=float(
+                    Decimal(str(price))
+                    * held.quantity
+                    * threshold_decimal
+                    / Decimal(100)
+                ),
                 risk_contribution=risk_contribution,
                 estimated_transaction_cost=(
                     risk_contribution * FORCED_DELEVERAGING_COST_RATE
@@ -837,7 +896,7 @@ def evaluate_forced_deleveraging(
     candidates.sort(key=lambda item: item.sort_key)
 
     projected_account = account
-    final_metrics = initial_metrics
+    final_rate = initial_rate
     planned: list[OrderIntent] = []
     for candidate in candidates:
         try:
@@ -846,7 +905,7 @@ def evaluate_forced_deleveraging(
                 candidate.intent,
                 raw_prices,
             )
-            final_metrics, _, _, _ = _value_risk_account(
+            _, _, _, _, final_rate = _value_risk_account(
                 projected_account,
                 raw_prices,
                 equity_override=exact_equity,
@@ -861,7 +920,7 @@ def evaluate_forced_deleveraging(
             )
             continue
         planned.append(candidate.intent)
-        if final_metrics.margin_rate_pct >= threshold:
+        if final_rate >= threshold:
             break
 
     return ForcedDeleveragingResult(
@@ -871,7 +930,7 @@ def evaluate_forced_deleveraging(
         diagnostics=tuple(diagnostics),
         missing_price_symbols=missing,
         initial_margin_rate_pct=initial_rate,
-        final_margin_rate_pct=final_metrics.margin_rate_pct,
+        final_margin_rate_pct=final_rate,
     )
 
 
@@ -1023,7 +1082,7 @@ class PortfolioRiskStage:
             )
 
         try:
-            metrics, _, _, _ = _value_risk_account(
+            metrics, _, _, _, _ = _value_risk_account(
                 self._account, self._raw_prices
             )
             drawdown = evaluate_portfolio_drawdown(metrics, self._peak_equity)
@@ -1085,6 +1144,7 @@ __all__ = (
     "RiskDecision",
     "RiskError",
     "SHORT_SQUEEZE",
+    "SQUEEZE_DATA_INVALID",
     "SHORT_STOP_LOSS",
     "SHORT_TRAILING_STOP",
     "WARNING",

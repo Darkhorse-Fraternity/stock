@@ -1,3 +1,4 @@
+import hashlib
 import math
 import unittest
 from copy import deepcopy
@@ -87,6 +88,20 @@ def stage_input(*facts):
         portfolio_snapshot_id="acct-1",
         upstream_facts=tuple(facts),
     )
+
+
+def stable_risk_intent_id(snapshot_id, held, reason):
+    material = "|".join(
+        (
+            snapshot_id,
+            held.symbol,
+            held.side.value,
+            str(held.quantity),
+            format(float(held.average_cost), ".17g"),
+            reason,
+        )
+    )
+    return "risk-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
 class DirectionAwarePositionRiskTests(unittest.TestCase):
@@ -339,18 +354,86 @@ class DirectionAwarePositionRiskTests(unittest.TestCase):
             order_side=OrderSide.SELL,
             position_effect=PositionEffect.CLOSE,
             quantity=held.quantity,
-            reason="RISK_CLOSE",
+            reason="LONG_STOP_LOSS",
             created_snapshot_id="snapshot-1",
         )
 
         with self.assertRaises(ValueError):
             RiskDecision(
-                reason="RISK_CLOSE",
+                reason="LONG_STOP_LOSS",
                 position_effect=PositionEffect.CLOSE,
                 position_mode=NORMAL,
                 updated_position=held,
                 intent=forged_intent,
             )
+
+    def test_directional_risk_reasons_reject_the_opposite_position_side(self):
+        cases = (
+            ("LONG_STOP_LOSS", PositionSide.SHORT),
+            ("LONG_TRAILING_STOP", PositionSide.SHORT),
+            ("SHORT_STOP_LOSS", PositionSide.LONG),
+            ("SHORT_TRAILING_STOP", PositionSide.LONG),
+        )
+
+        for reason, wrong_side in cases:
+            held = position(side=wrong_side)
+            intent = OrderIntent(
+                id=stable_risk_intent_id("snapshot-1", held, reason),
+                symbol=held.symbol,
+                position_side=held.side,
+                order_side=(
+                    OrderSide.SELL
+                    if held.side is PositionSide.LONG
+                    else OrderSide.BUY
+                ),
+                position_effect=PositionEffect.CLOSE,
+                quantity=held.quantity,
+                reason=reason,
+                created_snapshot_id="snapshot-1",
+            )
+
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                RiskDecision(
+                    reason=reason,
+                    position_effect=PositionEffect.CLOSE,
+                    position_mode=NORMAL,
+                    updated_position=held,
+                    intent=intent,
+                )
+
+    def test_squeeze_reasons_are_mode_only_and_short_only(self):
+        for reason in ("SHORT_SQUEEZE", "SQUEEZE_DATA_INVALID"):
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                RiskDecision(
+                    reason=reason,
+                    position_effect=None,
+                    position_mode=NORMAL,
+                    updated_position=position(side=PositionSide.LONG),
+                )
+
+    def test_margin_call_reason_allows_direction_correct_long_and_short_closes(self):
+        for side in (PositionSide.LONG, PositionSide.SHORT):
+            held = position(side=side)
+            reason = MARGIN_CALL
+            intent = OrderIntent(
+                id=stable_risk_intent_id("snapshot-1", held, reason),
+                symbol=held.symbol,
+                position_side=held.side,
+                order_side=(OrderSide.SELL if side is PositionSide.LONG else OrderSide.BUY),
+                position_effect=PositionEffect.CLOSE,
+                quantity=held.quantity,
+                reason=reason,
+                created_snapshot_id="snapshot-1",
+            )
+
+            decision = RiskDecision(
+                reason=reason,
+                position_effect=PositionEffect.CLOSE,
+                position_mode=NORMAL,
+                updated_position=held,
+                intent=intent,
+            )
+            self.assertEqual(decision.intent, intent)
 
 
 class SqueezeRiskTests(unittest.TestCase):
@@ -502,6 +585,28 @@ class ForcedDeleveragingTests(unittest.TestCase):
             [item.id for item in reverse_result.intents],
         )
 
+    def test_large_gross_keeps_small_candidate_margin_release_and_sort_order(self):
+        stressed = account(
+            position(symbol="BIG", entry=1e16, current=None, quantity=1),
+            position(symbol="ONE", entry=1.0, current=None, quantity=1),
+            position(symbol="TWO", entry=2.0, current=None, quantity=1),
+            loan=9e15,
+        )
+        prices = {"BIG": 1e16, "ONE": 1.0, "TWO": 2.0}
+
+        result = evaluate_forced_deleveraging(stressed, prices)
+        released = {
+            candidate.symbol: candidate.margin_released
+            for candidate in result.candidates
+        }
+
+        self.assertEqual(released["ONE"], 0.4)
+        self.assertEqual(released["TWO"], 0.8)
+        self.assertEqual(
+            [candidate.symbol for candidate in result.candidates],
+            ["BIG", "TWO", "ONE"],
+        )
+
     def test_revalues_after_each_close_and_stops_at_exact_buffer(self):
         stressed = account(
             position(symbol="L400", current=None, quantity=4),
@@ -575,6 +680,22 @@ class ForcedDeleveragingTests(unittest.TestCase):
 
         self.assertEqual(result.state, INSOLVENT_HALT)
         self.assertEqual(result.intents, ())
+
+    def test_exact_zero_decimal_equity_is_insolvent_without_contract_error(self):
+        stressed = account(
+            position(symbol="ZERO", entry=0.2, current=None, quantity=1),
+            cash=0.1,
+            loan=0.3,
+        )
+
+        try:
+            result = evaluate_forced_deleveraging(stressed, {"ZERO": 0.2})
+        except Exception as exc:  # pragma: no cover - assertion reports the defect
+            self.fail(f"exact-zero equity raised {type(exc).__name__}: {exc}")
+
+        self.assertEqual(result.state, INSOLVENT_HALT)
+        self.assertEqual(result.intents, ())
+        self.assertEqual(result.initial_margin_rate_pct, 0.0)
 
     def test_missing_price_skips_only_that_position_and_reports_diagnostic(self):
         priced = position(symbol="A", current=100.0, quantity=1)
