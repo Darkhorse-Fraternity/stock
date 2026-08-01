@@ -17,7 +17,7 @@ from stock_recommender.portfolio_engine.contracts import (
     TargetPosition,
 )
 from stock_recommender.pipeline import PipelineContractError, PipelineRunner, StageInput
-from stock_recommender.portfolio_engine.valuation import ValuationError
+from stock_recommender.portfolio_engine.valuation import ValuationError, value_account
 
 
 NOW = datetime(2026, 8, 1, 8, 0, tzinfo=timezone.utc)
@@ -562,6 +562,152 @@ class MarginBehaviorTests(unittest.TestCase):
         self.assertEqual(result.projected_metrics.short_liability, 100.0)
         self.assertEqual(result.projected_metrics.equity, 50.0)
         self.assertEqual(result.projected_metrics.margin_rate_pct, 50.0)
+
+    def test_full_short_cover_releases_basis_and_settles_profit_or_loss(self):
+        cases = (
+            (80.0, 0.0, 200.0, 0.0, 200.0),
+            (100.0, 0.0, 0.0, 0.0, 0.0),
+            (120.0, 50.0, 0.0, 150.0, -150.0),
+        )
+        close_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+        )
+        for price, cash, expected_cash, expected_loan, expected_equity in cases:
+            original = account(
+                cash=cash,
+                positions=(position("S", PositionSide.SHORT, 10, 100.0),),
+                restricted_short_proceeds=1000.0,
+            )
+
+            projected = margin.project_account_for_intent(
+                original,
+                close_short,
+                {"S": price},
+            )
+            metrics = value_account(projected, {}).metrics
+
+            with self.subTest(price=price):
+                self.assertEqual(projected.positions, ())
+                self.assertEqual(projected.restricted_short_proceeds, 0.0)
+                self.assertEqual(projected.available_cash, expected_cash)
+                self.assertEqual(projected.margin_loan, expected_loan)
+                self.assertEqual(metrics.equity, expected_equity)
+                self.assertEqual(
+                    metrics.equity,
+                    value_account(original, {"S": price}).metrics.equity,
+                )
+
+    def test_partial_short_cover_releases_original_basis_per_closed_share(self):
+        cases = (
+            (80.0, 0.0, 80.0, 0.0, 200.0),
+            (120.0, 50.0, 0.0, 30.0, -150.0),
+        )
+        reduce_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.REDUCE,
+            quantity=4,
+        )
+        for price, cash, expected_cash, expected_loan, expected_equity in cases:
+            original = account(
+                cash=cash,
+                positions=(position("S", PositionSide.SHORT, 10, 100.0),),
+                restricted_short_proceeds=1000.0,
+            )
+
+            projected = margin.project_account_for_intent(
+                original,
+                reduce_short,
+                {"S": price},
+            )
+            remaining = projected.positions[0]
+            metrics = value_account(projected, {"S": price}).metrics
+
+            with self.subTest(price=price):
+                self.assertEqual(projected.restricted_short_proceeds, 600.0)
+                self.assertEqual(projected.available_cash, expected_cash)
+                self.assertEqual(projected.margin_loan, expected_loan)
+                self.assertEqual(remaining.quantity, 6)
+                self.assertEqual(remaining.average_cost, 100.0)
+                self.assertEqual(metrics.equity, expected_equity)
+                self.assertEqual(
+                    metrics.equity,
+                    value_account(original, {"S": price}).metrics.equity,
+                )
+
+    def test_short_cover_releases_only_target_basis_independent_of_position_order(self):
+        target_short = position("S", PositionSide.SHORT, 10, 100.0)
+        other_short = position("T", PositionSide.SHORT, 5, 200.0)
+        close_target = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+        )
+        projections = []
+        for positions in (
+            (target_short, other_short),
+            (other_short, target_short),
+        ):
+            original = account(
+                cash=0.0,
+                positions=positions,
+                restricted_short_proceeds=2000.0,
+            )
+            projections.append(
+                margin.project_account_for_intent(
+                    original,
+                    close_target,
+                    {"S": 80.0},
+                )
+            )
+
+        for projected in projections:
+            self.assertEqual(projected.restricted_short_proceeds, 1000.0)
+            self.assertEqual(projected.available_cash, 200.0)
+            self.assertEqual(projected.margin_loan, 0.0)
+            self.assertEqual(projected.positions, (other_short,))
+            self.assertEqual(
+                value_account(projected, {"T": 200.0}).metrics.equity,
+                200.0,
+            )
+
+    def test_short_cover_rejects_unreleasable_or_nonfinite_original_basis(self):
+        close_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+        )
+        insufficient = account(
+            cash=0.0,
+            positions=(position("S", PositionSide.SHORT, 10, 100.0),),
+            restricted_short_proceeds=999.0,
+        )
+        before = copy.deepcopy(insufficient)
+
+        with self.assertRaisesRegex(ValueError, "restricted_short_proceeds"):
+            margin.project_account_for_intent(
+                insufficient,
+                close_short,
+                {"S": 80.0},
+            )
+        self.assertEqual(insufficient, before)
+
+        overflow = account(
+            cash=0.0,
+            positions=(position("S", PositionSide.SHORT, 10, 1e308),),
+            restricted_short_proceeds=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "released short proceeds.*finite"):
+            margin.project_account_for_intent(
+                overflow,
+                close_short,
+                {"S": 1.0},
+            )
 
     def test_missing_quote_blocks_increase_but_not_reduction(self):
         increasing = margin.admit_margin(

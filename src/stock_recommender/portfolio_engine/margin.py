@@ -437,6 +437,48 @@ def _project_position_quantities_for_intent(
     )
 
 
+def _short_cover_balances(
+    account: AccountSnapshot,
+    existing: PositionSnapshot,
+    closed_quantity: int,
+    cover_cost: float,
+) -> tuple[float, float, float]:
+    """Release original short-sale basis and settle the cover difference."""
+
+    released_proceeds = float(
+        Decimal(str(existing.average_cost)) * closed_quantity
+    )
+    if not math.isfinite(released_proceeds):
+        raise ValueError("released short proceeds must be finite")
+
+    restricted = float(account.restricted_short_proceeds)
+    if released_proceeds > restricted:
+        if math.isclose(
+            released_proceeds,
+            restricted,
+            rel_tol=1e-12,
+            abs_tol=1e-9,
+        ):
+            released_proceeds = restricted
+        else:
+            raise ValueError(
+                "restricted_short_proceeds is below the short basis to release"
+            )
+    restricted = max(0.0, restricted - released_proceeds)
+
+    available_cash = float(account.available_cash)
+    margin_loan = float(account.margin_loan)
+    settlement = released_proceeds - cover_cost
+    if settlement >= 0:
+        available_cash += settlement
+    else:
+        loss = -settlement
+        cash_used = min(max(0.0, available_cash), loss)
+        available_cash -= cash_used
+        margin_loan += loss - cash_used
+    return available_cash, restricted, margin_loan
+
+
 def project_account_for_intent(
     account: AccountSnapshot,
     intent: OrderIntent,
@@ -472,12 +514,14 @@ def project_account_for_intent(
     elif increasing:
         restricted += notional
     else:
-        restricted_used = min(restricted, notional)
-        restricted -= restricted_used
-        remainder = notional - restricted_used
-        cash_used = min(max(0.0, available_cash), remainder)
-        available_cash -= cash_used
-        margin_loan += remainder - cash_used
+        if existing is None:
+            raise RuntimeError("validated short reduction lost its existing position")
+        available_cash, restricted, margin_loan = _short_cover_balances(
+            account,
+            existing,
+            intent.quantity,
+            notional,
+        )
 
     return replace(
         account,
