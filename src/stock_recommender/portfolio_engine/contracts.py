@@ -518,6 +518,52 @@ class PositionRiskUpdate(_DeeplyImmutable):
         )
 
 
+@dataclass(frozen=True)
+class PositionSettlementUpdate(_DeeplyImmutable):
+    """Minimal execution-owned position settlement state.
+
+    Prices and risk fields are intentionally absent: fills prove prices and only
+    ``PositionRiskUpdate`` may change risk tracking.
+    """
+
+    symbol: str
+    side: PositionSide
+    quantity: int
+    sellable_quantity: int | None
+    sellable_on: date | None
+
+    def __post_init__(self) -> None:
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.side, PositionSide, "side")
+        _require_positive_quantity(self.quantity)
+        if self.sellable_quantity is not None:
+            _require_integer(self.sellable_quantity, "sellable_quantity")
+            if not 0 <= self.sellable_quantity <= self.quantity:
+                raise ValueError(
+                    "sellable_quantity must be between zero and quantity"
+                )
+        if self.sellable_on is not None and type(self.sellable_on) is not date:
+            raise TypeError("sellable_on must be a date or None")
+        if self.side is PositionSide.SHORT and (
+            self.sellable_quantity is not None or self.sellable_on is not None
+        ):
+            raise ValueError("SHORT settlement update must not carry long T+1 state")
+
+    @classmethod
+    def from_position(
+        cls, position: PositionSnapshot
+    ) -> PositionSettlementUpdate:
+        if type(position) is not PositionSnapshot:
+            raise TypeError("position must be PositionSnapshot")
+        return cls(
+            symbol=position.symbol,
+            side=position.side,
+            quantity=position.quantity,
+            sellable_quantity=position.sellable_quantity,
+            sellable_on=position.sellable_on,
+        )
+
+
 class CarryCostType(str, Enum):
     FINANCING = "FINANCING"
     BORROW = "BORROW"
@@ -1266,6 +1312,7 @@ class DecisionBatch(_DeeplyImmutable):
     stage_outputs: tuple[StageOutput, ...] = ()
     execution_progress: tuple[OrderExecutionProgress, ...] = ()
     position_risk_updates: tuple[PositionRiskUpdate, ...] = ()
+    position_settlement_updates: tuple[PositionSettlementUpdate, ...] = ()
     carry_accruals: tuple[CarryAccrualRecord, ...] = ()
 
     def __post_init__(self) -> None:
@@ -1287,6 +1334,11 @@ class DecisionBatch(_DeeplyImmutable):
             PositionRiskUpdate,
             "position_risk_updates",
         )
+        position_settlement_updates = _typed_tuple(
+            self.position_settlement_updates,
+            PositionSettlementUpdate,
+            "position_settlement_updates",
+        )
         carry_accruals = _typed_tuple(
             self.carry_accruals,
             CarryAccrualRecord,
@@ -1303,6 +1355,11 @@ class DecisionBatch(_DeeplyImmutable):
         object.__setattr__(self, "events", events)
         object.__setattr__(self, "execution_progress", execution_progress)
         object.__setattr__(self, "position_risk_updates", position_risk_updates)
+        object.__setattr__(
+            self,
+            "position_settlement_updates",
+            position_settlement_updates,
+        )
         object.__setattr__(self, "carry_accruals", carry_accruals)
         object.__setattr__(
             self,
@@ -1328,6 +1385,7 @@ _DEEPLY_IMMUTABLE_TYPES = (
     AccrualLifecycle,
     PositionSnapshot,
     PositionRiskUpdate,
+    PositionSettlementUpdate,
     CarryAccrualRecord,
     AccountSnapshot,
     PortfolioMetrics,

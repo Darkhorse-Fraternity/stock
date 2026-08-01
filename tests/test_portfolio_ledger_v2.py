@@ -31,6 +31,7 @@ from stock_recommender.portfolio_engine.contracts import (
     PositionRiskUpdate,
     PositionSide,
     PositionSnapshot,
+    stable_execution_intent_id,
     stable_execution_progress_fill_id,
 )
 from stock_recommender.portfolio_engine.ledger import (
@@ -254,6 +255,31 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
 
         with self.assertRaises(UnknownPortfolioEventError):
             JsonLedgerStore(self.path).commit(batch(events=(unknown,)))
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_unpaired_state_event_fails_closed_and_preserves_original_bytes(self):
+        before = self.path.read_bytes()
+        spoofed = PortfolioEvent(
+            id="spoofed-fill",
+            type="ORDER_FILLED",
+            occurred_at=NOW,
+            data={},
+        )
+
+        with self.assertRaisesRegex(LedgerError, "ORDER_FILLED|canonical|event"):
+            JsonLedgerStore(self.path).commit(batch(events=(spoofed,)))
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_duplicate_events_inside_one_batch_are_rejected_without_writing(self):
+        before = self.path.read_bytes()
+        duplicated = cash_event("duplicate-cash", -10.0)
+
+        with self.assertRaisesRegex(LedgerError, "duplicate event"):
+            JsonLedgerStore(self.path).commit(
+                batch(events=(duplicated, duplicated))
+            )
 
         self.assertEqual(self.path.read_bytes(), before)
 
@@ -598,6 +624,13 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
         self.assertEqual((position.symbol, position.quantity, position.average_cost), ("AAPL", 2, 100.0))
         self.assertEqual(position.peak_price, 110.0)
         self.assertTrue(position.trailing_active)
+        persisted = json.loads(self.path.read_text(encoding="utf-8"))["accounts"][
+            "strategy"
+        ]
+        self.assertEqual(
+            [event["type"] for event in persisted["events"]],
+            ["ORDER_FILLED", "RISK_CHANGED"],
+        )
         repeated = JsonLedgerStore(self.path).commit(decision)
         self.assertEqual(repeated, committed)
 
@@ -676,15 +709,18 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
     def test_real_execution_output_is_adopted_as_canonical_account(self):
         store = JsonLedgerStore(self.path)
         source = store.load("strategy")
+        intent_values = {
+            "symbol": "AAPL",
+            "position_side": PositionSide.LONG,
+            "order_side": OrderSide.BUY,
+            "position_effect": PositionEffect.OPEN,
+            "quantity": 2,
+            "reason": "TARGET",
+            "created_snapshot_id": "market-0",
+        }
         intent = OrderIntent(
-            id="intent-real-output",
-            symbol="AAPL",
-            position_side=PositionSide.LONG,
-            order_side=OrderSide.BUY,
-            position_effect=PositionEffect.OPEN,
-            quantity=2,
-            reason="TARGET",
-            created_snapshot_id="market-0",
+            id=stable_execution_intent_id(**intent_values),
+            **intent_values,
         )
         market = MarketSnapshot(
             id="market-1",
@@ -703,6 +739,43 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             max_bar_participation_pct=100.0,
         )
         simulated = execution.execute_intents(source, (intent,), market, policy)
+        forged_position = replace(
+            simulated.account.positions[0],
+            current_price=999.0,
+            sellable_quantity=0,
+            peak_price=999.0,
+            trailing_active=True,
+            position_mode="COVER_ONLY",
+        )
+        forged_account = replace(simulated.account, positions=(forged_position,))
+        forged_output = StageOutput(
+            stage="execution_simulation",
+            component_version="2.0.0",
+            facts=(
+                {"kind": "execution_fills", "items": simulated.fills},
+                {"kind": "execution_account", "account": forged_account},
+                {"kind": "execution_progress", "items": simulated.progress},
+                {
+                    "kind": "position_settlement_updates",
+                    "items": simulated.settlement_updates,
+                },
+            ),
+        )
+        before = self.path.read_bytes()
+        with self.assertRaisesRegex(LedgerError, "execution_account"):
+            store.commit(
+                DecisionBatch(
+                    run_key="forged-output",
+                    strategy_id="strategy",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="snapshot-0",
+                    market_snapshot_id="market-1",
+                    intents=(intent,),
+                    stage_outputs=(forged_output,),
+                )
+            )
+        self.assertEqual(self.path.read_bytes(), before)
+
         output = StageOutput(
             stage="execution_simulation",
             component_version="2.0.0",
@@ -710,6 +783,10 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 {"kind": "execution_fills", "items": simulated.fills},
                 {"kind": "execution_account", "account": simulated.account},
                 {"kind": "execution_progress", "items": simulated.progress},
+                {
+                    "kind": "position_settlement_updates",
+                    "items": simulated.settlement_updates,
+                },
             ),
         )
 
@@ -1026,7 +1103,15 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             id="carry-1",
             type="FINANCING_COST_ACCRUED",
             occurred_at=NOW,
-            data={"amount": 2.0},
+            data={
+                "account_id": record.account_id,
+                "cost_type": record.cost_type.value,
+                "lifecycle_id": record.lifecycle_id,
+                "symbol": record.symbol,
+                "accrual_date": record.accrual_date.isoformat(),
+                "elapsed_days": record.elapsed_days,
+                "amount": record.amount,
+            },
         )
         decision = DecisionBatch(
             run_key="carry-1",

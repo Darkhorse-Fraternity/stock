@@ -26,6 +26,7 @@ from .contracts import (
     PortfolioEvent,
     PositionEffect,
     PositionRiskUpdate,
+    PositionSettlementUpdate,
     PositionSide,
     PositionSnapshot,
 )
@@ -36,25 +37,6 @@ from .valuation import value_account
 
 LEDGER_SCHEMA_VERSION = 2
 _PROCESS_LOCK = threading.RLock()
-_INFORMATIONAL_EVENT_TYPES = frozenset(
-    {
-        "ACCOUNT_OPENED",
-        "ORDER_INTENDED",
-        "ORDER_FILLED",
-        "ORDER_PARTIAL",
-        "ORDER_CANCELLED",
-        "ORDER_EXPIRED",
-        "EXIT_TRIGGERED",
-        "RISK_CHANGED",
-        "STRATEGY_VERSION_ACTIVATED",
-        "PIPELINE_COMPLETED",
-        "MARGIN_CALL",
-        "COVER_ONLY",
-        "FORCED_DELEVERAGE",
-        "FINANCING_COST_ACCRUED",
-        "BORROW_COST_ACCRUED",
-    }
-)
 _ACCOUNT_SNAPSHOT_FIELDS = frozenset(
     {
         "id",
@@ -765,6 +747,32 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 _validate_event(event)
             except LedgerError as exc:
                 raise LedgerSchemaError(f"invalid persisted event: {exc}") from exc
+        fill_events = {
+            str(event.data["progress_fill_id"]): event
+            for event in events
+            if event.type in {"ORDER_FILLED", "ORDER_PARTIAL"}
+        }
+        if len(fill_events) != sum(
+            event.type in {"ORDER_FILLED", "ORDER_PARTIAL"} for event in events
+        ):
+            raise LedgerSchemaError(
+                "persisted fill events contain duplicate progress fill IDs"
+            )
+        if set(fill_events) != set(progress_details):
+            raise LedgerSchemaError(
+                "persisted fill events and execution progress must be one-to-one"
+            )
+        for progress_fill_id, detail in progress_details.items():
+            if fill_events[progress_fill_id] != _derived_fill_event(detail):
+                raise LedgerSchemaError(
+                    "persisted fill event does not exactly match execution progress"
+                )
+        try:
+            _validate_carry_event_pairs(decoded.carry_accruals, events)
+        except LedgerError as exc:
+            raise LedgerSchemaError(
+                f"persisted carry event reconciliation failed: {exc}"
+            ) from exc
         committed = item["committed_batches"]
         run_keys: set[str] = set()
         for index, raw_batch in enumerate(committed):
@@ -887,6 +895,7 @@ def _canonical_batch_facts(batch: DecisionBatch) -> tuple[
     tuple[ExecutionFill, ...],
     tuple[OrderExecutionProgress, ...],
     tuple[PositionRiskUpdate, ...],
+    tuple[PositionSettlementUpdate, ...],
     tuple[CarryAccrualRecord, ...],
 ]:
     intents = _unique_typed(
@@ -924,6 +933,13 @@ def _canonical_batch_facts(batch: DecisionBatch) -> tuple[
         expected_type=PositionRiskUpdate,
         identity=lambda item: item.symbol,
     )
+    settlement_updates = _unique_typed(
+        batch.position_settlement_updates,
+        batch.stage_outputs,
+        fact_kinds=frozenset({"position_settlement_updates"}),
+        expected_type=PositionSettlementUpdate,
+        identity=lambda item: item.symbol,
+    )
     accruals = _unique_typed(
         batch.carry_accruals,
         batch.stage_outputs,
@@ -931,7 +947,7 @@ def _canonical_batch_facts(batch: DecisionBatch) -> tuple[
         expected_type=CarryAccrualRecord,
         identity=lambda item: item.idempotency_key,
     )
-    return intents, fills, progress, updates, accruals
+    return intents, fills, progress, updates, settlement_updates, accruals
 
 
 def _execution_account_fact(batch: DecisionBatch) -> AccountSnapshot | None:
@@ -948,58 +964,29 @@ def _execution_account_fact(batch: DecisionBatch) -> AccountSnapshot | None:
     return None if not accounts else accounts[0]
 
 
-def _execution_accounting_core(account: AccountSnapshot) -> dict[str, Any]:
-    """Return fields independently replayable without market settlement policy."""
-
-    return {
-        "id": account.id,
-        "strategy_id": account.strategy_id,
-        "strategy_revision": account.strategy_revision,
-        "available_cash": account.available_cash,
-        "reserved_cash": account.reserved_cash,
-        "restricted_short_proceeds": account.restricted_short_proceeds,
-        "margin_loan": account.margin_loan,
-        "accrued_financing_cost": account.accrued_financing_cost,
-        "accrued_borrow_cost": account.accrued_borrow_cost,
-        "carry_accruals": account.carry_accruals,
-        "positions": tuple(
-            (held.symbol, held.side, held.quantity, held.average_cost)
-            for held in sorted(account.positions, key=lambda item: item.symbol)
-        ),
-    }
-
-
-def _adopt_execution_account(
-    source: AccountSnapshot,
+def _verify_execution_account(
     replayed: AccountSnapshot,
     canonical: AccountSnapshot | None,
 ) -> AccountSnapshot:
     if canonical is None:
         return replayed
-    if (
-        canonical.id != source.id
-        or canonical.strategy_id != source.strategy_id
-        or canonical.strategy_revision != source.strategy_revision
-        or canonical.snapshot_id != source.snapshot_id
-        or _execution_accounting_core(canonical)
-        != _execution_accounting_core(replayed)
-    ):
+    if canonical != replayed:
         raise LedgerError("execution_account does not match replayed execution progress")
-    return canonical
+    return replayed
 
 
 def _validate_fill_summaries(
     fills: Iterable[ExecutionFill],
     progress: Iterable[OrderExecutionProgress],
     existing_progress: Mapping[str, OrderExecutionProgress],
-) -> tuple[tuple[str, ExecutionFill], ...]:
+) -> tuple[tuple[ExecutionProgressFill, ExecutionFill], ...]:
     new_details: list[ExecutionProgressFill] = []
     for item in progress:
         prior = existing_progress.get(item.intent_id)
         prior_count = 0 if prior is None else len(prior.fills)
         new_details.extend(item.fills[prior_count:])
     unmatched = list(new_details)
-    paired: list[tuple[str, ExecutionFill]] = []
+    paired: list[tuple[ExecutionProgressFill, ExecutionFill]] = []
     for fill in fills:
         match = next(
             (
@@ -1012,7 +999,7 @@ def _validate_fill_summaries(
         if match is None:
             raise LedgerError("execution fill summary does not match new progress")
         unmatched.remove(match)
-        paired.append((match.id, fill))
+        paired.append((match, fill))
     if unmatched:
         raise LedgerError("new execution progress is missing an execution fill summary")
     return tuple(paired)
@@ -1047,10 +1034,11 @@ def _batch_fingerprint(
         tuple[ExecutionFill, ...],
         tuple[OrderExecutionProgress, ...],
         tuple[PositionRiskUpdate, ...],
+        tuple[PositionSettlementUpdate, ...],
         tuple[CarryAccrualRecord, ...],
     ],
 ) -> str:
-    intents, fills, progress, updates, accruals = facts
+    intents, fills, progress, updates, settlement_updates, accruals = facts
     material = {
         "batch": _fingerprint_plain(batch),
         "canonical_facts": {
@@ -1058,6 +1046,9 @@ def _batch_fingerprint(
             "fills": [_fingerprint_plain(item) for item in fills],
             "execution_progress": [_fingerprint_plain(item) for item in progress],
             "position_risk_updates": [_fingerprint_plain(item) for item in updates],
+            "position_settlement_updates": [
+                _fingerprint_plain(item) for item in settlement_updates
+            ],
             "carry_accruals": [_fingerprint_plain(item) for item in accruals],
             "execution_account": _fingerprint_plain(_execution_account_fact(batch)),
         },
@@ -1101,16 +1092,6 @@ def _touch_position_after_fill(
             replace(
                 held,
                 current_price=fill.price,
-                peak_price=(
-                    max(held.peak_price or fill.price, fill.price)
-                    if held.side is PositionSide.LONG
-                    else None
-                ),
-                trough_price=(
-                    min(held.trough_price or fill.price, fill.price)
-                    if held.side is PositionSide.SHORT
-                    else None
-                ),
                 borrow_lifecycle=lifecycle,
             )
         )
@@ -1211,6 +1192,37 @@ def _apply_risk_updates(
     return replace(account, positions=tuple(positions))
 
 
+def _apply_settlement_updates(
+    account: AccountSnapshot,
+    updates: Iterable[PositionSettlementUpdate],
+) -> AccountSnapshot:
+    by_symbol = {item.symbol: item for item in updates}
+    missing = set(by_symbol) - {item.symbol for item in account.positions}
+    if missing:
+        raise LedgerError(
+            "settlement update references missing position: "
+            + ", ".join(sorted(missing))
+        )
+    positions: list[PositionSnapshot] = []
+    for held in account.positions:
+        update = by_symbol.get(held.symbol)
+        if update is None:
+            positions.append(held)
+            continue
+        if update.side is not held.side or update.quantity != held.quantity:
+            raise LedgerError(
+                "settlement update identity differs from replayed position"
+            )
+        positions.append(
+            replace(
+                held,
+                sellable_quantity=update.sellable_quantity,
+                sellable_on=update.sellable_on,
+            )
+        )
+    return replace(account, positions=tuple(positions))
+
+
 def _apply_carry(
     account: AccountSnapshot, accruals: Iterable[CarryAccrualRecord]
 ) -> AccountSnapshot:
@@ -1251,28 +1263,15 @@ def _validate_carry_event_pairs(
         for event in events
         if event.type in {"FINANCING_COST_ACCRUED", "BORROW_COST_ACCRUED"}
     )
-    if not records and not carry_events:
-        return
     unmatched = list(carry_events)
     for record in records:
         expected_type = f"{record.cost_type.value}_COST_ACCRUED"
+        expected_data = _carry_event_data(record)
         match = next(
             (
                 event
                 for event in unmatched
-                if event.type == expected_type
-                and type(event.data.get("amount")) in {int, float}
-                and math.isclose(
-                    float(event.data["amount"]),
-                    record.amount,
-                    rel_tol=1e-12,
-                    abs_tol=1e-12,
-                )
-                and event.data.get("symbol", record.symbol) == record.symbol
-                and event.data.get("lifecycle_id", record.lifecycle_id)
-                == record.lifecycle_id
-                and event.data.get("accrual_date", record.accrual_date.isoformat())
-                == record.accrual_date.isoformat()
+                if event.type == expected_type and dict(event.data) == expected_data
             ),
             None,
         )
@@ -1283,18 +1282,275 @@ def _validate_carry_event_pairs(
         raise LedgerError("carry event requires one matching carry accrual")
 
 
+def _carry_event_data(record: CarryAccrualRecord) -> dict[str, Any]:
+    return {
+        "account_id": record.account_id,
+        "cost_type": record.cost_type.value,
+        "lifecycle_id": record.lifecycle_id,
+        "symbol": record.symbol,
+        "accrual_date": record.accrual_date.isoformat(),
+        "elapsed_days": record.elapsed_days,
+        "amount": record.amount,
+    }
+
+
+def _require_event_fields(event: PortfolioEvent, expected: frozenset[str]) -> None:
+    if set(event.data) != expected:
+        raise LedgerError(
+            f"{event.type} data fields must be exactly {sorted(expected)}"
+        )
+
+
+def _require_event_string(event: PortfolioEvent, field_name: str) -> None:
+    value = event.data[field_name]
+    if type(value) is not str or not value:
+        raise LedgerError(f"{event.type} {field_name} must be a non-empty string")
+
+
+def _require_event_number(event: PortfolioEvent, field_name: str) -> None:
+    value = event.data[field_name]
+    if type(value) not in {int, float} or not math.isfinite(float(value)):
+        raise LedgerError(f"{event.type} {field_name} must be finite")
+
+
+def _validate_fill_event(event: PortfolioEvent) -> None:
+    _require_event_fields(
+        event,
+        frozenset(
+            {
+                "progress_fill_id",
+                "intent_id",
+                "symbol",
+                "position_side",
+                "order_side",
+                "snapshot_id",
+                "quantity",
+                "price",
+                "fees",
+                "commission",
+                "status",
+            }
+        ),
+    )
+    for field_name in (
+        "progress_fill_id",
+        "intent_id",
+        "symbol",
+        "snapshot_id",
+    ):
+        _require_event_string(event, field_name)
+    if event.data["position_side"] not in {item.value for item in PositionSide}:
+        raise LedgerError(f"{event.type} position_side is invalid")
+    if event.data["order_side"] not in {item.value for item in OrderSide}:
+        raise LedgerError(f"{event.type} order_side is invalid")
+    if type(event.data["quantity"]) is not int or event.data["quantity"] <= 0:
+        raise LedgerError(f"{event.type} quantity must be a positive integer")
+    for field_name in ("price", "fees", "commission"):
+        _require_event_number(event, field_name)
+    expected_status = "FILLED" if event.type == "ORDER_FILLED" else "PARTIAL"
+    if event.data["status"] != expected_status:
+        raise LedgerError(f"{event.type} status must be {expected_status}")
+
+
+def _validate_risk_event(event: PortfolioEvent) -> None:
+    _require_event_fields(
+        event,
+        frozenset(
+            {
+                "run_key",
+                "market_snapshot_id",
+                "symbol",
+                "side",
+                "peak_price",
+                "trough_price",
+                "trailing_active",
+                "position_mode",
+            }
+        ),
+    )
+    for field_name in ("run_key", "market_snapshot_id", "symbol"):
+        _require_event_string(event, field_name)
+    if event.data["side"] not in {item.value for item in PositionSide}:
+        raise LedgerError("RISK_CHANGED side is invalid")
+    for field_name in ("peak_price", "trough_price"):
+        if event.data[field_name] is not None:
+            _require_event_number(event, field_name)
+    if type(event.data["trailing_active"]) is not bool:
+        raise LedgerError("RISK_CHANGED trailing_active must be a bool")
+    if event.data["position_mode"] not in {"NORMAL", "COVER_ONLY"}:
+        raise LedgerError("RISK_CHANGED position_mode is invalid")
+
+
+def _validate_carry_event(event: PortfolioEvent) -> None:
+    _require_event_fields(
+        event,
+        frozenset(
+            {
+                "account_id",
+                "cost_type",
+                "lifecycle_id",
+                "symbol",
+                "accrual_date",
+                "elapsed_days",
+                "amount",
+            }
+        ),
+    )
+    for field_name in ("account_id", "lifecycle_id", "accrual_date"):
+        _require_event_string(event, field_name)
+    expected_cost_type = event.type.removesuffix("_COST_ACCRUED")
+    if event.data["cost_type"] != expected_cost_type:
+        raise LedgerError(f"{event.type} cost_type does not match event type")
+    if expected_cost_type == CarryCostType.BORROW.value:
+        _require_event_string(event, "symbol")
+    elif event.data["symbol"] is not None:
+        raise LedgerError("FINANCING_COST_ACCRUED symbol must be null")
+    if type(event.data["elapsed_days"]) is not int or event.data["elapsed_days"] < 0:
+        raise LedgerError(f"{event.type} elapsed_days must be nonnegative")
+    _require_event_number(event, "amount")
+
+
 def _validate_event(event: PortfolioEvent) -> None:
     _json_plain(event.data)
     if event.type == "CASH_ADJUSTED":
-        if set(event.data) != {"amount"}:
-            raise LedgerError("CASH_ADJUSTED data must contain only amount")
-        amount = event.data["amount"]
-        if type(amount) not in {int, float} or not math.isfinite(float(amount)):
-            raise LedgerError("CASH_ADJUSTED amount must be finite")
+        _require_event_fields(event, frozenset({"amount"}))
+        _require_event_number(event, "amount")
         return
-    if event.type in _INFORMATIONAL_EVENT_TYPES:
+    if event.type == "ACCOUNT_OPENED":
+        _require_event_fields(
+            event,
+            frozenset(
+                {
+                    "account_id",
+                    "strategy_id",
+                    "strategy_revision",
+                    "portfolio_snapshot_id",
+                    "available_cash",
+                }
+            ),
+        )
+        for field_name in ("account_id", "strategy_id", "portfolio_snapshot_id"):
+            _require_event_string(event, field_name)
+        if type(event.data["strategy_revision"]) is not int:
+            raise LedgerError("ACCOUNT_OPENED strategy_revision must be an integer")
+        _require_event_number(event, "available_cash")
+        return
+    if event.type in {"ORDER_FILLED", "ORDER_PARTIAL"}:
+        _validate_fill_event(event)
+        return
+    if event.type == "RISK_CHANGED":
+        _validate_risk_event(event)
+        return
+    if event.type in {"FINANCING_COST_ACCRUED", "BORROW_COST_ACCRUED"}:
+        _validate_carry_event(event)
+        return
+    if event.type in {"ORDER_CANCELLED", "ORDER_EXPIRED"}:
+        _require_event_fields(
+            event,
+            frozenset({"intent_id", "symbol", "reason", "snapshot_id"}),
+        )
+        for field_name in ("intent_id", "symbol", "reason", "snapshot_id"):
+            _require_event_string(event, field_name)
+        return
+    if event.type == "PIPELINE_COMPLETED":
+        _require_event_fields(
+            event,
+            frozenset({"run_key", "market_snapshot_id"}),
+        )
+        _require_event_string(event, "run_key")
+        _require_event_string(event, "market_snapshot_id")
         return
     raise UnknownPortfolioEventError(f"unknown portfolio event type: {event.type}")
+
+
+def _derived_fill_event(fill: ExecutionProgressFill) -> PortfolioEvent:
+    return PortfolioEvent(
+        id=f"fill-{fill.id}",
+        type="ORDER_FILLED" if fill.status == "FILLED" else "ORDER_PARTIAL",
+        occurred_at=fill.occurred_at,
+        data={
+            "progress_fill_id": fill.id,
+            "intent_id": fill.intent_id,
+            "symbol": fill.symbol,
+            "position_side": fill.position_side.value,
+            "order_side": fill.order_side.value,
+            "snapshot_id": fill.snapshot_id,
+            "quantity": fill.quantity,
+            "price": fill.price,
+            "fees": fill.fees,
+            "commission": fill.commission,
+            "status": fill.status,
+        },
+    )
+
+
+def _derived_risk_event(
+    batch: DecisionBatch,
+    update: PositionRiskUpdate,
+    occurred_at: datetime,
+) -> PortfolioEvent:
+    material = f"{batch.run_key}|{batch.market_snapshot_id}|{update.symbol}"
+    return PortfolioEvent(
+        id="risk-change-"
+        + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24],
+        type="RISK_CHANGED",
+        occurred_at=occurred_at,
+        data={
+            "run_key": batch.run_key,
+            "market_snapshot_id": batch.market_snapshot_id,
+            "symbol": update.symbol,
+            "side": update.side.value,
+            "peak_price": update.peak_price,
+            "trough_price": update.trough_price,
+            "trailing_active": update.trailing_active,
+            "position_mode": update.position_mode,
+        },
+    )
+
+
+def _reconcile_batch_events(
+    batch: DecisionBatch,
+    paired_fills: Iterable[tuple[ExecutionProgressFill, ExecutionFill]],
+    risk_updates: Iterable[PositionRiskUpdate],
+    occurred_at: datetime,
+) -> tuple[PortfolioEvent, ...]:
+    submitted = tuple(batch.events)
+    submitted_ids = [event.id for event in submitted]
+    if len(submitted_ids) != len(set(submitted_ids)):
+        raise LedgerError("duplicate event ID inside decision batch")
+    for event in submitted:
+        _validate_event(event)
+
+    derived = (
+        *(_derived_fill_event(detail) for detail, _summary in paired_fills),
+        *(
+            _derived_risk_event(batch, update, occurred_at)
+            for update in risk_updates
+        ),
+    )
+    derived_by_id = {event.id: event for event in derived}
+    fact_bound_types = {"ORDER_FILLED", "ORDER_PARTIAL", "RISK_CHANGED"}
+    for event in submitted:
+        if event.type in {"ORDER_CANCELLED", "ORDER_EXPIRED"}:
+            raise LedgerError(
+                f"{event.type} requires a typed canonical cancellation fact"
+            )
+        if event.type == "ACCOUNT_OPENED":
+            raise LedgerError("ACCOUNT_OPENED is only valid during account creation")
+        if event.type in fact_bound_types and derived_by_id.get(event.id) != event:
+            raise LedgerError(
+                f"{event.type} event does not match one canonical fact"
+            )
+
+    submitted_by_id = {event.id: event for event in submitted}
+    for event in derived:
+        collision = submitted_by_id.get(event.id)
+        if collision is not None and collision != event:
+            raise LedgerError(f"conflicting derived event ID: {event.id}")
+    return (
+        *submitted,
+        *(event for event in derived if event.id not in submitted_by_id),
+    )
 
 
 def _apply_events(
@@ -1442,7 +1698,14 @@ class JsonLedgerStore:
             if batch.strategy_revision != account.strategy_revision:
                 raise LedgerError("batch strategy revision differs from account")
 
-            intents, fills, progress, updates, accruals = canonical_facts
+            (
+                intents,
+                fills,
+                progress,
+                updates,
+                settlement_updates,
+                accruals,
+            ) = canonical_facts
             _validate_carry_event_pairs(accruals, batch.events)
             existing_intents = tuple(
                 _intent_from_json(raw)
@@ -1477,19 +1740,25 @@ class JsonLedgerStore:
             current, merged_progress = _apply_progress(
                 account, intents_by_id, stored_progress, progress
             )
-            current = _adopt_execution_account(
-                account,
+            current = _apply_settlement_updates(current, settlement_updates)
+            current = _verify_execution_account(
                 current,
                 _execution_account_fact(batch),
             )
             current = _apply_risk_updates(current, updates)
             current = _apply_carry(current, accruals)
+            reconciled_events = _reconcile_batch_events(
+                batch,
+                paired_fills,
+                updates,
+                current.occurred_at,
+            )
             existing_events = tuple(
                 _event_from_json(raw)
                 for raw in _require_list(persisted["events"], "account.events")
             )
             current, merged_events = _apply_events(
-                current, existing_events, batch.events
+                current, existing_events, reconciled_events
             )
             new_snapshot_id = _stable_snapshot_id(batch)
             current = replace(current, snapshot_id=new_snapshot_id)
@@ -1509,8 +1778,8 @@ class JsonLedgerStore:
                 "fills": _merge_fill_rows(
                     _require_list(persisted["fills"], "account.fills"),
                     [
-                        _fill_to_json(fill, progress_fill_id=progress_fill_id)
-                        for progress_fill_id, fill in paired_fills
+                        _fill_to_json(fill, progress_fill_id=progress_fill.id)
+                        for progress_fill, fill in paired_fills
                     ],
                 ),
                 "execution_progress": [

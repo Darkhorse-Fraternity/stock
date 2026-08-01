@@ -751,6 +751,8 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
     config_path = Path(path) if path is not None else strategy_config_path()
+    if not config_path.exists():
+        return default_strategy_store()
     with transaction_guard((config_path,)):
         try:
             payload = json.loads(config_path.read_text(encoding="utf-8"))

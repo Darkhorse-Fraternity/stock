@@ -24,6 +24,7 @@ from .contracts import (
     OrderExecutionProgress,
     OrderSide,
     PositionEffect,
+    PositionSettlementUpdate,
     PositionSide,
     PositionSnapshot,
     PortfolioEvent,
@@ -185,6 +186,7 @@ class ExecutionSimulationResult:
     fills: tuple[ExecutionFill, ...] = ()
     diagnostics: tuple[ExecutionDiagnostic, ...] = ()
     progress: tuple[OrderExecutionProgress, ...] = ()
+    settlement_updates: tuple[PositionSettlementUpdate, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.account) is not AccountSnapshot:
@@ -192,23 +194,35 @@ class ExecutionSimulationResult:
         fills = tuple(self.fills)
         diagnostics = tuple(self.diagnostics)
         progress = tuple(self.progress)
+        settlement_updates = tuple(self.settlement_updates)
         if any(type(item) is not ExecutionFill for item in fills):
             raise TypeError("fills items must be ExecutionFill")
         if any(type(item) is not ExecutionDiagnostic for item in diagnostics):
             raise TypeError("diagnostics items must be ExecutionDiagnostic")
         if any(type(item) is not OrderExecutionProgress for item in progress):
             raise TypeError("progress items must be OrderExecutionProgress")
+        if any(
+            type(item) is not PositionSettlementUpdate
+            for item in settlement_updates
+        ):
+            raise TypeError(
+                "settlement_updates items must be PositionSettlementUpdate"
+            )
         ids = [item.intent_id for item in fills]
         if len(ids) != len(set(ids)):
             raise ValueError("fills must not contain duplicate intent IDs")
         progress_ids = [item.intent_id for item in progress]
         if len(progress_ids) != len(set(progress_ids)):
             raise ValueError("progress must not contain duplicate intent IDs")
+        settlement_symbols = [item.symbol for item in settlement_updates]
+        if len(settlement_symbols) != len(set(settlement_symbols)):
+            raise ValueError("settlement_updates must not contain duplicate symbols")
         if any(item.intent_id not in set(progress_ids) for item in fills):
             raise ValueError("every fill must have execution progress")
         object.__setattr__(self, "fills", fills)
         object.__setattr__(self, "diagnostics", diagnostics)
         object.__setattr__(self, "progress", progress)
+        object.__setattr__(self, "settlement_updates", settlement_updates)
 
 
 @dataclass(frozen=True)
@@ -1406,6 +1420,15 @@ def execute_intents(
             market,
             policy,
         )
+        current = replace(
+            current,
+            positions=tuple(
+                replace(held, current_price=fill.price)
+                if held.symbol == original.symbol
+                else held
+                for held in current.positions
+            ),
+        )
         current = _charge_fee(current, fill.fees)
         current = _apply_accrual_lifecycles(
             before_fill,
@@ -1464,6 +1487,10 @@ def execute_intents(
         tuple(fills),
         tuple(diagnostics),
         tuple(sorted(progress_by_id.values(), key=lambda item: item.intent_id)),
+        tuple(
+            PositionSettlementUpdate.from_position(held)
+            for held in sorted(current.positions, key=lambda item: item.symbol)
+        ),
     )
 
 
@@ -1538,6 +1565,10 @@ class ExecutionSimulationStage:
                 {"kind": "execution_fills", "items": result.fills},
                 {"kind": "execution_account", "account": result.account},
                 {"kind": "execution_progress", "items": result.progress},
+                {
+                    "kind": "position_settlement_updates",
+                    "items": result.settlement_updates,
+                },
                 {
                     "kind": "execution_diagnostics",
                     "items": tuple(
