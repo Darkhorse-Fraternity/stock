@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Mapping, Protocol
+from typing import Protocol
 
 from .borrow import BorrowSnapshot
 from .contracts import (
+    AccountSnapshot,
     DecisionBatch,
     EventCalendar,
     ExecutionFill,
@@ -40,9 +41,11 @@ class EventCalendarProvider(Protocol):
 
 
 class LedgerStore(Protocol):
-    def load(self, strategy_id: str) -> Mapping[str, Any]: ...
+    def load(self, strategy_id: str) -> AccountSnapshot: ...
 
-    def commit(self, batch: DecisionBatch) -> Mapping[str, Any]: ...
+    def commit(self, batch: DecisionBatch) -> AccountSnapshot: ...
+
+    def list_accounts(self) -> tuple[AccountSnapshot, ...]: ...
 
 
 class BrokerExecutionPort(Protocol):

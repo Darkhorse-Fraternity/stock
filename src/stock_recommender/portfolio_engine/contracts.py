@@ -576,6 +576,8 @@ class AccountSnapshot(_DeeplyImmutable):
     positions: tuple[PositionSnapshot, ...] = ()
     carry_accruals: tuple[CarryAccrualRecord, ...] = ()
     financing_lifecycle: AccrualLifecycle | None = None
+    reserved_cash: float = 0.0
+    snapshot_id: str | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.id, "id")
@@ -583,6 +585,7 @@ class AccountSnapshot(_DeeplyImmutable):
         _require_integer(self.strategy_revision, "strategy_revision")
         _require_datetime(self.occurred_at, "occurred_at")
         _require_finite_number(self.available_cash, "available_cash")
+        _require_nonnegative_finite_number(self.reserved_cash, "reserved_cash")
         _require_nonnegative_finite_number(
             self.restricted_short_proceeds,
             "restricted_short_proceeds",
@@ -611,6 +614,8 @@ class AccountSnapshot(_DeeplyImmutable):
                 raise ValueError(
                     "financing_lifecycle requires a positive margin_loan"
                 )
+        if self.snapshot_id is not None:
+            _require_string(self.snapshot_id, "snapshot_id")
         keys: set[tuple[str, CarryCostType, str, date, str | None]] = set()
         for record in carry_accruals:
             if record.account_id != self.id:
@@ -1259,6 +1264,9 @@ class DecisionBatch(_DeeplyImmutable):
     events: tuple[PortfolioEvent, ...] = ()
     diagnostics: tuple[Mapping[str, Any], ...] = ()
     stage_outputs: tuple[StageOutput, ...] = ()
+    execution_progress: tuple[OrderExecutionProgress, ...] = ()
+    position_risk_updates: tuple[PositionRiskUpdate, ...] = ()
+    carry_accruals: tuple[CarryAccrualRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.run_key, "run_key")
@@ -1269,6 +1277,21 @@ class DecisionBatch(_DeeplyImmutable):
         intents = _typed_tuple(self.intents, OrderIntent, "intents")
         fills = _typed_tuple(self.fills, ExecutionFill, "fills")
         events = _typed_tuple(self.events, PortfolioEvent, "events")
+        execution_progress = _typed_tuple(
+            self.execution_progress,
+            OrderExecutionProgress,
+            "execution_progress",
+        )
+        position_risk_updates = _typed_tuple(
+            self.position_risk_updates,
+            PositionRiskUpdate,
+            "position_risk_updates",
+        )
+        carry_accruals = _typed_tuple(
+            self.carry_accruals,
+            CarryAccrualRecord,
+            "carry_accruals",
+        )
         diagnostics = _mapping_tuple(self.diagnostics, "diagnostics")
         stage_outputs = _typed_tuple(
             self.stage_outputs,
@@ -1278,6 +1301,9 @@ class DecisionBatch(_DeeplyImmutable):
         object.__setattr__(self, "intents", intents)
         object.__setattr__(self, "fills", fills)
         object.__setattr__(self, "events", events)
+        object.__setattr__(self, "execution_progress", execution_progress)
+        object.__setattr__(self, "position_risk_updates", position_risk_updates)
+        object.__setattr__(self, "carry_accruals", carry_accruals)
         object.__setattr__(
             self,
             "diagnostics",

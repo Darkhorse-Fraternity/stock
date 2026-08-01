@@ -1,0 +1,685 @@
+from __future__ import annotations
+
+import json
+import multiprocessing
+import threading
+import unittest
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from stock_recommender.pipeline import StageOutput
+from stock_recommender.portfolio_engine import execution
+
+from stock_recommender.portfolio_engine.contracts import (
+    AccrualLifecycle,
+    AccountSnapshot,
+    CarryAccrualRecord,
+    CarryCostType,
+    DecisionBatch,
+    ExecutionFill,
+    ExecutionProgressFill,
+    MarketSnapshot,
+    OrderExecutionProgress,
+    OrderIntent,
+    OrderSide,
+    PortfolioEvent,
+    PositionEffect,
+    PositionRiskUpdate,
+    PositionSide,
+    PositionSnapshot,
+    stable_execution_progress_fill_id,
+)
+from stock_recommender.portfolio_engine.ledger import (
+    JsonLedgerStore,
+    LedgerError,
+    LedgerSchemaError,
+    StalePortfolioSnapshotError,
+    UnknownPortfolioEventError,
+    encode_account_snapshot,
+)
+
+
+NOW = datetime(2026, 7, 31, 14, 30, tzinfo=timezone.utc)
+
+
+def account(*, strategy_id: str = "strategy", cash: float = 1_000.0) -> AccountSnapshot:
+    return AccountSnapshot(
+        id=f"account-{strategy_id}",
+        strategy_id=strategy_id,
+        strategy_revision=2,
+        occurred_at=NOW,
+        available_cash=cash,
+    )
+
+
+def batch(
+    *,
+    strategy_id: str = "strategy",
+    run_key: str = "run-1",
+    snapshot_id: str = "snapshot-0",
+    events: tuple[PortfolioEvent, ...] = (),
+) -> DecisionBatch:
+    return DecisionBatch(
+        run_key=run_key,
+        strategy_id=strategy_id,
+        strategy_revision=2,
+        portfolio_snapshot_id=snapshot_id,
+        market_snapshot_id=f"market-{run_key}",
+        events=events,
+    )
+
+
+def cash_event(event_id: str, amount: float) -> PortfolioEvent:
+    return PortfolioEvent(
+        id=event_id,
+        type="CASH_ADJUSTED",
+        occurred_at=NOW,
+        data={"amount": amount},
+    )
+
+
+def commit_from_process(path: str, run_key: str, result_queue: object) -> None:
+    try:
+        JsonLedgerStore(path).commit(
+            batch(
+                run_key=run_key,
+                events=(cash_event(f"cash-{run_key}", -10.0),),
+            )
+        )
+    except Exception as exc:
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("OK")
+
+
+class PortfolioLedgerV2Tests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.path = Path(self.temporary.name) / "ledger.json"
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "accounts": {
+                        "strategy": {
+                            **encode_account_snapshot(account()),
+                            "portfolio_snapshot_id": "snapshot-0",
+                            "reserved_cash": 0.0,
+                            "open_intents": [],
+                            "fills": [],
+                            "execution_progress": [],
+                            "events": [],
+                            "committed_batches": [],
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_decision_batch_commits_once_and_returns_account_snapshot(self):
+        store = JsonLedgerStore(self.path)
+        first = store.commit(batch(events=(cash_event("cash-1", -10.0),)))
+        repeated = store.commit(batch(events=(cash_event("cash-1", -10.0),)))
+
+        self.assertIs(type(first), AccountSnapshot)
+        self.assertEqual(first.available_cash, 990.0)
+        self.assertEqual(repeated, first)
+        self.assertEqual(store.load("strategy"), first)
+        self.assertEqual(store.list_accounts(), (first,))
+
+    def test_different_run_rejects_stale_snapshot(self):
+        store = JsonLedgerStore(self.path)
+        committed = store.commit(batch(events=(cash_event("cash-1", -10.0),)))
+
+        with self.assertRaises(StalePortfolioSnapshotError):
+            store.commit(
+                batch(
+                    run_key="run-2",
+                    snapshot_id="snapshot-0",
+                    events=(cash_event("cash-2", -10.0),),
+                )
+            )
+        self.assertEqual(store.load("strategy"), committed)
+
+    def test_unknown_event_fails_closed_and_preserves_original_bytes(self):
+        before = self.path.read_bytes()
+        unknown = PortfolioEvent(
+            id="unknown-1",
+            type="FUTURE_EVENT",
+            occurred_at=NOW,
+            data={},
+        )
+
+        with self.assertRaises(UnknownPortfolioEventError):
+            JsonLedgerStore(self.path).commit(batch(events=(unknown,)))
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_atomic_replace_failure_preserves_original_bytes(self):
+        before = self.path.read_bytes()
+
+        with patch(
+            "stock_recommender.portfolio_engine.ledger.os.replace",
+            side_effect=OSError("injected replace failure"),
+        ):
+            with self.assertRaises(OSError):
+                JsonLedgerStore(self.path).commit(
+                    batch(events=(cash_event("cash-replace", -10.0),))
+                )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_persisted_duplicate_intents_and_unknown_events_are_rejected(self):
+        intent = {
+            "id": "duplicate",
+            "symbol": "AAPL",
+            "position_side": "LONG",
+            "order_side": "BUY",
+            "position_effect": "OPEN",
+            "quantity": 1,
+            "reason": "test",
+            "created_snapshot_id": "market-0",
+        }
+        original = json.loads(self.path.read_text(encoding="utf-8"))
+        corruptions = (
+            {"open_intents": [intent, intent]},
+            {
+                "events": [
+                    {
+                        "id": "future",
+                        "type": "FUTURE_EVENT",
+                        "occurred_at": NOW.isoformat(),
+                        "data": {},
+                    }
+                ]
+            },
+        )
+        for corruption in corruptions:
+            with self.subTest(corruption=tuple(corruption)):
+                payload = json.loads(json.dumps(original))
+                payload["accounts"]["strategy"].update(corruption)
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(LedgerSchemaError):
+                    JsonLedgerStore(self.path).load("strategy")
+
+    def test_runtime_rejects_v1_malformed_and_truncated_json(self):
+        for raw in (
+            json.dumps({"version": 1, "accounts": {}}),
+            json.dumps({"version": 2, "accounts": []}),
+            '{"version": 2, "accounts":',
+        ):
+            with self.subTest(raw=raw):
+                self.path.write_text(raw, encoding="utf-8")
+                with self.assertRaises(LedgerSchemaError):
+                    JsonLedgerStore(self.path).list_accounts()
+
+    def test_concurrent_different_runs_cannot_overwrite_each_other(self):
+        store = JsonLedgerStore(self.path)
+        errors: list[Exception] = []
+
+        def commit_run(run_key: str) -> None:
+            try:
+                store.commit(
+                    batch(
+                        run_key=run_key,
+                        events=(cash_event(f"cash-{run_key}", -10.0),),
+                    )
+                )
+            except Exception as exc:  # one contender must observe stale state
+                errors.append(exc)
+
+        threads = [threading.Thread(target=commit_run, args=(f"run-{index}",)) for index in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(JsonLedgerStore(self.path).load("strategy").available_cash, 990.0)
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], StalePortfolioSnapshotError)
+
+    def test_process_lock_serializes_stale_writers(self):
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=commit_from_process,
+                args=(str(self.path), f"process-{index}", results),
+            )
+            for index in range(2)
+        ]
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+
+        outcomes = sorted(results.get(timeout=2) for _ in processes)
+        self.assertEqual(outcomes, ["OK", "StalePortfolioSnapshotError"])
+        self.assertEqual(JsonLedgerStore(self.path).load("strategy").available_cash, 990.0)
+
+    def test_canonical_progress_risk_and_carry_are_applied_once(self):
+        intent = OrderIntent(
+            id="intent-1",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=2,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+        fill_values = {
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "position_side": intent.position_side,
+            "order_side": intent.order_side,
+            "snapshot_id": "market-1",
+            "occurred_at": NOW,
+            "quantity": 2,
+            "price": 100.0,
+            "fees": 1.0,
+            "commission": 1.0,
+            "status": "FILLED",
+        }
+        progress_fill = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**fill_values), **fill_values
+        )
+        progress = OrderExecutionProgress(
+            intent_id=intent.id,
+            symbol=intent.symbol,
+            position_side=intent.position_side,
+            order_side=intent.order_side,
+            intent_quantity=2,
+            execution_policy_fingerprint="policy-1",
+            fills=(progress_fill,),
+        )
+        risk_update = PositionRiskUpdate(
+            symbol="AAPL",
+            side=PositionSide.LONG,
+            peak_price=110.0,
+            trough_price=None,
+            trailing_active=True,
+            position_mode="NORMAL",
+        )
+        decision = DecisionBatch(
+            run_key="run-fill",
+            strategy_id="strategy",
+            strategy_revision=2,
+            portfolio_snapshot_id="snapshot-0",
+            market_snapshot_id="market-1",
+            intents=(intent,),
+            fills=(ExecutionFill(intent.id, "AAPL", 2, 100.0, 1.0, "FILLED"),),
+            execution_progress=(progress,),
+            position_risk_updates=(risk_update,),
+        )
+
+        committed = JsonLedgerStore(self.path).commit(decision)
+        position = committed.positions[0]
+        self.assertEqual(committed.available_cash, 799.0)
+        self.assertEqual((position.symbol, position.quantity, position.average_cost), ("AAPL", 2, 100.0))
+        self.assertEqual(position.peak_price, 110.0)
+        self.assertTrue(position.trailing_active)
+        repeated = JsonLedgerStore(self.path).commit(decision)
+        self.assertEqual(repeated, committed)
+
+    def test_execution_account_fact_must_match_replayed_progress(self):
+        intent = OrderIntent(
+            id="intent-account-proof",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=1,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+        fill_values = {
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "position_side": intent.position_side,
+            "order_side": intent.order_side,
+            "snapshot_id": "market-1",
+            "occurred_at": NOW,
+            "quantity": 1,
+            "price": 100.0,
+            "fees": 0.0,
+            "commission": 0.0,
+            "status": "FILLED",
+        }
+        progress_fill = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**fill_values), **fill_values
+        )
+        progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            1,
+            "policy-1",
+            (progress_fill,),
+        )
+        forged = account(cash=999.0)
+        output = StageOutput(
+            stage="execution_simulation",
+            component_version="2.0.0",
+            facts=(
+                {"kind": "execution_account", "account": forged},
+                {"kind": "execution_progress", "items": (progress,)},
+            ),
+        )
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(LedgerError, "execution_account"):
+            JsonLedgerStore(self.path).commit(
+                DecisionBatch(
+                    run_key="account-proof",
+                    strategy_id="strategy",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="snapshot-0",
+                    market_snapshot_id="market-1",
+                    intents=(intent,),
+                    stage_outputs=(output,),
+                )
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_real_execution_output_is_adopted_as_canonical_account(self):
+        store = JsonLedgerStore(self.path)
+        source = store.load("strategy")
+        intent = OrderIntent(
+            id="intent-real-output",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=2,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+        market = MarketSnapshot(
+            id="market-1",
+            occurred_at=NOW,
+            quotes={"AAPL": {"price": 100.0, "bar_volume": 10_000}},
+        )
+        policy = execution.ExecutionPolicy(
+            market="us",
+            lot_size=1,
+            same_day_sell=True,
+            commission_rate_pct=0.0,
+            minimum_commission=0.0,
+            stamp_duty_rate_pct=0.0,
+            transfer_fee_rate_pct=0.0,
+            slippage_bps=0.0,
+            max_bar_participation_pct=100.0,
+        )
+        simulated = execution.execute_intents(source, (intent,), market, policy)
+        output = StageOutput(
+            stage="execution_simulation",
+            component_version="2.0.0",
+            facts=(
+                {"kind": "execution_fills", "items": simulated.fills},
+                {"kind": "execution_account", "account": simulated.account},
+                {"kind": "execution_progress", "items": simulated.progress},
+            ),
+        )
+
+        committed = store.commit(
+            DecisionBatch(
+                run_key="real-output",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                intents=(intent,),
+                stage_outputs=(output,),
+            )
+        )
+
+        self.assertEqual(committed.available_cash, simulated.account.available_cash)
+        self.assertEqual(committed.positions, simulated.account.positions)
+        self.assertNotEqual(committed.snapshot_id, simulated.account.snapshot_id)
+
+    def test_execution_fill_summary_must_match_progress(self):
+        intent = OrderIntent(
+            id="intent-fill-proof",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=2,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+        fill_values = {
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "position_side": intent.position_side,
+            "order_side": intent.order_side,
+            "snapshot_id": "market-1",
+            "occurred_at": NOW,
+            "quantity": 2,
+            "price": 100.0,
+            "fees": 1.0,
+            "commission": 1.0,
+            "status": "FILLED",
+        }
+        detail = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**fill_values), **fill_values
+        )
+        progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            2,
+            "policy-1",
+            (detail,),
+        )
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(LedgerError, "fill summary"):
+            JsonLedgerStore(self.path).commit(
+                DecisionBatch(
+                    run_key="fill-proof",
+                    strategy_id="strategy",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="snapshot-0",
+                    market_snapshot_id="market-1",
+                    intents=(intent,),
+                    fills=(ExecutionFill(intent.id, "AAPL", 1, 100.0, 1.0, "FILLED"),),
+                    execution_progress=(progress,),
+                )
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_append_only_partial_progress_replays_only_new_fill(self):
+        intent = OrderIntent(
+            id="intent-partial",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=4,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+
+        def progress_fill(snapshot: str, occurred_at: datetime, status: str):
+            values = {
+                "intent_id": intent.id,
+                "symbol": intent.symbol,
+                "position_side": intent.position_side,
+                "order_side": intent.order_side,
+                "snapshot_id": snapshot,
+                "occurred_at": occurred_at,
+                "quantity": 2,
+                "price": 100.0,
+                "fees": 0.0,
+                "commission": 0.0,
+                "status": status,
+            }
+            return ExecutionProgressFill(
+                id=stable_execution_progress_fill_id(**values), **values
+            )
+
+        first_fill = progress_fill("market-1", NOW, "PARTIAL")
+        first_progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            4,
+            "policy-1",
+            (first_fill,),
+        )
+        store = JsonLedgerStore(self.path)
+        first = store.commit(
+            DecisionBatch(
+                run_key="partial-1",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                intents=(intent,),
+                execution_progress=(first_progress,),
+            )
+        )
+        second_fill = progress_fill("market-2", NOW + timedelta(minutes=5), "FILLED")
+        second_progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            4,
+            "policy-1",
+            (first_fill, second_fill),
+        )
+        second = store.commit(
+            DecisionBatch(
+                run_key="partial-2",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id=first.snapshot_id,
+                market_snapshot_id="market-2",
+                intents=(intent,),
+                execution_progress=(second_progress,),
+            )
+        )
+        self.assertEqual(second.positions[0].quantity, 4)
+        self.assertEqual(second.available_cash, 600.0)
+
+    def test_carry_record_is_accounted_once_and_requires_matching_event_type(self):
+        financed = AccountSnapshot(
+            id="account-strategy",
+            strategy_id="strategy",
+            strategy_revision=2,
+            occurred_at=NOW,
+            available_cash=100.0,
+            margin_loan=500.0,
+            financing_lifecycle=AccrualLifecycle("financing-1", date(2026, 7, 30)),
+        )
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["accounts"]["strategy"].update(encode_account_snapshot(financed))
+        payload["accounts"]["strategy"]["portfolio_snapshot_id"] = "snapshot-0"
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        record = CarryAccrualRecord(
+            account_id=financed.id,
+            cost_type=CarryCostType.FINANCING,
+            accrual_date=date(2026, 7, 31),
+            elapsed_days=1,
+            amount=2.0,
+            lifecycle_id="financing-1",
+        )
+        event = PortfolioEvent(
+            id="carry-1",
+            type="FINANCING_COST_ACCRUED",
+            occurred_at=NOW,
+            data={"amount": 2.0},
+        )
+        decision = DecisionBatch(
+            run_key="carry-1",
+            strategy_id="strategy",
+            strategy_revision=2,
+            portfolio_snapshot_id="snapshot-0",
+            market_snapshot_id="market-1",
+            carry_accruals=(record,),
+            events=(event,),
+        )
+        committed = JsonLedgerStore(self.path).commit(decision)
+        self.assertEqual(committed.available_cash, 98.0)
+        self.assertEqual(committed.accrued_financing_cost, 2.0)
+        self.assertEqual(committed.carry_accruals, (record,))
+
+    def test_fill_without_canonical_progress_fails_without_writing(self):
+        before = self.path.read_bytes()
+        decision = DecisionBatch(
+            run_key="fill-only",
+            strategy_id="strategy",
+            strategy_revision=2,
+            portfolio_snapshot_id="snapshot-0",
+            market_snapshot_id="market-1",
+            fills=(ExecutionFill("missing", "AAPL", 1, 100.0, 0.0, "FILLED"),),
+        )
+        with self.assertRaisesRegex(ValueError, "canonical execution progress"):
+            JsonLedgerStore(self.path).commit(decision)
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_same_run_key_with_different_facts_is_rejected(self):
+        store = JsonLedgerStore(self.path)
+        store.commit(batch(events=(cash_event("cash-1", -10.0),)))
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "run_key.*different"):
+            store.commit(batch(events=(cash_event("cash-forged", -20.0),)))
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_carry_record_and_event_must_be_one_to_one(self):
+        financed = AccountSnapshot(
+            id="account-strategy",
+            strategy_id="strategy",
+            strategy_revision=2,
+            occurred_at=NOW,
+            available_cash=100.0,
+            margin_loan=500.0,
+            financing_lifecycle=AccrualLifecycle("financing-1", date(2026, 7, 30)),
+        )
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["accounts"]["strategy"].update(encode_account_snapshot(financed))
+        payload["accounts"]["strategy"]["portfolio_snapshot_id"] = "snapshot-0"
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        record = CarryAccrualRecord(
+            account_id=financed.id,
+            cost_type=CarryCostType.FINANCING,
+            accrual_date=date(2026, 7, 31),
+            elapsed_days=1,
+            amount=2.0,
+            lifecycle_id="financing-1",
+        )
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(ValueError, "carry.*event"):
+            JsonLedgerStore(self.path).commit(
+                DecisionBatch(
+                    run_key="carry-unpaired",
+                    strategy_id="strategy",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="snapshot-0",
+                    market_snapshot_id="market-1",
+                    carry_accruals=(record,),
+                )
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
+
+if __name__ == "__main__":
+    unittest.main()
