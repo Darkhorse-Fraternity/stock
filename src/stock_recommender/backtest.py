@@ -24,6 +24,7 @@ from .parameters import (
 )
 from .portfolio_backtest import (
     HistoricalBorrowBook,
+    normalize_event_calendar_history,
     normalize_universe_snapshots,
     replay_portfolio_fold,
 )
@@ -234,6 +235,16 @@ def evaluate_approval_gate(metrics: dict, validation: dict, metadata: dict) -> d
         True if borrow_history_required else "LONG_SHORT only",
         "做空策略历史借券可用性覆盖完整",
     )
+    event_calendar_complete = bool(
+        metadata.get("event_calendar_history_complete")
+    )
+    add(
+        "event_calendar",
+        (not borrow_history_required) or event_calendar_complete,
+        event_calendar_complete,
+        True if borrow_history_required else "LONG_SHORT only",
+        "做空策略历史重大事件日历覆盖完整",
+    )
     return {"passed": all(item["passed"] for item in checks), "checks": checks, "evaluated_at": _timestamp()}
 
 
@@ -430,6 +441,9 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
     )
     top_n = min(int(validation["top_n"]), int(strategy.get("portfolio", {}).get("max_positions", 10)))
     universe_snapshots = normalize_universe_snapshots(dataset.get("universe_by_date"))
+    event_calendar_history = normalize_event_calendar_history(
+        dataset.get("event_calendar_history")
+    )
     folds = []
     normal_results = []
     stressed_results = []
@@ -447,6 +461,7 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
             top_n=top_n,
             cost_multiplier=1.0,
             borrow_book=borrow_book,
+            event_calendar_history=event_calendar_history,
             execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
         )
         stressed = replay_portfolio_fold(
@@ -460,6 +475,7 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
             top_n=top_n,
             cost_multiplier=2.0,
             borrow_book=borrow_book,
+            event_calendar_history=event_calendar_history,
             execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
         )
         if not normal["days"]:
@@ -559,6 +575,11 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
     metadata["execution_parity_complete"] = True
     metadata["execution_data_complete"] = bool(metadata.get("execution_data_complete")) and all(
         result["execution_data_coverage_complete"] for result in normal_results
+    )
+    metadata["event_calendar_history_complete"] = bool(
+        metadata.get("event_calendar_history_complete")
+    ) and all(
+        result["event_calendar_coverage_complete"] for result in normal_results
     )
     engine_metadata = [result["metadata"] for result in normal_results]
     borrow_apr_summaries = [item["borrow_apr_pct"] for item in engine_metadata]
@@ -707,6 +728,7 @@ def load_backtest_dataset_file(path: str | Path) -> dict:
     dataset = deepcopy(payload)
     dataset.setdefault("benchmark", [])
     dataset.setdefault("universe_by_date", {})
+    dataset.setdefault("event_calendar_history", {})
     metadata = dataset.setdefault("metadata", {})
     if not isinstance(metadata, dict):
         raise BacktestDataError("回测数据集 metadata 必须是对象")

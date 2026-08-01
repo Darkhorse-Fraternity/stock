@@ -554,6 +554,42 @@ def normalize_universe_snapshots(value: object) -> dict[date, set[str]]:
     return dict(sorted(snapshots.items()))
 
 
+def normalize_event_calendar_history(
+    value: object,
+) -> dict[date, dict[str, int | None]]:
+    """Parse the JSON dataset calendar into exact, date-keyed snapshots."""
+
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise TypeError("event calendar history must be a date mapping")
+    history: dict[date, dict[str, int | None]] = {}
+    for raw_day, raw_symbols in value.items():
+        day = _strict_date(raw_day, "event calendar history date")
+        if day in history:
+            raise ValueError(
+                f"duplicate event calendar history date: {day.isoformat()}"
+            )
+        if not isinstance(raw_symbols, Mapping):
+            raise TypeError("event calendar history symbols must be a mapping")
+        calendar: dict[str, int | None] = {}
+        for raw_symbol, raw_sessions in raw_symbols.items():
+            if type(raw_symbol) is not str or not raw_symbol.strip():
+                raise ValueError("event calendar symbols must be non-empty strings")
+            symbol = raw_symbol.strip()
+            if symbol in calendar:
+                raise ValueError(f"duplicate event calendar symbol: {symbol}")
+            if raw_sessions is not None and (
+                type(raw_sessions) is not int or raw_sessions < 0
+            ):
+                raise ValueError(
+                    "event calendar sessions must be a nonnegative integer or null"
+                )
+            calendar[symbol] = raw_sessions
+        history[day] = calendar
+    return dict(sorted(history.items()))
+
+
 def universe_for_day(
     snapshots: dict[date, set[str]],
     cutoff: date,
@@ -693,7 +729,15 @@ def replay_portfolio_fold(
     replay_mode: str = "backtest",
 ) -> dict:
     if not test_dates:
-        return {"days": [], "fold_return": 0.0, "benchmark_return": 0.0, "maximum_drawdown": 0.0, "coverage_complete": False, "execution_data_coverage_complete": False}
+        return {
+            "days": [],
+            "fold_return": 0.0,
+            "benchmark_return": 0.0,
+            "maximum_drawdown": 0.0,
+            "coverage_complete": False,
+            "execution_data_coverage_complete": False,
+            "event_calendar_coverage_complete": False,
+        }
     multiplier = _finite_cost_multiplier(cost_multiplier)
     signal_strategy = _replay_strategy(strategy, 1.0)
     profile = market_profile(strategy_market(signal_strategy))
@@ -709,6 +753,7 @@ def replay_portfolio_fold(
     coverage_complete = bool(snapshots)
     exact_execution_prices = execution_price_mode == "intraday_0935_1500"
     execution_data_coverage_complete = exact_execution_prices
+    event_calendar_coverage_complete = bool(event_calendar_history)
     frames: list[EngineReplayFrame] = []
     day_facts: list[dict[str, Any]] = []
 
@@ -824,10 +869,19 @@ def replay_portfolio_fold(
             profile.session_end,
             tzinfo=profile.timezone,
         )
+        calendar_symbols = tuple(
+            str(item["symbol"])
+            for item in analyzed_rows
+            if type(item.get("symbol")) is str and item.get("symbol")
+        )
         calendar = _calendar_for_day(
             event_calendar_history,
             cutoff_day,
-            cutoff_quotes,
+            calendar_symbols,
+        )
+        event_calendar_coverage_complete = (
+            event_calendar_coverage_complete
+            and set(calendar_symbols).issubset(calendar)
         )
         frames.extend(
             (
@@ -879,6 +933,7 @@ def replay_portfolio_fold(
             "maximum_drawdown": 0.0,
             "coverage_complete": coverage_complete,
             "execution_data_coverage_complete": execution_data_coverage_complete,
+            "event_calendar_coverage_complete": event_calendar_coverage_complete,
         }
     replay = replay_engine_frames(
         strategy=signal_strategy,
@@ -927,6 +982,7 @@ def replay_portfolio_fold(
         "maximum_drawdown": maximum_drawdown,
         "coverage_complete": coverage_complete,
         "execution_data_coverage_complete": execution_data_coverage_complete,
+        "event_calendar_coverage_complete": event_calendar_coverage_complete,
         "closed_trades": sum(
             1
             for event_type in replay.event_types

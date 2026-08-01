@@ -47,7 +47,11 @@ from .pre_execution import (
 )
 from .risk import PortfolioRiskStage
 from .request_identity import request_fingerprint
-from .signal_ports import SIGNAL_MODELS, SignalModel
+from .signal_ports import (
+    SIGNAL_MODELS,
+    SignalRegistryEntry,
+    resolve_signal_model,
+)
 from .target_pipeline import TargetNettingStage
 from .valuation import value_account
 
@@ -131,23 +135,13 @@ def _signal_output(stage: str, candidates: tuple[SignalCandidate, ...]) -> Stage
     )
 
 
-def _model_from_registry(
-    registry: Mapping[str, SignalModel],
-    model_id: str,
-) -> SignalModel:
-    try:
-        return registry[model_id]
-    except KeyError:
-        raise KeyError(f"unregistered signal model: {model_id}") from None
-
-
 class PortfolioEngine:
     """Thin service coordinating pure decisions and one ledger transaction."""
 
     def __init__(
         self,
         *,
-        signal_registry: Mapping[str, SignalModel] | None = None,
+        signal_registry: Mapping[str, SignalRegistryEntry] | None = None,
         exposure_normalizer: PolicyNormalizer = effective_exposure_policy,
         margin_normalizer: PolicyNormalizer = normalize_margin_policy,
         short_normalizer: PolicyNormalizer = normalize_short_policy,
@@ -294,7 +288,7 @@ class PortfolioEngine:
         if not isinstance(signal_config, Mapping):
             raise ValueError("strategy.signal must be explicit")
         long_model_id = str(signal_config.get("model") or SIGNAL_MODEL_ID)
-        long_model = _model_from_registry(self._signal_registry, long_model_id)
+        long_model = resolve_signal_model(self._signal_registry, long_model_id)
         long_candidates = tuple(
             long_model.evaluate(request.analyzed_rows, request.event_calendar)
         )
@@ -305,9 +299,10 @@ class PortfolioEngine:
 
         short_candidates: tuple[SignalCandidate, ...] = ()
         if exposure_policy.mode == "LONG_SHORT":
-            short_model = _model_from_registry(
+            short_model = resolve_signal_model(
                 self._signal_registry,
                 short_policy.signal_model,
+                policy=short_policy,
             )
             short_candidates = tuple(
                 short_model.evaluate(request.analyzed_rows, request.event_calendar)

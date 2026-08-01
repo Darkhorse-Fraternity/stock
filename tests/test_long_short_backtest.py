@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import math
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 
-from stock_recommender.backtest import evaluate_approval_gate
+from stock_recommender.backtest import evaluate_approval_gate, run_walk_forward_backtest
+from stock_recommender.parameters import load_strategy_config
 from stock_recommender.portfolio_backtest import (
     EngineReplayFrame,
     HistoricalBorrowBook,
@@ -197,10 +199,142 @@ def gate_metadata(*, mode: str, borrow_complete: bool) -> dict:
         "corporate_actions_complete": True,
         "exposure_mode": mode,
         "borrow_history_complete": borrow_complete,
+        "event_calendar_history_complete": True,
+    }
+
+
+def production_short_strategy() -> dict:
+    value = load_strategy_config(path=Path("/missing"))
+    value["id"] = "production-short-backtest"
+    value["market"] = "us"
+    value["parameters"]["market"]["value"] = "us"
+    value["exposure_policy"]["mode"] = "LONG_SHORT"
+    value["validation"].update(
+        {
+            "lookback_days": 60,
+            "history_days_min": 61,
+            "holding_period_days": 3,
+            "top_n": 2,
+            "minimum_oos_events": 1,
+            "minimum_oos_months": 0,
+            "minimum_positive_fold_ratio": 0,
+            "minimum_dsr_probability": 0,
+            "maximum_drawdown_pct": 100,
+        }
+    )
+    return value
+
+
+def production_short_dataset(*, days: int = 100) -> dict:
+    start = date(2024, 1, 1)
+    symbols = ("WEAK0", "WEAK1", "WEAK2")
+    panel: dict[str, list[dict]] = {}
+    for index, symbol in enumerate(symbols):
+        rows = []
+        decline = 0.002 + index * 0.0002
+        for offset in range(days):
+            current = start + timedelta(days=offset)
+            close = 200.0 * ((1.0 - decline) ** offset)
+            rows.append(
+                {
+                    "date": current.isoformat(),
+                    "open": close * 1.001,
+                    "close": close,
+                    "high": close * 1.01,
+                    "low": close * 0.99,
+                    "volume": 2_000_000,
+                    "turnover": 50_000_000.0,
+                    "open_volume": 2_000_000,
+                    "close_volume": 2_000_000,
+                    "entry_price": close * 1.001,
+                    "exit_price": close,
+                }
+            )
+        panel[symbol] = rows
+    days_by_date = [start + timedelta(days=offset) for offset in range(days)]
+    return {
+        "panel": panel,
+        "benchmark": [
+            {
+                "date": day.isoformat(),
+                "open": 100.0,
+                "close": 100.0,
+                "volume": 1,
+            }
+            for day in days_by_date
+        ],
+        "universe_by_date": {
+            day.isoformat(): list(symbols) for day in days_by_date
+        },
+        "borrow_history": {
+            day.isoformat(): {
+                symbol: {
+                    "shortable": True,
+                    "easy_to_borrow": True,
+                    "available_quantity": 1_000_000,
+                    "borrow_apr_pct": 8.0,
+                }
+                for symbol in symbols
+            }
+            for day in days_by_date
+        },
+        "event_calendar_history": {
+            day.isoformat(): {symbol: None for symbol in symbols}
+            for day in days_by_date
+        },
+        "evaluation_period": {"start": "2024-03-20", "end": "2024-03-22"},
+        "metadata": {
+            "point_in_time_complete": True,
+            "benchmark_complete": True,
+            "strategy_parity_complete": True,
+            "execution_data_complete": True,
+            "execution_price_mode": "intraday_0935_1500",
+            "corporate_actions_complete": True,
+            "borrow_history_complete": True,
+            "event_calendar_history_complete": True,
+            "parameter_trials": 1,
+        },
     }
 
 
 class LongShortBacktestTests(unittest.TestCase):
+    def test_production_walk_forward_opens_short_and_passes_data_gates(self):
+        result = run_walk_forward_backtest(
+            production_short_dataset(),
+            production_short_strategy(),
+        )
+        checks = {item["id"]: item for item in result["approval_gate"]["checks"]}
+
+        self.assertGreater(result["metrics"]["maximum_positions_observed"], 0)
+        self.assertGreater(result["metrics"]["borrow_cost"], 0)
+        self.assertTrue(result["metadata"]["borrow_history_complete"])
+        self.assertTrue(result["metadata"]["event_calendar_history_complete"])
+        self.assertTrue(checks["borrow_history"]["passed"])
+        self.assertTrue(checks["event_calendar"]["passed"])
+
+    def test_production_walk_forward_never_reads_future_event_calendar(self):
+        strategy = production_short_strategy()
+        safe_at_cutoff = production_short_dataset()
+        cutoff_only = "2024-03-19"
+        future_signal_day = "2024-03-20"
+        safe_at_cutoff["evaluation_period"] = {
+            "start": future_signal_day,
+            "end": future_signal_day,
+        }
+        safe_at_cutoff["event_calendar_history"] = {
+            cutoff_only: {
+                symbol: None for symbol in safe_at_cutoff["panel"]
+            },
+            future_signal_day: {
+                symbol: 0 for symbol in safe_at_cutoff["panel"]
+            },
+        }
+
+        result = run_walk_forward_backtest(safe_at_cutoff, strategy)
+
+        self.assertEqual(result["sample_events"][0]["symbols"], [])
+        self.assertGreater(result["metrics"]["maximum_positions_observed"], 0)
+
     def test_shared_analyzed_universe_marks_only_preselected_long_rows(self):
         rows = (
             {

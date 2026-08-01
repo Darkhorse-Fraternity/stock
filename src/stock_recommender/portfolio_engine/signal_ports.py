@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Mapping, Protocol
+from dataclasses import dataclass
+from typing import Callable, Iterable, Mapping, Protocol, TypeAlias
 
 from ..signal_engine import SIGNAL_MODEL_ID
 from .contracts import (
@@ -26,7 +27,23 @@ class SignalModel(Protocol):
     ) -> tuple[SignalCandidate, ...]: ...
 
 
-SIGNAL_MODELS: dict[str, SignalModel] = {}
+@dataclass(frozen=True)
+class SignalModelFactory:
+    """Create an immutable model bound to one strategy's policy snapshot."""
+
+    model_id: str
+    side: PositionSide
+    create: Callable[[object | None], SignalModel]
+
+    def bind(self, policy: object | None) -> SignalModel:
+        model = self.create(policy)
+        if model.model_id != self.model_id or model.side is not self.side:
+            raise ValueError("signal model factory returned a mismatched model")
+        return model
+
+
+SignalRegistryEntry: TypeAlias = SignalModel | SignalModelFactory
+SIGNAL_MODELS: dict[str, SignalRegistryEntry] = {}
 
 
 def register_signal_model(model: SignalModel) -> None:
@@ -35,11 +52,31 @@ def register_signal_model(model: SignalModel) -> None:
     SIGNAL_MODELS[model.model_id] = model
 
 
-def get_signal_model(model_id: str) -> SignalModel:
+def register_signal_model_factory(factory: SignalModelFactory) -> None:
+    if type(factory) is not SignalModelFactory:
+        raise TypeError("factory must be SignalModelFactory")
+    if factory.model_id in SIGNAL_MODELS:
+        raise ValueError(f"重复信号模型：{factory.model_id}")
+    SIGNAL_MODELS[factory.model_id] = factory
+
+
+def resolve_signal_model(
+    registry: Mapping[str, SignalRegistryEntry],
+    model_id: str,
+    *,
+    policy: object | None = None,
+) -> SignalModel:
     try:
-        return SIGNAL_MODELS[model_id]
+        registered = registry[model_id]
     except KeyError:
         raise KeyError(f"未注册信号模型：{model_id}") from None
+    if type(registered) is SignalModelFactory:
+        return registered.bind(policy)
+    return registered
+
+
+def get_signal_model(model_id: str, *, policy: object | None = None) -> SignalModel:
+    return resolve_signal_model(SIGNAL_MODELS, model_id, policy=policy)
 
 
 def _finite_number(value: object) -> float | None:
@@ -123,4 +160,14 @@ register_signal_model(FactorRankLongAdapter())
 from .short_signal import ShortTrendBreakdownV1  # noqa: E402
 
 
-register_signal_model(ShortTrendBreakdownV1())
+def _create_short_trend_model(policy: object | None) -> SignalModel:
+    return ShortTrendBreakdownV1() if policy is None else ShortTrendBreakdownV1(policy=policy)
+
+
+register_signal_model_factory(
+    SignalModelFactory(
+        model_id=ShortTrendBreakdownV1.model_id,
+        side=ShortTrendBreakdownV1.side,
+        create=_create_short_trend_model,
+    )
+)

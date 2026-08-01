@@ -185,6 +185,105 @@ def recommendation_plan(decision=None) -> RecommendationPlan:
 
 
 class PortfolioEngineServiceTests(unittest.TestCase):
+    def _built_in_short_decision(
+        self,
+        *,
+        event_blackout_sessions: int,
+        maximum_volatility_20d_pct: float,
+        event_sessions: int | None,
+        volatility20: float,
+        engine=None,
+    ):
+        bound_strategy = strategy()
+        bound_strategy["signal"]["model"] = "factor_rank_v1"
+        bound_strategy["short_policy"].update(
+            {
+                "signal_model": "short_trend_breakdown_v1",
+                "event_blackout_sessions": event_blackout_sessions,
+                "maximum_volatility_20d_pct": maximum_volatility_20d_pct,
+            }
+        )
+        return (engine or service.PortfolioEngine()).evaluate(
+            PlanRequest(
+                run_key=(
+                    "plan:policy-bound-short:"
+                    f"{event_blackout_sessions}:{maximum_volatility_20d_pct}"
+                ),
+                strategy=bound_strategy,
+                account=account(),
+                analyzed_rows=(
+                    {
+                        "symbol": "S",
+                        "cutoff_date": "2026-08-01",
+                        "selected_for_long": False,
+                        "momentum20": -0.12,
+                        "momentum60": -0.25,
+                        "price": 50.0,
+                        "ma20": 55.0,
+                        "ma60": 60.0,
+                        "volatility20": volatility20,
+                        "turnover": 50_000_000.0,
+                        "one_day_return": -0.03,
+                    },
+                ),
+                market=market("policy-bound-short"),
+                borrow=BorrowSnapshot(
+                    id="borrow-policy-bound-short",
+                    status=AVAILABLE,
+                    securities={
+                        "S": BorrowSecurity(
+                            symbol="S",
+                            shortable=True,
+                            easy_to_borrow=True,
+                            available_quantity=100_000,
+                            borrow_apr_pct=8.0,
+                        )
+                    },
+                ),
+                event_calendar={"S": event_sessions},
+            )
+        )
+
+    def test_builtin_short_model_binds_each_strategy_blackout_policy(self):
+        engine = service.PortfolioEngine()
+        admitted = self._built_in_short_decision(
+            event_blackout_sessions=2,
+            maximum_volatility_20d_pct=80.0,
+            event_sessions=3,
+            volatility20=0.45,
+            engine=engine,
+        )
+        blocked = self._built_in_short_decision(
+            event_blackout_sessions=3,
+            maximum_volatility_20d_pct=80.0,
+            event_sessions=3,
+            volatility20=0.45,
+            engine=engine,
+        )
+
+        self.assertEqual([item.symbol for item in admitted.intents], ["S"])
+        self.assertEqual(blocked.intents, ())
+
+    def test_builtin_short_model_binds_each_strategy_volatility_policy(self):
+        engine = service.PortfolioEngine()
+        admitted = self._built_in_short_decision(
+            event_blackout_sessions=2,
+            maximum_volatility_20d_pct=60.0,
+            event_sessions=None,
+            volatility20=0.50,
+            engine=engine,
+        )
+        blocked = self._built_in_short_decision(
+            event_blackout_sessions=2,
+            maximum_volatility_20d_pct=40.0,
+            event_sessions=None,
+            volatility20=0.50,
+            engine=engine,
+        )
+
+        self.assertEqual([item.symbol for item in admitted.intents], ["S"])
+        self.assertEqual(blocked.intents, ())
+
     def test_public_service_exposes_portfolio_engine(self):
         self.assertTrue(
             hasattr(service, "PortfolioEngine"),
