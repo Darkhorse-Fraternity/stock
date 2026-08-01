@@ -644,6 +644,37 @@ class MarginBehaviorTests(unittest.TestCase):
             with self.subTest(updates=updates), self.assertRaises(ValueError):
                 replace(result, **updates)
 
+    def test_incomplete_projection_result_has_one_exact_rejection_shape(self):
+        result = margin.MarginAdmissionResult(
+            admitted=False,
+            reason="MARGIN_PROJECTION_UNAVAILABLE",
+            state=margin.REDUCE_ONLY,
+            required_margin=0.0,
+            available_buying_power=0.0,
+            difference=0.0,
+            maintenance_margin_pct=30.0,
+            buffer_threshold_pct=40.0,
+            current_metrics=None,
+            projected_metrics=None,
+            projection_status="INCOMPLETE",
+            risk_increasing=True,
+        )
+
+        self.assertFalse(result.admitted)
+        mutations = (
+            {"admitted": True, "reason": None},
+            {"reason": "MARKET_PRICE_MISSING"},
+            {"state": margin.NORMAL},
+            {"difference": 1.0},
+            {"risk_increasing": False},
+            {"current_metrics": margin.admit_margin(
+                account(cash=50.0), intent(), {"L": 1.0}, MarginPolicy()
+            ).current_metrics},
+        )
+        for updates in mutations:
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                replace(result, **updates)
+
     def test_missing_price_projection_updates_quantity_without_balance_values(self):
         cases = (
             (
@@ -934,6 +965,173 @@ class AdmissionStageTests(unittest.TestCase):
                 self.assertEqual(facts[0]["items"], ())
                 self.assertEqual(facts[1]["items"], (invalid,))
                 self.assertEqual(facts[2]["items"][0]["reason"], expected_reason)
+
+    def test_missing_short_close_blocks_later_long_open_as_projection_unavailable(self):
+        close_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+            quantity=100,
+        )
+        open_long = intent("L", quantity=100)
+        stage = margin.MarginAdmissionStage(
+            account(
+                cash=0.0,
+                positions=(position("S", PositionSide.SHORT, quantity=100),),
+                restricted_short_proceeds=100.0,
+            ),
+            {"L": 1.0},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input(
+                {"kind": "order_intents", "items": (close_short, open_long)}
+            )
+        )[0].facts
+        second = facts[2]["items"][1]
+
+        self.assertEqual(facts[0]["items"], (close_short,))
+        self.assertEqual(facts[1]["items"], (open_long,))
+        self.assertEqual(second["reason"], "MARGIN_PROJECTION_UNAVAILABLE")
+        self.assertEqual(second["state"], margin.REDUCE_ONLY)
+        self.assertEqual(second["projection_status"], "INCOMPLETE")
+        self.assertEqual(
+            (
+                second["required_margin"],
+                second["available_buying_power"],
+                second["difference"],
+            ),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertIsNone(second["current_metrics"])
+        self.assertIsNone(second["projected_metrics"])
+
+    def test_missing_long_sale_blocks_later_short_open_as_projection_unavailable(self):
+        close_long = intent(
+            "L",
+            position_effect=PositionEffect.CLOSE,
+            quantity=100,
+        )
+        open_short = intent("S", position_side=PositionSide.SHORT, quantity=100)
+        stage = margin.MarginAdmissionStage(
+            account(cash=50.0, positions=(position("L", quantity=100),)),
+            {"S": 1.0},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input(
+                {"kind": "order_intents", "items": (close_long, open_short)}
+            )
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (close_long,))
+        self.assertEqual(facts[1]["items"], (open_short,))
+        self.assertEqual(
+            facts[2]["items"][1]["reason"],
+            "MARGIN_PROJECTION_UNAVAILABLE",
+        )
+        self.assertEqual(facts[2]["items"][1]["projection_status"], "INCOMPLETE")
+
+    def test_incomplete_projection_still_allows_remaining_risk_reduction(self):
+        reduce_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.REDUCE,
+            quantity=40,
+        )
+        close_remaining = replace(
+            intent(
+                "S",
+                position_side=PositionSide.SHORT,
+                position_effect=PositionEffect.CLOSE,
+                quantity=60,
+            ),
+            id="intent-S-CLOSE-remaining",
+        )
+        stage = margin.MarginAdmissionStage(
+            account(
+                cash=0.0,
+                positions=(position("S", PositionSide.SHORT, quantity=100),),
+                restricted_short_proceeds=100.0,
+            ),
+            {},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input(
+                {
+                    "kind": "order_intents",
+                    "items": (reduce_short, close_remaining),
+                }
+            )
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (reduce_short, close_remaining))
+        self.assertEqual(facts[1]["items"], ())
+        self.assertEqual(facts[2]["items"][1]["projection_status"], "INCOMPLETE")
+
+    def test_semantic_rejection_does_not_mark_projection_incomplete(self):
+        invalid_reduction = intent(
+            "L",
+            position_effect=PositionEffect.REDUCE,
+            quantity=1,
+        )
+        open_known = intent("X", quantity=50)
+        stage = margin.MarginAdmissionStage(
+            account(cash=100.0),
+            {"X": 1.0},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input(
+                {
+                    "kind": "order_intents",
+                    "items": (invalid_reduction, open_known),
+                }
+            )
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (open_known,))
+        self.assertEqual(facts[1]["items"], (invalid_reduction,))
+        self.assertEqual(facts[2]["items"][0]["reason"], "POSITION_NOT_FOUND")
+        self.assertEqual(facts[2]["items"][1]["projection_status"], "COMPLETE")
+
+    def test_fully_priced_reduction_keeps_balance_projection_available(self):
+        close_short = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+            quantity=100,
+        )
+        open_long = intent("L", quantity=100)
+        stage = margin.MarginAdmissionStage(
+            account(
+                cash=50.0,
+                positions=(position("S", PositionSide.SHORT, quantity=100),),
+                restricted_short_proceeds=100.0,
+            ),
+            {"S": 1.0, "L": 1.0},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input(
+                {"kind": "order_intents", "items": (close_short, open_long)}
+            )
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (close_short, open_long))
+        self.assertEqual(facts[1]["items"], ())
+        self.assertEqual(facts[2]["items"][1]["projection_status"], "COMPLETE")
+        self.assertEqual(facts[2]["items"][1]["state"], margin.NORMAL)
+        self.assertEqual(
+            facts[2]["items"][1]["projected_metrics"]["margin_rate_pct"],
+            50.0,
+        )
 
 
 if __name__ == "__main__":

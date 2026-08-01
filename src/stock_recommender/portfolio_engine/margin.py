@@ -84,7 +84,11 @@ class MarginAdmissionResult(_ImmutableMarginValue):
             raise ValueError("reason must be a non-empty string or None")
         if self.state not in {NORMAL, REDUCE_ONLY, MARGIN_CALL}:
             raise ValueError(f"unsupported margin state: {self.state}")
-        if self.projection_status not in {"COMPLETE", "MARKET_PRICE_MISSING"}:
+        if self.projection_status not in {
+            "COMPLETE",
+            "MARKET_PRICE_MISSING",
+            "INCOMPLETE",
+        }:
             raise ValueError(f"unsupported projection_status: {self.projection_status}")
         if type(self.risk_increasing) is not bool:
             raise ValueError("risk_increasing must be a bool")
@@ -115,6 +119,31 @@ class MarginAdmissionResult(_ImmutableMarginValue):
         if not self.admitted and self.reason is None:
             raise ValueError("a rejected margin result must have a reason")
         if self.projected_metrics is None:
+            if self.projection_status == "INCOMPLETE":
+                if self.current_metrics is not None:
+                    raise ValueError(
+                        "incomplete projection must not expose stale current_metrics"
+                    )
+                if self.state != REDUCE_ONLY:
+                    raise ValueError("incomplete projection must be REDUCE_ONLY")
+                if any(
+                    getattr(self, field_name) != 0.0
+                    for field_name in (
+                        "required_margin",
+                        "available_buying_power",
+                        "difference",
+                    )
+                ):
+                    raise ValueError("incomplete projection amounts must be zero")
+                if (
+                    not self.risk_increasing
+                    or self.admitted
+                    or self.reason != "MARGIN_PROJECTION_UNAVAILABLE"
+                ):
+                    raise ValueError(
+                        "incomplete projection must reject risk increase"
+                    )
+                return
             if self.projection_status != "MARKET_PRICE_MISSING":
                 raise ValueError(
                     "metrics-free result requires MARKET_PRICE_MISSING projection_status"
@@ -393,6 +422,21 @@ def _updated_positions(
     return tuple(positions)
 
 
+def _project_position_quantities_for_intent(
+    account: AccountSnapshot,
+    intent: OrderIntent,
+) -> AccountSnapshot:
+    """Project only a risk reduction's remaining quantity, never its balances."""
+
+    existing = _validate_intent_semantics(account, intent)
+    if intent.increases_risk:
+        raise ValueError("position-only projection cannot increase risk")
+    return replace(
+        account,
+        positions=_updated_positions(account, intent, existing, None),
+    )
+
+
 def project_account_for_intent(
     account: AccountSnapshot,
     intent: OrderIntent,
@@ -407,10 +451,7 @@ def project_account_for_intent(
     except MarketPriceMissingError:
         if intent.increases_risk:
             raise
-        return replace(
-            account,
-            positions=_updated_positions(account, intent, existing, None),
-        )
+        return _project_position_quantities_for_intent(account, intent)
     notional = float(Decimal(str(price)) * intent.quantity)
     if not math.isfinite(notional):
         raise ValueError("intent notional must be finite")
@@ -496,6 +537,29 @@ def _missing_price_result(
         projected_metrics=None,
         projection_status="MARKET_PRICE_MISSING",
         risk_increasing=intent.increases_risk,
+    )
+
+
+def _incomplete_projection_result(
+    intent: OrderIntent,
+    maintenance: float,
+    threshold: float,
+) -> MarginAdmissionResult:
+    if not intent.increases_risk:
+        raise ValueError("incomplete projection rejection requires risk increase")
+    return MarginAdmissionResult(
+        admitted=False,
+        reason="MARGIN_PROJECTION_UNAVAILABLE",
+        state=REDUCE_ONLY,
+        required_margin=0.0,
+        available_buying_power=0.0,
+        difference=0.0,
+        maintenance_margin_pct=maintenance,
+        buffer_threshold_pct=threshold,
+        current_metrics=None,
+        projected_metrics=None,
+        projection_status="INCOMPLETE",
+        risk_increasing=True,
     )
 
 
@@ -609,7 +673,81 @@ class MarginAdmissionStage:
         rejected: list[OrderIntent] = []
         diagnostics: list[dict[str, object]] = []
         projected_account = self._account
+        projection_complete = True
         for item in intents:
+            if not projection_complete and item.increases_risk:
+                result = _incomplete_projection_result(
+                    item,
+                    self._maintenance,
+                    self._threshold,
+                )
+                rejected.append(item)
+                diagnostics.append(
+                    {
+                        "intent_id": item.id,
+                        "symbol": item.symbol,
+                        "admitted": result.admitted,
+                        "reason": result.reason,
+                        "state": result.state,
+                        "required_margin": result.required_margin,
+                        "available_buying_power": result.available_buying_power,
+                        "difference": result.difference,
+                        "maintenance_margin_pct": result.maintenance_margin_pct,
+                        "buffer_threshold_pct": result.buffer_threshold_pct,
+                        "projection_status": result.projection_status,
+                        "risk_increasing": result.risk_increasing,
+                        "current_metrics": None,
+                        "projected_metrics": None,
+                    }
+                )
+                continue
+            if not projection_complete:
+                try:
+                    projected_account = _project_position_quantities_for_intent(
+                        projected_account,
+                        item,
+                    )
+                except IntentSemanticsError as exc:
+                    rejected.append(item)
+                    diagnostics.append(
+                        {
+                            "intent_id": item.id,
+                            "symbol": item.symbol,
+                            "admitted": False,
+                            "reason": exc.reason,
+                            "state": REDUCE_ONLY,
+                            "required_margin": 0.0,
+                            "available_buying_power": 0.0,
+                            "difference": 0.0,
+                            "maintenance_margin_pct": self._maintenance,
+                            "buffer_threshold_pct": self._threshold,
+                            "projection_status": "INVALID_INTENT",
+                            "risk_increasing": False,
+                            "current_metrics": None,
+                            "projected_metrics": None,
+                        }
+                    )
+                    continue
+                admitted.append(item)
+                diagnostics.append(
+                    {
+                        "intent_id": item.id,
+                        "symbol": item.symbol,
+                        "admitted": True,
+                        "reason": None,
+                        "state": REDUCE_ONLY,
+                        "required_margin": 0.0,
+                        "available_buying_power": 0.0,
+                        "difference": 0.0,
+                        "maintenance_margin_pct": self._maintenance,
+                        "buffer_threshold_pct": self._threshold,
+                        "projection_status": "INCOMPLETE",
+                        "risk_increasing": False,
+                        "current_metrics": None,
+                        "projected_metrics": None,
+                    }
+                )
+                continue
             try:
                 result = admit_margin(
                     projected_account,
@@ -647,6 +785,8 @@ class MarginAdmissionStage:
                     item,
                     self._market_or_prices,
                 )
+                if result.projection_status != "COMPLETE":
+                    projection_complete = False
             else:
                 rejected.append(item)
             diagnostics.append(
