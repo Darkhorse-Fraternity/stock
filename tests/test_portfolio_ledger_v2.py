@@ -167,6 +167,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                             "revision_transitions": [],
                             "events": [],
                             "committed_batches": [],
+                            "run_results": [],
                         }
                     },
                 }
@@ -383,6 +384,51 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 with self.assertRaises(LedgerSchemaError):
                     store.load("tamper-revision")
                 self.assertEqual(path.read_bytes(), before)
+
+    def test_committed_request_result_is_lossless_and_tamper_evident(self):
+        store = JsonLedgerStore(self.path)
+        result = DecisionBatch(
+            run_key="request-result-run",
+            strategy_id="strategy",
+            strategy_revision=2,
+            portfolio_snapshot_id="snapshot-0",
+            market_snapshot_id="request-result-market",
+            request_fingerprint="request-fingerprint-1",
+            diagnostics=({"code": "TEST", "nested": {"values": (1, 2)}},),
+            stage_outputs=(
+                StageOutput(
+                    stage="audit",
+                    component_version="1.0.0",
+                    facts=({"kind": "typed", "items": ()},),
+                ),
+            ),
+        )
+        store.commit(result)
+
+        self.assertEqual(
+            store.load_committed_batch(
+                "strategy",
+                result.run_key,
+                result.request_fingerprint,
+            ),
+            result,
+        )
+        with self.assertRaisesRegex(LedgerError, "different request"):
+            store.load_committed_batch(
+                "strategy",
+                result.run_key,
+                "different-request-fingerprint",
+            )
+
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["accounts"]["strategy"]["run_results"][0][
+            "request_fingerprint"
+        ] = "forged-request-fingerprint"
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        before = self.path.read_bytes()
+        with self.assertRaises(LedgerSchemaError):
+            store.load("strategy")
+        self.assertEqual(self.path.read_bytes(), before)
 
     def _persist_two_risk_updates(self) -> tuple[Path, dict[str, object]]:
         path = self.path.parent / "risk-history.json"
@@ -710,6 +756,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             "revision_transitions",
             "events",
             "committed_batches",
+            "run_results",
         )
         for field_name in required_account_fields:
             with self.subTest(missing=field_name):

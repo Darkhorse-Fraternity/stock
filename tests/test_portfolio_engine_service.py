@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import json
+import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -32,7 +34,7 @@ from stock_recommender.portfolio_engine.contracts import (
     PositionSide,
     SignalCandidate,
 )
-from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
+from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerError
 from stock_recommender.portfolio_engine.risk import COVER_ONLY
 from stock_recommender.recommendation import RecommendationPlan
 from stock_recommender.reports import render_report
@@ -132,6 +134,13 @@ class CountingLedger:
 
     def load_view(self, strategy_id):
         return self.store.load_view(strategy_id)
+
+    def load_committed_batch(self, strategy_id, run_key, request_fingerprint):
+        return self.store.load_committed_batch(
+            strategy_id,
+            run_key,
+            request_fingerprint,
+        )
 
     def commit(self, batch):
         self.commit_calls += 1
@@ -503,7 +512,10 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                 borrow=BorrowSnapshot.unavailable(),
                 event_calendar={"L": None},
             )
-            expected = engine.evaluate(request)
+            expected = replace(
+                engine.evaluate(request),
+                request_fingerprint=service.request_fingerprint(request),
+            )
             planned = engine.plan_and_commit(request)
             self.assertEqual(planned, expected)
             self.assertEqual(ledger.commit_calls, 1)
@@ -521,18 +533,143 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             self.assertEqual(same.fills, ())
             self.assertEqual(ledger.commit_calls, 2)
 
-            later = engine.process_and_commit(
-                ProcessRequest(
-                    run_key="process:later",
-                    strategy=strategy("LONG_ONLY"),
-                    account=ledger.load("strategy-us"),
-                    market=market("market-2", occurred_at=NOW + timedelta(minutes=5)),
-                    borrow=BorrowSnapshot.unavailable(),
-                )
+            later_request = ProcessRequest(
+                run_key="process:later",
+                strategy=strategy("LONG_ONLY"),
+                account=ledger.load("strategy-us"),
+                market=market("market-2", occurred_at=NOW + timedelta(minutes=5)),
+                borrow=BorrowSnapshot.unavailable(),
             )
+            later = engine.process_and_commit(later_request)
             self.assertEqual(len(later.fills), 1)
             self.assertEqual(ledger.commit_calls, 3)
             self.assertEqual(ledger.load_view("strategy-us").open_intents, ())
+            repeated = engine.process_and_commit(later_request)
+            self.assertEqual(repeated, later)
+            self.assertEqual(ledger.commit_calls, 3)
+
+    def test_plan_retry_replays_original_result_before_stale_account_check(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+            )
+            request = PlanRequest(
+                run_key="plan:exact-retry",
+                strategy=strategy("LONG_ONLY"),
+                account=ledger.load("strategy-us"),
+                analyzed_rows=({"symbol": "L", "score": 0.9},),
+                market=market("retry-plan"),
+                borrow=BorrowSnapshot.unavailable("retry-borrow"),
+                event_calendar={"L": None},
+            )
+
+            first = engine.plan_and_commit(request)
+            repeated = engine.plan_and_commit(request)
+
+            self.assertEqual(repeated, first)
+            self.assertEqual(ledger.commit_calls, 1)
+            self.assertEqual(len(long_model.row_objects), 1)
+
+            changed = PlanRequest(
+                run_key=request.run_key,
+                strategy=request.strategy,
+                account=request.account,
+                analyzed_rows=({"symbol": "L", "score": 0.8},),
+                market=request.market,
+                borrow=request.borrow,
+                event_calendar=request.event_calendar,
+            )
+            with self.assertRaisesRegex(LedgerError, "different request|run_key"):
+                engine.plan_and_commit(changed)
+            self.assertEqual(ledger.commit_calls, 1)
+
+    def test_request_fingerprint_covers_every_plan_and_process_input(self):
+        base_plan = PlanRequest(
+            run_key="plan:fingerprint",
+            strategy=strategy("LONG_ONLY"),
+            account=account(),
+            analyzed_rows=({"symbol": "L", "score": 0.9},),
+            market=market("fingerprint-market"),
+            borrow=BorrowSnapshot.unavailable("fingerprint-borrow"),
+            event_calendar={"L": None},
+        )
+        mutations = (
+            replace(base_plan, strategy={**strategy("LONG_ONLY"), "name": "changed"}),
+            replace(base_plan, account=account("fingerprint-account-changed")),
+            replace(base_plan, analyzed_rows=({"symbol": "L", "score": 0.8},)),
+            replace(base_plan, market=market("fingerprint-market-changed")),
+            replace(base_plan, borrow=BorrowSnapshot.unavailable("borrow-changed")),
+            replace(base_plan, event_calendar={"L": 1}),
+        )
+        fingerprint = service.request_fingerprint(base_plan)
+        self.assertTrue(fingerprint)
+        self.assertEqual(fingerprint, service.request_fingerprint(base_plan))
+        for changed in mutations:
+            with self.subTest(changed=changed):
+                self.assertNotEqual(
+                    fingerprint,
+                    service.request_fingerprint(changed),
+                )
+
+        base_process = ProcessRequest(
+            run_key="process:fingerprint",
+            strategy=base_plan.strategy,
+            account=base_plan.account,
+            market=base_plan.market,
+            borrow=base_plan.borrow,
+        )
+        self.assertNotEqual(
+            service.request_fingerprint(base_process),
+            service.request_fingerprint(
+                replace(base_process, market=market("process-market-changed"))
+            ),
+        )
+
+    def test_concurrent_same_plan_request_persists_one_replayable_result(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            ledger = CountingLedger(path)
+            ledger.create_account(account())
+            request = PlanRequest(
+                run_key="plan:concurrent-exact-retry",
+                strategy=strategy("LONG_ONLY"),
+                account=ledger.load("strategy-us"),
+                analyzed_rows=({"symbol": "L", "score": 0.9},),
+                market=market("concurrent-plan"),
+                borrow=BorrowSnapshot.unavailable("concurrent-borrow"),
+                event_calendar={"L": None},
+            )
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+            )
+            results = []
+            errors = []
+
+            def run() -> None:
+                try:
+                    results.append(engine.plan_and_commit(request))
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=run) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0], results[1])
+            persisted = json.loads(path.read_text(encoding="utf-8"))["accounts"][
+                "strategy-us"
+            ]
+            self.assertEqual(len(persisted["run_results"]), 1)
 
     def test_process_requires_strictly_later_market_time_not_only_new_id(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")

@@ -43,6 +43,7 @@ from .exposure import ExposureBudgetStage
 from .margin import MarginAdmissionStage
 from .pre_execution import PreExecutionAdmissionStage, hard_cap_breaches
 from .risk import PortfolioRiskStage
+from .request_identity import request_fingerprint
 from .signal_ports import SIGNAL_MODELS, SignalModel
 from .target_pipeline import TargetNettingStage
 from .valuation import value_account
@@ -466,7 +467,24 @@ class PortfolioEngine:
         return self._ledger.commit(batch)
 
     def plan_and_commit(self, request: PlanRequest) -> DecisionBatch:
-        batch = self.evaluate(request)
+        if type(request) is not PlanRequest:
+            raise TypeError("request must be PlanRequest")
+        if self._ledger is None:
+            raise RuntimeError(
+                "PortfolioEngine requires a ledger_store for plan_and_commit"
+            )
+        fingerprint = request_fingerprint(request)
+        committed = self._ledger.load_committed_batch(
+            str(request.strategy["id"]),
+            request.run_key,
+            fingerprint,
+        )
+        if committed is not None:
+            return committed
+        batch = replace(
+            self.evaluate(request),
+            request_fingerprint=fingerprint,
+        )
         self.commit(batch)
         return batch
 
@@ -479,6 +497,14 @@ class PortfolioEngine:
             raise RuntimeError(
                 "PortfolioEngine requires a ledger_store for process_and_commit"
             )
+        fingerprint = request_fingerprint(request)
+        committed = self._ledger.load_committed_batch(
+            str(request.strategy["id"]),
+            request.run_key,
+            fingerprint,
+        )
+        if committed is not None:
+            return committed
         view = self._ledger.load_view(str(request.strategy["id"]))
         if view.account != request.account:
             raise ValueError("stale portfolio account snapshot")
@@ -556,6 +582,7 @@ class PortfolioEngine:
                 request.market,
                 exposure_policy,
                 margin_policy,
+                baseline_account=request.account,
             )
             if post_execution_breaches:
                 raise RuntimeError(
@@ -708,6 +735,7 @@ class PortfolioEngine:
             strategy_revision=int(request.strategy["revision"]),
             portfolio_snapshot_id=request.account.snapshot_id or request.account.id,
             market_snapshot_id=request.market.id,
+            request_fingerprint=fingerprint,
             intents=risk_intents,
             fills=fills,
             events=carry.events,

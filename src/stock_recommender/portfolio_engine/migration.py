@@ -646,6 +646,7 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
         "revision_transitions": [],
         "events": [],
         "committed_batches": committed_batches,
+        "run_results": [],
     }
     decoded = decode_account_snapshot(result)
     prices = {

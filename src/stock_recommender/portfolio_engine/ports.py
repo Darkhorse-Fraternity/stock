@@ -54,6 +54,13 @@ class LedgerStore(Protocol):
         transition: RevisionTransition,
     ) -> AccountSnapshot: ...
 
+    def load_committed_batch(
+        self,
+        strategy_id: str,
+        run_key: str,
+        request_fingerprint: str,
+    ) -> DecisionBatch | None: ...
+
     def commit(self, batch: DecisionBatch) -> AccountSnapshot: ...
 
     def list_accounts(self) -> tuple[AccountSnapshot, ...]: ...

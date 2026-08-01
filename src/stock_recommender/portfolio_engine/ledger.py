@@ -6,12 +6,18 @@ import hashlib
 import json
 import math
 import threading
-from dataclasses import dataclass, fields, is_dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from ..pipeline import StageOutput
+from .canonical import (
+    CanonicalGraphError,
+    canonical_graph,
+    decode_canonical_graph,
+)
 from .contracts import (
     AccrualLifecycle,
     AccountSnapshot,
@@ -31,6 +37,8 @@ from .contracts import (
     PositionSettlementUpdate,
     PositionSide,
     PositionSnapshot,
+    SignalCandidate,
+    TargetPosition,
 )
 from .atomic_io import atomic_replace_bytes, transaction_guard
 from .margin import project_account_for_intent
@@ -66,6 +74,7 @@ _ACCOUNT_FIELDS = _ACCOUNT_SNAPSHOT_FIELDS | frozenset(
         "revision_transitions",
         "events",
         "committed_batches",
+        "run_results",
     }
 )
 _RISK_FACT_FIELDS = frozenset(
@@ -863,47 +872,54 @@ def _json_plain(value: Any) -> Any:
 def _fingerprint_plain(value: Any) -> Any:
     """Encode immutable domain values without dropping observable fields."""
 
-    if is_dataclass(value) and not isinstance(value, type):
-        return {
-            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
-            "fields": {
-                field.name: _fingerprint_plain(getattr(value, field.name))
-                for field in fields(value)
-            },
-        }
-    if isinstance(value, Mapping):
-        result: dict[str, Any] = {}
-        for key, item in value.items():
-            if type(key) is not str:
-                raise LedgerError("observable mapping keys must be strings")
-            result[key] = _fingerprint_plain(item)
-        return result
-    if isinstance(value, (tuple, list)):
-        return [_fingerprint_plain(item) for item in value]
-    if isinstance(value, frozenset):
-        encoded = [_fingerprint_plain(item) for item in value]
-        return sorted(
-            encoded,
-            key=lambda item: json.dumps(
-                item, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-            ),
+    return canonical_graph(value)
+
+
+_RUN_RESULT_DATACLASSES = (
+    AccrualLifecycle,
+    AccountSnapshot,
+    CarryAccrualRecord,
+    DecisionBatch,
+    ExecutionFill,
+    ExecutionProgressFill,
+    OrderExecutionProgress,
+    OrderIntent,
+    PortfolioEvent,
+    PositionRiskUpdate,
+    PositionSettlementUpdate,
+    PositionSnapshot,
+    SignalCandidate,
+    StageOutput,
+    TargetPosition,
+)
+_RUN_RESULT_ENUMS = (
+    CarryCostType,
+    OrderSide,
+    PositionEffect,
+    PositionSide,
+)
+_RUN_RESULT_DATACLASS_TYPES = {
+    f"{item.__module__}.{item.__qualname__}": item
+    for item in _RUN_RESULT_DATACLASSES
+}
+_RUN_RESULT_ENUM_TYPES = {
+    f"{item.__module__}.{item.__qualname__}": item
+    for item in _RUN_RESULT_ENUMS
+}
+
+
+def _batch_from_canonical_json(value: object) -> DecisionBatch:
+    try:
+        decoded = decode_canonical_graph(
+            value,
+            dataclass_types=_RUN_RESULT_DATACLASS_TYPES,
+            enum_types=_RUN_RESULT_ENUM_TYPES,
         )
-    if isinstance(value, Enum):
-        return {
-            "__enum__": f"{type(value).__module__}.{type(value).__qualname__}",
-            "value": _fingerprint_plain(value.value),
-        }
-    if isinstance(value, datetime):
-        return {"__datetime__": value.isoformat()}
-    if isinstance(value, date):
-        return {"__date__": value.isoformat()}
-    if isinstance(value, bytes):
-        return {"__bytes__": value.hex()}
-    if value is None or type(value) in {bool, int, float, str}:
-        if type(value) is float and not math.isfinite(value):
-            raise LedgerError("non-finite observable number")
-        return value
-    raise LedgerError(f"unsupported observable value: {type(value).__name__}")
+    except CanonicalGraphError as exc:
+        raise LedgerSchemaError("invalid canonical run result") from exc
+    if type(decoded) is not DecisionBatch:
+        raise LedgerSchemaError("canonical run result must be DecisionBatch")
+    return decoded
 
 
 def _validate_account(account: AccountSnapshot) -> None:
@@ -948,6 +964,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             "revision_transitions",
             "events",
             "committed_batches",
+            "run_results",
         ):
             _require_list(item[key], f"account.{key}")
         intents = [_intent_from_json(raw) for raw in item["open_intents"]]
@@ -1110,6 +1127,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             ) from exc
         committed = item["committed_batches"]
         run_keys: set[str] = set()
+        committed_by_run_key: dict[str, Mapping[str, Any]] = {}
         referenced_risk_fact_ids: list[str] = []
         for index, raw_batch in enumerate(committed):
             batch = _require_mapping(raw_batch, f"committed_batches[{index}]")
@@ -1185,10 +1203,76 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                     )
             referenced_risk_fact_ids.extend(batch_risk_fact_ids)
             run_keys.add(run_key)
+            committed_by_run_key[run_key] = batch
         if referenced_risk_fact_ids != risk_fact_ids:
             raise LedgerSchemaError(
                 "committed batches and canonical risk facts must be append-only one-to-one"
             )
+        run_result_keys: set[str] = set()
+        for index, raw_result in enumerate(item["run_results"]):
+            result = _require_mapping(raw_result, f"run_results[{index}]")
+            _require_keys(
+                result,
+                frozenset(
+                    {
+                        "strategy_id",
+                        "run_key",
+                        "request_fingerprint",
+                        "batch_fingerprint",
+                        "batch",
+                    }
+                ),
+                f"run_results[{index}]",
+            )
+            run_key = result["run_key"]
+            request_fingerprint = result["request_fingerprint"]
+            batch_fingerprint = result["batch_fingerprint"]
+            for field_name, value in (
+                ("run_key", run_key),
+                ("request_fingerprint", request_fingerprint),
+                ("batch_fingerprint", batch_fingerprint),
+            ):
+                if type(value) is not str or not value:
+                    raise LedgerSchemaError(
+                        f"run result {field_name} must be non-empty"
+                    )
+            if result["strategy_id"] != strategy_id:
+                raise LedgerSchemaError("run result strategy_id differs from account")
+            if run_key in run_result_keys:
+                raise LedgerSchemaError("account.run_results contains duplicate run keys")
+            committed_batch = committed_by_run_key.get(run_key)
+            if committed_batch is None:
+                raise LedgerSchemaError("run result references an uncommitted run")
+            decoded_batch = _batch_from_canonical_json(result["batch"])
+            if canonical_graph(decoded_batch) != result["batch"]:
+                raise LedgerSchemaError("run result batch graph is not canonical")
+            if (
+                decoded_batch.strategy_id != strategy_id
+                or decoded_batch.run_key != run_key
+                or decoded_batch.request_fingerprint != request_fingerprint
+                or decoded_batch.strategy_revision
+                != committed_batch["strategy_revision"]
+                or decoded_batch.portfolio_snapshot_id
+                != committed_batch["source_snapshot_id"]
+                or decoded_batch.market_snapshot_id
+                != committed_batch["market_snapshot_id"]
+            ):
+                raise LedgerSchemaError(
+                    "canonical run result identity differs from committed batch"
+                )
+            canonical_facts = _canonical_batch_facts(decoded_batch)
+            expected_batch_fingerprint = _batch_fingerprint(
+                decoded_batch,
+                canonical_facts,
+            )
+            if (
+                batch_fingerprint != expected_batch_fingerprint
+                or committed_batch["fingerprint"] != expected_batch_fingerprint
+            ):
+                raise LedgerSchemaError(
+                    "canonical run result fingerprint differs from committed batch"
+                )
+            run_result_keys.add(run_key)
     return payload
 
 
@@ -1603,6 +1687,10 @@ def _apply_progress(
             current = _charge_fee(current, progress_fill.fees)
             current = _touch_position_after_fill(current, intent, progress_fill)
         merged[item.intent_id] = item
+    current = replace(
+        current,
+        positions=tuple(sorted(current.positions, key=lambda item: item.symbol)),
+    )
     return current, merged
 
 
@@ -2123,6 +2211,7 @@ class JsonLedgerStore:
             "revision_transitions": [],
             "events": [_event_to_json(opened)],
             "committed_batches": [],
+            "run_results": [],
         }
         with _PROCESS_LOCK, transaction_guard((self.path,)):
             store = _read_store(self.path)
@@ -2319,6 +2408,64 @@ class JsonLedgerStore:
                 for strategy_id in sorted(store["accounts"])
             )
 
+    def load_committed_batch(
+        self,
+        strategy_id: str,
+        run_key: str,
+        request_fingerprint: str,
+    ) -> DecisionBatch | None:
+        """Return an exact prior result, or reject reuse of its run key."""
+
+        for value, field_name in (
+            (strategy_id, "strategy_id"),
+            (run_key, "run_key"),
+            (request_fingerprint, "request_fingerprint"),
+        ):
+            if type(value) is not str or not value:
+                raise ValueError(f"{field_name} must be a non-empty string")
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
+            store = _read_store(self.path)
+            try:
+                persisted = _require_mapping(
+                    store["accounts"][strategy_id],
+                    "account",
+                )
+            except KeyError as exc:
+                raise KeyError(f"portfolio account not found: {strategy_id}") from exc
+            committed = next(
+                (
+                    item
+                    for item in _require_list(
+                        persisted["committed_batches"],
+                        "account.committed_batches",
+                    )
+                    if isinstance(item, Mapping) and item.get("run_key") == run_key
+                ),
+                None,
+            )
+            if committed is None:
+                return None
+            result = next(
+                (
+                    item
+                    for item in _require_list(
+                        persisted["run_results"],
+                        "account.run_results",
+                    )
+                    if isinstance(item, Mapping) and item.get("run_key") == run_key
+                ),
+                None,
+            )
+            if result is None:
+                raise LedgerError(
+                    "run_key was committed without a replayable request result"
+                )
+            if result.get("request_fingerprint") != request_fingerprint:
+                raise LedgerError(
+                    "run_key was already committed with a different request"
+                )
+            return _batch_from_canonical_json(result["batch"])
+
     def commit(self, batch: DecisionBatch) -> AccountSnapshot:
         if type(batch) is not DecisionBatch:
             raise TypeError("batch must be DecisionBatch")
@@ -2477,6 +2624,22 @@ class JsonLedgerStore:
                         "risk_fact_ids": [fact.fact_id for fact in new_risk_facts],
                         "fingerprint": fingerprint,
                     },
+                ],
+                "run_results": [
+                    *_require_list(persisted["run_results"], "account.run_results"),
+                    *(
+                        (
+                            {
+                                "strategy_id": batch.strategy_id,
+                                "run_key": batch.run_key,
+                                "request_fingerprint": batch.request_fingerprint,
+                                "batch_fingerprint": fingerprint,
+                                "batch": canonical_graph(batch),
+                            },
+                        )
+                        if batch.request_fingerprint is not None
+                        else ()
+                    ),
                 ],
             }
             next_store = {

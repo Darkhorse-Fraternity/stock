@@ -16,6 +16,7 @@ from stock_recommender.portfolio_engine.config import (
     ShortPolicy,
 )
 from stock_recommender.portfolio_engine.contracts import (
+    AccrualLifecycle,
     AccountSnapshot,
     MarketSnapshot,
     OrderIntent,
@@ -56,6 +57,8 @@ def intent(
     symbol: str = "L",
     position_side: PositionSide = PositionSide.LONG,
     position_effect: PositionEffect = PositionEffect.OPEN,
+    created_market_at: datetime | None = None,
+    reason: str = "planned entry",
 ) -> OrderIntent:
     increases = position_effect in {PositionEffect.OPEN, PositionEffect.INCREASE}
     order_side = (
@@ -69,9 +72,9 @@ def intent(
         "order_side": order_side,
         "position_effect": position_effect,
         "quantity": quantity,
-        "reason": "planned entry",
+        "reason": reason,
         "created_snapshot_id": "market-planned",
-        "created_market_at": NOW.replace(minute=30),
+        "created_market_at": created_market_at or NOW.replace(minute=30),
     }
     return OrderIntent(
         id=stable_execution_intent_id(**values),
@@ -324,6 +327,330 @@ class PreExecutionAdmissionTests(unittest.TestCase):
             fact for fact in output.facts if fact["kind"] == "pre_execution_admitted_intents"
         )
         self.assertEqual(admitted["items"], (closing, opening))
+
+    def test_admission_order_is_fifo_and_independent_of_caller_permutation(self):
+        earlier = intent(
+            1,
+            symbol="B",
+            created_market_at=NOW - timedelta(minutes=2),
+            reason="earlier",
+        )
+        later = intent(
+            1,
+            symbol="A",
+            created_market_at=NOW - timedelta(minutes=1),
+            reason="later",
+        )
+        quote = MarketSnapshot(
+            id="market-fifo-cash",
+            occurred_at=NOW,
+            quotes={
+                symbol: {
+                    "price": 100.0,
+                    "bar_open": 100.0,
+                    "bar_high": 100.0,
+                    "bar_low": 100.0,
+                    "bar_volume": 1_000_000,
+                }
+                for symbol in ("A", "B")
+            },
+        )
+        for orders in ((later, earlier), (earlier, later)):
+            output = self._evaluate(
+                orders,
+                quote,
+                current_account=account(available_cash=100.0),
+            )
+            admitted = next(
+                fact
+                for fact in output.facts
+                if fact["kind"] == "pre_execution_admitted_intents"
+            )
+            self.assertEqual(admitted["items"], (earlier,))
+
+        same_time_a = intent(1, symbol="A", reason="same-time-a")
+        same_time_b = intent(1, symbol="B", reason="same-time-b")
+        output = self._evaluate(
+            (same_time_b, same_time_a),
+            quote,
+            current_account=account(available_cash=100.0),
+        )
+        admitted = next(
+            fact
+            for fact in output.facts
+            if fact["kind"] == "pre_execution_admitted_intents"
+        )
+        self.assertEqual(admitted["items"], (same_time_a,))
+
+        same_symbol = (
+            intent(1, symbol="A", reason="id-tie-first"),
+            intent(1, symbol="A", reason="id-tie-second"),
+        )
+        expected = min(same_symbol, key=lambda item: item.id)
+        for orders in (same_symbol, tuple(reversed(same_symbol))):
+            output = self._evaluate(
+                orders,
+                quote,
+                current_account=account(available_cash=100.0),
+            )
+            admitted = next(
+                fact
+                for fact in output.facts
+                if fact["kind"] == "pre_execution_admitted_intents"
+            )
+            self.assertEqual(admitted["items"], (expected,))
+
+    def test_short_borrow_reservation_uses_fifo_not_caller_order(self):
+        earlier = intent(
+            40,
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.INCREASE,
+            created_market_at=NOW - timedelta(minutes=2),
+            reason="earlier-short",
+        )
+        later = intent(
+            40,
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            created_market_at=NOW - timedelta(minutes=1),
+            reason="later-short",
+        )
+        partial_market = MarketSnapshot(
+            id="market-partial-borrow-fifo",
+            occurred_at=NOW - timedelta(seconds=30),
+            quotes={
+                "S": {
+                    "price": 100.0,
+                    "bar_open": 100.0,
+                    "bar_high": 100.0,
+                    "bar_low": 100.0,
+                    "bar_volume": 20,
+                }
+            },
+        )
+        partial = execute_intents(
+            account(),
+            (later,),
+            partial_market,
+            execution_policy(),
+        )
+        self.assertEqual(partial.progress[0].filled_quantity, 20)
+        for orders in ((later, earlier), (earlier, later)):
+            output = self._evaluate(
+                orders,
+                market(100.0, symbol="S"),
+                current_account=partial.account,
+                exposure=long_short_exposure(),
+                borrow_snapshot=available_borrow(quantity=50),
+                progress=partial.progress,
+            )
+            admitted = next(
+                fact
+                for fact in output.facts
+                if fact["kind"] == "pre_execution_admitted_intents"
+            )
+            self.assertEqual(admitted["items"], (earlier,))
+
+    def test_hard_caps_have_no_float_tolerance_at_any_scale(self):
+        from stock_recommender.portfolio_engine.pre_execution import hard_cap_breaches
+
+        exposure = ExposurePolicy(
+            mode="LONG_ONLY",
+            max_positions=10,
+            max_gross_exposure_pct=100.0,
+            max_net_exposure_pct=100.0,
+            max_long_exposure_pct=100.0,
+            max_short_exposure_pct=0.0,
+            max_long_position_pct=100.0,
+            max_short_position_pct=0.0,
+        )
+        for scale in (1e-200, 100.0, 1e200):
+            with self.subTest(scale=scale, boundary="exact"):
+                exact = account(
+                    available_cash=0.0,
+                    positions=(
+                        PositionSnapshot(
+                            symbol="L",
+                            side=PositionSide.LONG,
+                            quantity=1,
+                            average_cost=scale,
+                            current_price=scale,
+                        ),
+                    ),
+                )
+                self.assertNotIn(
+                    "GROSS_EXPOSURE_CAP",
+                    hard_cap_breaches(exact, market(scale), exposure, MarginPolicy()),
+                )
+
+            with self.subTest(scale=scale, boundary="100.0000000005"):
+                loan = scale * 5e-12
+                beyond = AccountSnapshot(
+                    id="account-admission",
+                    strategy_id="strategy-admission",
+                    strategy_revision=1,
+                    occurred_at=NOW,
+                    available_cash=0.0,
+                    margin_loan=loan,
+                    financing_lifecycle=AccrualLifecycle(
+                        id=f"financing-{scale}",
+                        started_on=NOW.date(),
+                    ),
+                    positions=(
+                        PositionSnapshot(
+                            symbol="L",
+                            side=PositionSide.LONG,
+                            quantity=1,
+                            average_cost=scale,
+                            current_price=scale,
+                        ),
+                    ),
+                    snapshot_id="account-before",
+                )
+                self.assertIn(
+                    "GROSS_EXPOSURE_CAP",
+                    hard_cap_breaches(beyond, market(scale), exposure, MarginPolicy()),
+                )
+
+        nextafter_loan = math.ulp(100.0)
+        nextafter_account = AccountSnapshot(
+            id="account-admission",
+            strategy_id="strategy-admission",
+            strategy_revision=1,
+            occurred_at=NOW,
+            available_cash=0.0,
+            margin_loan=nextafter_loan,
+            financing_lifecycle=AccrualLifecycle(
+                id="financing-nextafter",
+                started_on=NOW.date(),
+            ),
+            positions=(
+                PositionSnapshot(
+                    symbol="L",
+                    side=PositionSide.LONG,
+                    quantity=1,
+                    average_cost=100.0,
+                    current_price=100.0,
+                ),
+            ),
+            snapshot_id="account-before",
+        )
+        self.assertIn(
+            "GROSS_EXPOSURE_CAP",
+            hard_cap_breaches(
+                nextafter_account,
+                market(100.0),
+                exposure,
+                MarginPolicy(),
+            ),
+        )
+
+    def test_existing_policy_breach_is_baseline_aware_and_reduce_only_safe(self):
+        held = PositionSnapshot(
+            symbol="S",
+            side=PositionSide.SHORT,
+            quantity=1,
+            average_cost=100.0,
+            current_price=100.0,
+        )
+        existing = AccountSnapshot(
+            id="account-admission",
+            strategy_id="strategy-admission",
+            strategy_revision=1,
+            occurred_at=NOW,
+            available_cash=1_000.0,
+            restricted_short_proceeds=100.0,
+            positions=(held,),
+            snapshot_id="account-before",
+        )
+        permissive_long_only = ExposurePolicy(
+            mode="LONG_ONLY",
+            max_positions=10,
+            max_gross_exposure_pct=200.0,
+            max_net_exposure_pct=200.0,
+            max_long_exposure_pct=200.0,
+            max_short_exposure_pct=0.0,
+            max_long_position_pct=200.0,
+            max_short_position_pct=0.0,
+        )
+        non_worsening_long = intent(1, symbol="L")
+        reducing_cover = intent(
+            1,
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.CLOSE,
+        )
+        worsening_short = intent(
+            1,
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.INCREASE,
+            reason="worsening-short",
+        )
+        quote = MarketSnapshot(
+            id="market-baseline-policy-breach",
+            occurred_at=NOW,
+            quotes={
+                symbol: {
+                    "price": 100.0,
+                    "bar_open": 100.0,
+                    "bar_high": 100.0,
+                    "bar_low": 100.0,
+                    "bar_volume": 1_000_000,
+                }
+                for symbol in ("L", "S")
+            },
+        )
+
+        non_worsening = self._evaluate(
+            non_worsening_long,
+            quote,
+            current_account=existing,
+            exposure=permissive_long_only,
+        )
+        admitted = next(
+            fact
+            for fact in non_worsening.facts
+            if fact["kind"] == "pre_execution_admitted_intents"
+        )
+        self.assertEqual(admitted["items"], (non_worsening_long,))
+
+        reduction = self._evaluate(
+            reducing_cover,
+            quote,
+            current_account=existing,
+            exposure=permissive_long_only,
+        )
+        admitted = next(
+            fact
+            for fact in reduction.facts
+            if fact["kind"] == "pre_execution_admitted_intents"
+        )
+        self.assertEqual(admitted["items"], (reducing_cover,))
+
+        worsening = self._evaluate(
+            worsening_short,
+            quote,
+            current_account=existing,
+            exposure=permissive_long_only,
+            borrow_snapshot=available_borrow(quantity=10),
+        )
+        admitted = next(
+            fact
+            for fact in worsening.facts
+            if fact["kind"] == "pre_execution_admitted_intents"
+        )
+        diagnostic = next(
+            fact
+            for fact in worsening.facts
+            if fact["kind"] == "pre_execution_diagnostics"
+        )
+        self.assertEqual(admitted["items"], ())
+        self.assertIn(
+            diagnostic["items"][0]["reason"],
+            {"LONG_ONLY_SHORT_FORBIDDEN", "SHORT_EXPOSURE_CAP"},
+        )
 
     def test_margin_maintenance_and_liquidation_buffer_is_a_hard_cap(self):
         exposure = ExposurePolicy(

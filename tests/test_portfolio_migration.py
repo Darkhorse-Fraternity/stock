@@ -481,6 +481,7 @@ class PortfolioMigrationTests(unittest.TestCase):
                 "revision_transitions",
                 "events",
                 "committed_batches",
+                "run_results",
             },
         )
         self.assertEqual(account["positions"]["600001"]["side"], "LONG")
@@ -491,6 +492,7 @@ class PortfolioMigrationTests(unittest.TestCase):
         self.assertEqual(account["margin_loan"], 0.0)
         self.assertEqual(account["risk_facts"], [])
         self.assertEqual(account["revision_transitions"], [])
+        self.assertEqual(account["run_results"], [])
         self.assertTrue(
             all(
                 committed["risk_fact_ids"] == []

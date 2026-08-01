@@ -1318,6 +1318,7 @@ class DecisionBatch(_DeeplyImmutable):
     strategy_revision: int
     portfolio_snapshot_id: str
     market_snapshot_id: str
+    request_fingerprint: str | None = None
     intents: tuple[OrderIntent, ...] = ()
     fills: tuple[ExecutionFill, ...] = ()
     events: tuple[PortfolioEvent, ...] = ()
@@ -1334,6 +1335,8 @@ class DecisionBatch(_DeeplyImmutable):
         _require_integer(self.strategy_revision, "strategy_revision")
         _require_string(self.portfolio_snapshot_id, "portfolio_snapshot_id")
         _require_string(self.market_snapshot_id, "market_snapshot_id")
+        if self.request_fingerprint is not None:
+            _require_string(self.request_fingerprint, "request_fingerprint")
         intents = _typed_tuple(self.intents, OrderIntent, "intents")
         fills = _typed_tuple(self.fills, ExecutionFill, "fills")
         events = _typed_tuple(self.events, PortfolioEvent, "events")
