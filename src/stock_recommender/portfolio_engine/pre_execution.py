@@ -6,7 +6,8 @@ import math
 from typing import Mapping
 
 from ..pipeline import PipelineContractError, StageInput, StageOutput
-from .config import ExposurePolicy, MarginPolicy
+from .borrow import BorrowSnapshot, borrow_security_failure
+from .config import ExposurePolicy, MarginPolicy, ShortPolicy
 from .contracts import (
     AccountSnapshot,
     MarketSnapshot,
@@ -105,7 +106,7 @@ class PreExecutionAdmissionStage:
     """Re-admit persisted intents against the current executable snapshot."""
 
     name = "pre_execution_admission"
-    component_version = "1.0.0"
+    component_version = "1.1.0"
 
     def __init__(
         self,
@@ -114,6 +115,9 @@ class PreExecutionAdmissionStage:
         exposure: ExposurePolicy,
         margin: MarginPolicy,
         execution_policy: ExecutionPolicy,
+        *,
+        borrow_snapshot: BorrowSnapshot,
+        short_policy: ShortPolicy,
     ) -> None:
         if type(account) is not AccountSnapshot:
             raise TypeError("account must be AccountSnapshot")
@@ -125,11 +129,17 @@ class PreExecutionAdmissionStage:
             raise TypeError("margin must be MarginPolicy")
         if type(execution_policy) is not ExecutionPolicy:
             raise TypeError("execution_policy must be ExecutionPolicy")
+        if type(borrow_snapshot) is not BorrowSnapshot:
+            raise TypeError("borrow_snapshot must be BorrowSnapshot")
+        if type(short_policy) is not ShortPolicy:
+            raise TypeError("short_policy must be ShortPolicy")
         self._account = account
         self._market = market
         self._exposure = exposure
         self._margin = margin
         self._execution_policy = execution_policy
+        self._borrow_snapshot = borrow_snapshot
+        self._short_policy = short_policy
 
     def evaluate(self, stage_input: StageInput) -> StageOutput:
         if type(stage_input) is not StageInput:
@@ -177,12 +187,47 @@ class PreExecutionAdmissionStage:
         admitted: list[OrderIntent] = []
         rejected: list[OrderIntent] = []
         diagnostics: list[dict[str, object]] = []
+        reserved_borrow_by_symbol: dict[str, int] = {}
         for item in ordered:
             prior = (
                 (progress_by_id[item.id],)
                 if item.id in progress_by_id
                 else ()
             )
+            previously_filled = 0 if not prior else prior[0].filled_quantity
+            remaining_quantity = max(0, item.quantity - previously_filled)
+            if (
+                item.increases_risk
+                and item.position_side is PositionSide.SHORT
+            ):
+                total_requested = (
+                    reserved_borrow_by_symbol.get(item.symbol, 0)
+                    + remaining_quantity
+                )
+                borrow_reason, _ = borrow_security_failure(
+                    self._borrow_snapshot,
+                    item.symbol,
+                    self._short_policy,
+                    requested_quantity=total_requested,
+                )
+                if borrow_reason is not None:
+                    security = self._borrow_snapshot.securities.get(item.symbol)
+                    rejected.append(item)
+                    diagnostics.append(
+                        {
+                            "intent_id": item.id,
+                            "symbol": item.symbol,
+                            "reason": borrow_reason,
+                            "requested_quantity": total_requested,
+                            "available_quantity": (
+                                None
+                                if security is None
+                                else security.available_quantity
+                            ),
+                            "borrow_snapshot_id": self._borrow_snapshot.id,
+                        }
+                    )
+                    continue
             simulation = execute_intents(
                 projected,
                 (item,),
@@ -220,6 +265,11 @@ class PreExecutionAdmissionStage:
                 continue
             admitted.append(item)
             projected = simulation.account
+            if item.position_side is PositionSide.SHORT:
+                reserved_borrow_by_symbol[item.symbol] = (
+                    reserved_borrow_by_symbol.get(item.symbol, 0)
+                    + remaining_quantity
+                )
         return StageOutput(
             stage=self.name,
             component_version=self.component_version,

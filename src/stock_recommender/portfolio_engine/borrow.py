@@ -49,12 +49,23 @@ def _optional_nonnegative_number(value: object, field_name: str) -> float | None
     return 0.0 if number == 0.0 else number
 
 
+def _optional_nonnegative_integer(value: object, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an int or None")
+    if value < 0:
+        raise ValueError(f"{field_name} must be nonnegative")
+    return value
+
+
 @dataclass(frozen=True)
 class BorrowSecurity(_ImmutableBorrowValue):
     symbol: str
     shortable: bool
     easy_to_borrow: bool
     borrow_apr_pct: float | None = None
+    available_quantity: int | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
@@ -64,6 +75,14 @@ class BorrowSecurity(_ImmutableBorrowValue):
             self,
             "borrow_apr_pct",
             _optional_nonnegative_number(self.borrow_apr_pct, "borrow_apr_pct"),
+        )
+        object.__setattr__(
+            self,
+            "available_quantity",
+            _optional_nonnegative_integer(
+                self.available_quantity,
+                "available_quantity",
+            ),
         )
 
 
@@ -172,20 +191,48 @@ def _materialize_typed(
     return items
 
 
-def _security_failure(
+def borrow_security_failure(
     snapshot: BorrowSnapshot,
     symbol: str,
     policy: ShortPolicy,
+    *,
+    requested_quantity: int | None = None,
 ) -> tuple[str | None, float | None]:
+    """Return the canonical current-snapshot reason for rejecting short risk."""
+
+    if type(snapshot) is not BorrowSnapshot:
+        raise TypeError("snapshot must be BorrowSnapshot")
+    _require_string(symbol, "symbol")
+    resolved_policy = _validate_policy(policy)
+    if requested_quantity is not None:
+        if type(requested_quantity) is not int:
+            raise TypeError("requested_quantity must be an int or None")
+        if requested_quantity < 0:
+            raise ValueError("requested_quantity must be nonnegative")
     if snapshot.status == UNAVAILABLE:
         return "BORROW_DATA_MISSING", None
     security = snapshot.securities.get(symbol)
     if security is None:
         return "BORROW_DATA_MISSING", None
-    if policy.require_shortable and not security.shortable:
+    if resolved_policy.require_shortable and not security.shortable:
         return "SHORT_NOT_SHORTABLE", security.borrow_apr_pct
-    if policy.require_easy_to_borrow and not security.easy_to_borrow:
+    if resolved_policy.require_easy_to_borrow and not security.easy_to_borrow:
         return "NOT_EASY_TO_BORROW", security.borrow_apr_pct
+    maximum_apr = (
+        resolved_policy.estimated_borrow_apr_pct
+        * resolved_policy.cost_stress_multiplier
+    )
+    if (
+        security.borrow_apr_pct is not None
+        and security.borrow_apr_pct > maximum_apr
+    ):
+        return "BORROW_RATE_TOO_HIGH", security.borrow_apr_pct
+    if (
+        requested_quantity is not None
+        and security.available_quantity is not None
+        and requested_quantity > security.available_quantity
+    ):
+        return "BORROW_QUANTITY_INSUFFICIENT", security.borrow_apr_pct
     return None, security.borrow_apr_pct
 
 
@@ -212,7 +259,11 @@ def admit_borrow(
         if item.side is PositionSide.LONG:
             admitted.append(item)
             continue
-        reason, apr = _security_failure(snapshot, item.symbol, resolved_policy)
+        reason, apr = borrow_security_failure(
+            snapshot,
+            item.symbol,
+            resolved_policy,
+        )
         if reason == "BORROW_DATA_MISSING" and not (
             resolved_policy.block_on_borrow_data_missing
         ):
@@ -228,7 +279,11 @@ def admit_borrow(
     for position in positions:
         if position.side is not PositionSide.SHORT:
             continue
-        reason, _ = _security_failure(snapshot, position.symbol, resolved_policy)
+        reason, _ = borrow_security_failure(
+            snapshot,
+            position.symbol,
+            resolved_policy,
+        )
         modes[position.symbol] = "COVER_ONLY" if reason is not None else "NORMAL"
 
     return BorrowAdmissionResult(
@@ -243,7 +298,7 @@ class BorrowAdmissionStage:
     """Pure pipeline adapter for borrow admission after exposure allocation."""
 
     name = "borrow_admission"
-    component_version = "1.0.0"
+    component_version = "1.1.0"
 
     def __init__(
         self,
@@ -304,4 +359,5 @@ __all__ = (
     "BorrowSecurity",
     "BorrowSnapshot",
     "admit_borrow",
+    "borrow_security_failure",
 )

@@ -33,6 +33,7 @@ from stock_recommender.portfolio_engine.contracts import (
     SignalCandidate,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
+from stock_recommender.portfolio_engine.risk import COVER_ONLY
 from stock_recommender.recommendation import RecommendationPlan
 from stock_recommender.reports import render_report
 from stock_recommender.tracking import save_daily_selection
@@ -714,6 +715,161 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                 ["pre_execution_admission", "execution_simulation"],
             )
             self.assertEqual(ledger.load("strategy-us").positions, ())
+
+    def test_process_rechecks_current_borrow_and_blocks_only_new_short_risk(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        short_model = StaticSignalModel("short-test-v1", PositionSide.SHORT, "S")
+        planned_borrow = BorrowSnapshot(
+            id="borrow-planned",
+            status=AVAILABLE,
+            securities={
+                "S": BorrowSecurity(
+                    symbol="S",
+                    shortable=True,
+                    easy_to_borrow=True,
+                    borrow_apr_pct=2.0,
+                )
+            },
+        )
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={
+                    long_model.model_id: long_model,
+                    short_model.model_id: short_model,
+                },
+                ledger_store=ledger,
+            )
+            planned = engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:borrow-recheck",
+                    strategy=strategy("LONG_SHORT"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"}, {"symbol": "S"}),
+                    market=market("borrow-recheck-plan"),
+                    borrow=planned_borrow,
+                    event_calendar={},
+                )
+            )
+            self.assertEqual([item.symbol for item in planned.intents], ["L", "S"])
+
+            processed = engine.process_and_commit(
+                ProcessRequest(
+                    run_key="process:borrow-recheck",
+                    strategy=strategy("LONG_SHORT"),
+                    account=ledger.load("strategy-us"),
+                    market=market(
+                        "borrow-recheck-current",
+                        occurred_at=NOW + timedelta(minutes=1),
+                    ),
+                    borrow=BorrowSnapshot.unavailable("borrow-current-missing"),
+                )
+            )
+            self.assertEqual([item.symbol for item in processed.fills], ["L"])
+            self.assertIn("BORROW_DATA_MISSING", processed.diagnostic_codes)
+            positions = ledger.load("strategy-us").positions
+            self.assertEqual(
+                [(item.symbol, item.side) for item in positions],
+                [("L", PositionSide.LONG)],
+            )
+            self.assertEqual(ledger.commit_calls, 2)
+
+    def test_partial_short_cannot_resume_when_borrow_becomes_unavailable(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        short_model = StaticSignalModel("short-test-v1", PositionSide.SHORT, "S")
+        available_borrow = BorrowSnapshot(
+            id="borrow-partial-available",
+            status=AVAILABLE,
+            securities={
+                "S": BorrowSecurity(
+                    symbol="S",
+                    shortable=True,
+                    easy_to_borrow=True,
+                    borrow_apr_pct=2.0,
+                    available_quantity=100,
+                )
+            },
+        )
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={
+                    long_model.model_id: long_model,
+                    short_model.model_id: short_model,
+                },
+                ledger_store=ledger,
+            )
+            planned = engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:partial-short-borrow",
+                    strategy=strategy("LONG_SHORT"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"}, {"symbol": "S"}),
+                    market=market("partial-short-plan"),
+                    borrow=available_borrow,
+                    event_calendar={},
+                )
+            )
+            short_intent = next(
+                item for item in planned.intents if item.symbol == "S"
+            )
+            partial_market = MarketSnapshot(
+                id="partial-short-first",
+                occurred_at=NOW + timedelta(minutes=1),
+                quotes={
+                    "L": {
+                        "price": 100.0,
+                        "bar_open": 100.0,
+                        "bar_high": 101.0,
+                        "bar_low": 99.0,
+                        "bar_volume": 100_000,
+                    },
+                    "S": {
+                        "price": 50.0,
+                        "bar_open": 50.0,
+                        "bar_high": 51.0,
+                        "bar_low": 49.0,
+                        "bar_volume": 100,
+                    },
+                },
+            )
+            first = engine.process_and_commit(
+                ProcessRequest(
+                    run_key="process:partial-short:first",
+                    strategy=strategy("LONG_SHORT"),
+                    account=ledger.load("strategy-us"),
+                    market=partial_market,
+                    borrow=available_borrow,
+                )
+            )
+            short_fill = next(item for item in first.fills if item.symbol == "S")
+            self.assertGreater(short_fill.quantity, 0)
+            self.assertLess(short_fill.quantity, short_intent.quantity)
+
+            second = engine.process_and_commit(
+                ProcessRequest(
+                    run_key="process:partial-short:unavailable",
+                    strategy=strategy("LONG_SHORT"),
+                    account=ledger.load("strategy-us"),
+                    market=market(
+                        "partial-short-unavailable",
+                        occurred_at=NOW + timedelta(minutes=2),
+                    ),
+                    borrow=BorrowSnapshot.unavailable("borrow-runtime-failed"),
+                )
+            )
+            self.assertEqual(second.fills, ())
+            self.assertIn("BORROW_DATA_MISSING", second.diagnostic_codes)
+            short_position = next(
+                item
+                for item in ledger.load("strategy-us").positions
+                if item.symbol == "S"
+            )
+            self.assertEqual(short_position.quantity, short_fill.quantity)
+            self.assertEqual(short_position.position_mode, COVER_ONLY)
+            self.assertEqual(ledger.commit_calls, 3)
 
     def test_post_execution_hard_cap_failure_writes_nothing_to_ledger(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")

@@ -186,6 +186,85 @@ class BorrowContractTests(unittest.TestCase):
             with self.subTest(apr=invalid), self.assertRaises((TypeError, ValueError)):
                 borrow.BorrowSecurity("S", True, True, invalid)
 
+    def test_security_validates_optional_available_quantity(self):
+        valid = borrow.BorrowSecurity(
+            "S",
+            True,
+            True,
+            2.0,
+            available_quantity=0,
+        )
+        self.assertEqual(valid.available_quantity, 0)
+        self.assertIsNone(
+            borrow.BorrowSecurity("S", True, True, 2.0).available_quantity
+        )
+        for invalid in (True, -1, 1.0, "1"):
+            with self.subTest(quantity=invalid), self.assertRaises(
+                (TypeError, ValueError)
+            ):
+                borrow.BorrowSecurity(
+                    "S",
+                    True,
+                    True,
+                    2.0,
+                    available_quantity=invalid,
+                )
+
+    def test_execution_failure_helper_checks_rate_and_remaining_quantity(self):
+        policy = ShortPolicy(
+            estimated_borrow_apr_pct=8.0,
+            cost_stress_multiplier=2.0,
+        )
+        snapshot = borrow.BorrowSnapshot(
+            "borrow-execution",
+            borrow.AVAILABLE,
+            {
+                "S": borrow.BorrowSecurity(
+                    "S",
+                    True,
+                    True,
+                    16.0,
+                    available_quantity=10,
+                )
+            },
+        )
+
+        self.assertEqual(
+            borrow.borrow_security_failure(
+                snapshot,
+                "S",
+                policy,
+                requested_quantity=10,
+            ),
+            (None, 16.0),
+        )
+        self.assertEqual(
+            borrow.borrow_security_failure(
+                snapshot,
+                "S",
+                policy,
+                requested_quantity=11,
+            )[0],
+            "BORROW_QUANTITY_INSUFFICIENT",
+        )
+        expensive = replace(
+            snapshot.securities["S"],
+            borrow_apr_pct=math.nextafter(16.0, math.inf),
+        )
+        self.assertEqual(
+            borrow.borrow_security_failure(
+                borrow.BorrowSnapshot(
+                    "borrow-expensive",
+                    borrow.AVAILABLE,
+                    {"S": expensive},
+                ),
+                "S",
+                policy,
+                requested_quantity=10,
+            )[0],
+            "BORROW_RATE_TOO_HIGH",
+        )
+
     def test_snapshot_copies_and_deeply_freezes_security_mapping(self):
         security = borrow.BorrowSecurity("S", True, True, 2)
         source = {"S": security}

@@ -509,6 +509,8 @@ class PortfolioEngine:
             exposure_policy,
             margin_policy,
             resolved_execution_policy,
+            borrow_snapshot=request.borrow,
+            short_policy=short_policy,
         ).evaluate(
             _stage_input(
                 request,
@@ -523,6 +525,10 @@ class PortfolioEngine:
             "pre_execution_admitted_intents",
             OrderIntent,
         )
+        admitted_intent_ids = {item.id for item in admitted_for_execution}
+        admitted_progress = tuple(
+            item for item in progress if item.intent_id in admitted_intent_ids
+        )
         execution_output = ExecutionSimulationStage(
             request.account,
             request.market,
@@ -535,7 +541,7 @@ class PortfolioEngine:
                         "kind": "pre_execution_admitted_intents",
                         "items": admitted_for_execution,
                     },
-                    {"kind": "execution_progress", "items": progress},
+                    {"kind": "execution_progress", "items": admitted_progress},
                 ),
             )
         )
