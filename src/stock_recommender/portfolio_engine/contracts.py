@@ -425,6 +425,51 @@ class PositionSnapshot(_DeeplyImmutable):
 
 
 @dataclass(frozen=True)
+class PositionRiskUpdate(_DeeplyImmutable):
+    symbol: str
+    side: PositionSide
+    peak_price: float | None
+    trough_price: float | None
+    trailing_active: bool
+    position_mode: str
+
+    def __post_init__(self) -> None:
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.side, PositionSide, "side")
+        if self.peak_price is not None:
+            _require_positive_finite_number(self.peak_price, "peak_price")
+        if self.trough_price is not None:
+            _require_positive_finite_number(self.trough_price, "trough_price")
+        if type(self.trailing_active) is not bool:
+            raise TypeError("trailing_active must be a bool")
+        if self.position_mode not in {"NORMAL", "COVER_ONLY"}:
+            raise ValueError(f"unsupported position_mode: {self.position_mode}")
+        if self.side is PositionSide.LONG:
+            if self.trough_price is not None:
+                raise ValueError("LONG update must not have trough_price")
+            trailing_anchor = self.peak_price
+        else:
+            if self.peak_price is not None:
+                raise ValueError("SHORT update must not have peak_price")
+            trailing_anchor = self.trough_price
+        if self.trailing_active and trailing_anchor is None:
+            raise ValueError("active trailing update must have directional anchor")
+
+    @classmethod
+    def from_position(cls, position: PositionSnapshot) -> PositionRiskUpdate:
+        if type(position) is not PositionSnapshot:
+            raise TypeError("position must be PositionSnapshot")
+        return cls(
+            symbol=position.symbol,
+            side=position.side,
+            peak_price=position.peak_price,
+            trough_price=position.trough_price,
+            trailing_active=position.trailing_active,
+            position_mode=position.position_mode,
+        )
+
+
+@dataclass(frozen=True)
 class AccountSnapshot(_DeeplyImmutable):
     id: str
     strategy_id: str
@@ -843,6 +888,7 @@ class DecisionBatch(_DeeplyImmutable):
 
 _DEEPLY_IMMUTABLE_TYPES = (
     PositionSnapshot,
+    PositionRiskUpdate,
     AccountSnapshot,
     PortfolioMetrics,
     ValuationResult,

@@ -19,6 +19,7 @@ from .contracts import (
     OrderSide,
     PortfolioMetrics,
     PositionEffect,
+    PositionRiskUpdate,
     PositionSide,
     PositionSnapshot,
     freeze_immutable,
@@ -305,46 +306,6 @@ class PositionRiskResult(_ImmutableRiskValue):
 
     def __getitem__(self, index: int) -> RiskDecision:
         return self.decisions[index]
-
-
-@dataclass(frozen=True)
-class PositionRiskUpdate(_ImmutableRiskValue):
-    symbol: str
-    side: PositionSide
-    peak_price: float | None
-    trough_price: float | None
-    trailing_active: bool
-    position_mode: str
-
-    def __post_init__(self) -> None:
-        if type(self.symbol) is not str or not self.symbol:
-            raise ValueError("symbol must be a non-empty string")
-        if type(self.side) is not PositionSide:
-            raise TypeError("side must be PositionSide")
-        for field_name in ("peak_price", "trough_price"):
-            value = getattr(self, field_name)
-            if value is not None:
-                object.__setattr__(
-                    self,
-                    field_name,
-                    _positive_number(value, field_name),
-                )
-        if type(self.trailing_active) is not bool:
-            raise TypeError("trailing_active must be a bool")
-        _validate_position_mode(self.position_mode)
-
-    @classmethod
-    def from_position(cls, position: PositionSnapshot) -> PositionRiskUpdate:
-        if type(position) is not PositionSnapshot:
-            raise TypeError("position must be PositionSnapshot")
-        return cls(
-            symbol=position.symbol,
-            side=position.side,
-            peak_price=position.peak_price,
-            trough_price=position.trough_price,
-            trailing_active=position.trailing_active,
-            position_mode=position.position_mode,
-        )
 
 
 @dataclass(frozen=True)

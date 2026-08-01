@@ -9,10 +9,12 @@ from stock_recommender.pipeline import PipelineContractError, PipelineRunner, St
 from stock_recommender.portfolio_engine.config import MarginPolicy, ShortPolicy
 from stock_recommender.portfolio_engine.contracts import (
     AccountSnapshot,
+    DecisionBatch,
     MarketSnapshot,
     OrderIntent,
     OrderSide,
     PositionEffect,
+    PositionRiskUpdate,
     PositionSide,
     PositionSnapshot,
 )
@@ -786,6 +788,35 @@ class ForcedDeleveragingTests(unittest.TestCase):
             result.diagnostics[0]["details"]["symbols"].append("FORGED")
 
 
+class PositionRiskUpdateContractTests(unittest.TestCase):
+    def test_rejects_anchor_for_opposite_position_direction(self):
+        for side, peak_price, trough_price in (
+            (PositionSide.LONG, None, 90.0),
+            (PositionSide.SHORT, 110.0, None),
+        ):
+            with self.subTest(side=side), self.assertRaises(ValueError):
+                PositionRiskUpdate(
+                    symbol="X",
+                    side=side,
+                    peak_price=peak_price,
+                    trough_price=trough_price,
+                    trailing_active=False,
+                    position_mode=NORMAL,
+                )
+
+    def test_active_trailing_requires_directional_anchor(self):
+        for side in (PositionSide.LONG, PositionSide.SHORT):
+            with self.subTest(side=side), self.assertRaises(ValueError):
+                PositionRiskUpdate(
+                    symbol="X",
+                    side=side,
+                    peak_price=None,
+                    trough_price=None,
+                    trailing_active=True,
+                    position_mode=NORMAL,
+                )
+
+
 class PortfolioRiskStageTests(unittest.TestCase):
     def test_insolvent_stage_suppresses_all_position_risk_intents(self):
         cases = (
@@ -910,6 +941,54 @@ class PortfolioRiskStageTests(unittest.TestCase):
             "position_mode",
         ):
             self.assertNotIn(field_name, diagnostic_item)
+
+    def test_real_risk_output_is_deeply_immutable_inside_decision_batch(self):
+        output = PortfolioRiskStage(
+            account(
+                position(symbol="L", current=None, quantity=1),
+                cash=100.0,
+            ),
+            {"L": 110.0},
+            peak_equity=210.0,
+        ).evaluate(stage_input())
+        source_diagnostic = next(
+            fact for fact in output.facts if fact["kind"] == "risk_diagnostic"
+        )
+        source_update = next(
+            fact
+            for fact in output.facts
+            if fact["kind"] == "position_risk_updates"
+        )["items"][0]
+
+        try:
+            batch = DecisionBatch(
+                run_key="run-1",
+                strategy_id="strategy-1",
+                strategy_revision=3,
+                portfolio_snapshot_id="acct-1",
+                market_snapshot_id="market-1",
+                stage_outputs=(output,),
+            )
+        except TypeError as exc:
+            self.fail(f"real risk output must be accepted: {exc}")
+        frozen_facts = {
+            fact["kind"]: fact for fact in batch.stage_outputs[0].facts
+        }
+        update = frozen_facts["position_risk_updates"]["items"][0]
+
+        self.assertIs(risk_module.PositionRiskUpdate, PositionRiskUpdate)
+        self.assertIsInstance(update, risk_module.PositionRiskUpdate)
+        self.assertIs(update, source_update)
+        self.assertIs(deepcopy(batch), batch)
+        source_diagnostic["drawdown_state"] = "FORGED"
+        self.assertEqual(
+            frozen_facts["risk_diagnostic"]["drawdown_state"],
+            NORMAL,
+        )
+        with self.assertRaises(TypeError):
+            frozen_facts["risk_diagnostic"]["drawdown_state"] = "FORGED"
+        with self.assertRaises(FrozenInstanceError):
+            update.peak_price = 999.0
 
     def test_stage_accepts_missing_position_modes_and_rejects_duplicates(self):
         stage = PortfolioRiskStage(account(cash=100.0), {}, peak_equity=100.0)
