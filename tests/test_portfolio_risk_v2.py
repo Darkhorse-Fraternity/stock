@@ -411,6 +411,33 @@ class DirectionAwarePositionRiskTests(unittest.TestCase):
                     updated_position=position(side=PositionSide.LONG),
                 )
 
+    def test_short_squeeze_reason_requires_cover_only_mode(self):
+        held = position(
+            side=PositionSide.SHORT,
+            position_mode=NORMAL,
+        )
+
+        with self.assertRaises(ValueError):
+            RiskDecision(
+                reason="SHORT_SQUEEZE",
+                position_effect=None,
+                position_mode=NORMAL,
+                updated_position=held,
+            )
+
+    def test_invalid_squeeze_data_preserves_either_existing_short_mode(self):
+        for mode in (NORMAL, COVER_ONLY):
+            held = position(side=PositionSide.SHORT, position_mode=mode)
+
+            decision = RiskDecision(
+                reason="SQUEEZE_DATA_INVALID",
+                position_effect=None,
+                position_mode=mode,
+                updated_position=held,
+            )
+
+            self.assertEqual(decision.position_mode, mode)
+
     def test_margin_call_reason_allows_direction_correct_long_and_short_closes(self):
         for side in (PositionSide.LONG, PositionSide.SHORT):
             held = position(side=side)

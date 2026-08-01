@@ -49,25 +49,48 @@ _PORTFOLIO_STATES = frozenset(
 )
 _RISK_REASON_SEMANTICS = {
     LONG_STOP_LOSS: frozenset(
-        {(PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE)}
+        {
+            (PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE, mode)
+            for mode in _POSITION_MODES
+        }
     ),
     LONG_TRAILING_STOP: frozenset(
-        {(PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE)}
+        {
+            (PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE, mode)
+            for mode in _POSITION_MODES
+        }
     ),
     SHORT_STOP_LOSS: frozenset(
-        {(PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE)}
+        {
+            (PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE, mode)
+            for mode in _POSITION_MODES
+        }
     ),
     SHORT_TRAILING_STOP: frozenset(
-        {(PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE)}
+        {
+            (PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE, mode)
+            for mode in _POSITION_MODES
+        }
     ),
     MARGIN_CALL: frozenset(
         {
-            (PositionSide.LONG, OrderSide.SELL, PositionEffect.CLOSE),
-            (PositionSide.SHORT, OrderSide.BUY, PositionEffect.CLOSE),
+            (side, order_side, PositionEffect.CLOSE, mode)
+            for side, order_side in (
+                (PositionSide.LONG, OrderSide.SELL),
+                (PositionSide.SHORT, OrderSide.BUY),
+            )
+            for mode in _POSITION_MODES
         }
     ),
-    SHORT_SQUEEZE: frozenset({(PositionSide.SHORT, None, None)}),
-    SQUEEZE_DATA_INVALID: frozenset({(PositionSide.SHORT, None, None)}),
+    SHORT_SQUEEZE: frozenset(
+        {(PositionSide.SHORT, None, None, COVER_ONLY)}
+    ),
+    SQUEEZE_DATA_INVALID: frozenset(
+        {
+            (PositionSide.SHORT, None, None, mode)
+            for mode in _POSITION_MODES
+        }
+    ),
 }
 
 
@@ -240,6 +263,7 @@ class RiskDecision(_ImmutableRiskValue):
                 self.updated_position.side,
                 None if self.intent is None else self.intent.order_side,
                 self.position_effect,
+                self.position_mode,
             )
             if allowed is None or actual not in allowed:
                 raise ValueError("reason is inconsistent with risk decision semantics")
