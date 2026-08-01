@@ -275,7 +275,7 @@ def _metric_matches(actual: int | float, expected: float) -> bool:
         float(actual),
         expected,
         rel_tol=1e-12,
-        abs_tol=1e-12,
+        abs_tol=0.0,
     )
 
 

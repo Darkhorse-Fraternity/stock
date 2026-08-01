@@ -367,6 +367,42 @@ class PortfolioValuationTests(unittest.TestCase):
                 margin_rate_pct=math.inf,
             )
 
+    def test_metrics_contract_rejects_near_zero_equity_with_infinite_exposure(self):
+        with self.assertRaises(ValueError):
+            contracts.PortfolioMetrics(
+                available_cash=-1000.0,
+                restricted_short_proceeds=0.0,
+                margin_loan=0.0,
+                accrued_financing_cost=0.0,
+                accrued_borrow_cost=0.0,
+                long_market_value=1000.0,
+                short_liability=0.0,
+                equity=5e-13,
+                long_exposure_pct=math.inf,
+                short_exposure_pct=0.0,
+                gross_exposure_pct=math.inf,
+                net_exposure_pct=math.inf,
+                margin_rate_pct=0.0,
+            )
+
+    def test_metrics_contract_rejects_near_zero_exposure_without_positions(self):
+        with self.assertRaises(ValueError):
+            contracts.PortfolioMetrics(
+                available_cash=100.0,
+                restricted_short_proceeds=0.0,
+                margin_loan=0.0,
+                accrued_financing_cost=0.0,
+                accrued_borrow_cost=0.0,
+                long_market_value=0.0,
+                short_liability=0.0,
+                equity=100.0,
+                long_exposure_pct=5e-13,
+                short_exposure_pct=0.0,
+                gross_exposure_pct=0.0,
+                net_exposure_pct=-5e-13,
+                margin_rate_pct=math.inf,
+            )
+
     def test_prices_must_cover_every_position_and_extra_prices_are_ignored(self):
         account = self._account(
             positions=(
