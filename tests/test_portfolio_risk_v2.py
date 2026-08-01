@@ -243,6 +243,23 @@ class DirectionAwarePositionRiskTests(unittest.TestCase):
         with self.assertRaisesRegex(RiskError, "current_price"):
             evaluate_position_risk(position(current=None))
 
+    def test_active_long_trailing_without_peak_anchor_fails_closed(self):
+        held = position(current=120.0, trailing_active=True, peak=None)
+
+        with self.assertRaisesRegex(RiskError, "peak_price"):
+            evaluate_position_risk(held)
+
+    def test_active_short_trailing_without_trough_anchor_fails_closed(self):
+        held = position(
+            side=PositionSide.SHORT,
+            current=80.0,
+            trailing_active=True,
+            trough=None,
+        )
+
+        with self.assertRaisesRegex(RiskError, "trough_price"):
+            evaluate_position_risk(held)
+
     def test_risk_decision_rejects_a_forged_reason(self):
         held = position(current=92.0)
         forged_intent = OrderIntent(
@@ -259,6 +276,76 @@ class DirectionAwarePositionRiskTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RiskDecision(
                 reason="LONG_STOP_LOSS",
+                position_effect=PositionEffect.CLOSE,
+                position_mode=NORMAL,
+                updated_position=held,
+                intent=forged_intent,
+            )
+
+    def test_risk_decision_rejects_wrong_close_side_for_long_and_short(self):
+        cases = (
+            (position(), OrderSide.BUY),
+            (position(side=PositionSide.SHORT), OrderSide.SELL),
+        )
+
+        for held, wrong_order_side in cases:
+            with self.subTest(side=held.side), self.assertRaises(ValueError):
+                intent = OrderIntent(
+                    id=f"wrong-side-{held.side.value}",
+                    symbol=held.symbol,
+                    position_side=held.side,
+                    order_side=wrong_order_side,
+                    position_effect=PositionEffect.CLOSE,
+                    quantity=held.quantity,
+                    reason="RISK_CLOSE",
+                    created_snapshot_id="snapshot-1",
+                )
+                RiskDecision(
+                    reason="RISK_CLOSE",
+                    position_effect=PositionEffect.CLOSE,
+                    position_mode=NORMAL,
+                    updated_position=held,
+                    intent=intent,
+                )
+
+    def test_risk_decision_rejects_non_close_intent(self):
+        held = position(quantity=10)
+        forged_intent = OrderIntent(
+            id="forged-reduce",
+            symbol=held.symbol,
+            position_side=held.side,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.REDUCE,
+            quantity=held.quantity,
+            reason="RISK_REDUCE",
+            created_snapshot_id="snapshot-1",
+        )
+
+        with self.assertRaises(ValueError):
+            RiskDecision(
+                reason="RISK_REDUCE",
+                position_effect=PositionEffect.REDUCE,
+                position_mode=NORMAL,
+                updated_position=held,
+                intent=forged_intent,
+            )
+
+    def test_risk_decision_rejects_forged_intent_identity(self):
+        held = position()
+        forged_intent = OrderIntent(
+            id="forged-identity",
+            symbol=held.symbol,
+            position_side=held.side,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.CLOSE,
+            quantity=held.quantity,
+            reason="RISK_CLOSE",
+            created_snapshot_id="snapshot-1",
+        )
+
+        with self.assertRaises(ValueError):
+            RiskDecision(
+                reason="RISK_CLOSE",
                 position_effect=PositionEffect.CLOSE,
                 position_mode=NORMAL,
                 updated_position=held,
@@ -339,6 +426,30 @@ class PortfolioDrawdownRiskTests(unittest.TestCase):
                 self.assertEqual(result.state, expected)
                 self.assertEqual(result.diagnostic["state"], expected)
 
+    def test_small_equity_drawdown_thresholds_and_nextafter_are_exact(self):
+        cases = (
+            (0.0088, 12.0, WARNING, NORMAL),
+            (0.0086, 14.0, DERISK, WARNING),
+            (0.0085, 15.0, MANUAL_HALT, DERISK),
+        )
+
+        for equity, expected_pct, exact_state, safer_state in cases:
+            with self.subTest(threshold=expected_pct):
+                exact = evaluate_portfolio_drawdown(self.metrics(equity), 0.01)
+                safer = evaluate_portfolio_drawdown(
+                    self.metrics(math.nextafter(equity, math.inf)),
+                    0.01,
+                )
+                breached = evaluate_portfolio_drawdown(
+                    self.metrics(math.nextafter(equity, -math.inf)),
+                    0.01,
+                )
+
+                self.assertEqual(exact.drawdown_pct, expected_pct)
+                self.assertEqual(exact.state, exact_state)
+                self.assertEqual(safer.state, safer_state)
+                self.assertEqual(breached.state, exact_state)
+
     def test_equity_at_or_below_zero_has_insolvent_priority(self):
         for equity in (0.0, -1.0):
             with self.subTest(equity=equity):
@@ -417,6 +528,42 @@ class ForcedDeleveragingTests(unittest.TestCase):
         self.assertEqual(exact.state, "REDUCE_ONLY")
         self.assertEqual(below.state, MARGIN_CALL)
         self.assertTrue(below.intents)
+
+    def test_small_decimal_margin_thirty_boundary_is_exact(self):
+        held = position(
+            symbol="MICRO",
+            entry=0.03,
+            current=None,
+            quantity=1,
+        )
+
+        exact = evaluate_forced_deleveraging(
+            account(held, loan=0.021),
+            {"MICRO": 0.03},
+        )
+        breached = evaluate_forced_deleveraging(
+            account(held, loan=math.nextafter(0.021, math.inf)),
+            {"MICRO": 0.03},
+        )
+
+        self.assertEqual(exact.initial_margin_rate_pct, 30.0)
+        self.assertEqual(exact.state, "REDUCE_ONLY")
+        self.assertEqual(exact.intents, ())
+        self.assertEqual(breached.state, MARGIN_CALL)
+
+    def test_small_decimal_forced_close_stops_at_exact_forty(self):
+        stressed = account(
+            position(symbol="L3", entry=0.01, current=None, quantity=3),
+            position(symbol="L2", entry=0.01, current=None, quantity=2),
+            position(symbol="L1", entry=0.01, current=None, quantity=1),
+            loan=0.048,
+        )
+        prices = {"L3": 0.01, "L2": 0.01, "L1": 0.01}
+
+        result = evaluate_forced_deleveraging(stressed, prices)
+
+        self.assertEqual([item.symbol for item in result.intents], ["L3"])
+        self.assertEqual(result.final_margin_rate_pct, 40.0)
 
     def test_insolvent_account_returns_no_intents(self):
         stressed = account(

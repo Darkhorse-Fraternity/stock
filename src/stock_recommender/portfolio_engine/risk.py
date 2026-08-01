@@ -184,6 +184,20 @@ class RiskDecision(_ImmutableRiskValue):
             raise ValueError("position_effect requires an intent")
         if self.intent is not None and self.position_effect is not self.intent.position_effect:
             raise ValueError("position_effect must match intent.position_effect")
+        if self.intent is not None:
+            expected_order_side = (
+                OrderSide.SELL
+                if self.updated_position.side is PositionSide.LONG
+                else OrderSide.BUY
+            )
+            if (
+                self.position_effect is not PositionEffect.CLOSE
+                or self.intent.position_effect is not PositionEffect.CLOSE
+                or self.intent.order_side is not expected_order_side
+            ):
+                raise ValueError(
+                    "risk intent must be a direction-correct full close"
+                )
         if self.intent is not None and (
             self.reason != self.intent.reason
             or self.intent.symbol != self.updated_position.symbol
@@ -191,6 +205,12 @@ class RiskDecision(_ImmutableRiskValue):
             or self.intent.quantity != self.updated_position.quantity
         ):
             raise ValueError("intent must match the risk decision and updated position")
+        if self.intent is not None and self.intent.id != _stable_intent_id(
+            self.intent.created_snapshot_id,
+            self.updated_position,
+            self.intent.reason,
+        ):
+            raise ValueError("risk intent id must match its immutable decision inputs")
         if self.updated_position.position_mode != self.position_mode:
             raise ValueError("updated_position mode must match position_mode")
 
@@ -381,10 +401,15 @@ def _validated_position_prices(
         else _positive_number(position.trough_price, "trough_price")
     )
     if position.side is PositionSide.LONG:
+        if position.trailing_active and peak is None:
+            raise RiskError("active long trailing stop requires peak_price")
         if peak is not None and peak < entry:
             raise RiskError("long peak_price must not be below average_cost")
-    elif trough is not None and trough > entry:
-        raise RiskError("short trough_price must not exceed average_cost")
+    else:
+        if position.trailing_active and trough is None:
+            raise RiskError("active short trailing stop requires trough_price")
+        if trough is not None and trough > entry:
+            raise RiskError("short trough_price must not exceed average_cost")
     return entry, current, peak, trough
 
 
@@ -557,14 +582,19 @@ def evaluate_portfolio_drawdown(
             diagnostic,
         )
     peak = _positive_number(peak_equity, "peak_equity")
-    drawdown_pct = (peak - equity) / peak * 100.0
+    drawdown_decimal = (
+        (Decimal(str(peak)) - Decimal(str(equity)))
+        / Decimal(str(peak))
+        * Decimal(100)
+    )
+    drawdown_pct = float(drawdown_decimal)
     if not math.isfinite(drawdown_pct):
         raise RiskError("drawdown_pct must be finite")
-    if drawdown_pct >= 15.0:
+    if drawdown_decimal >= Decimal(15):
         state = MANUAL_HALT
-    elif drawdown_pct >= 14.0:
+    elif drawdown_decimal >= Decimal(14):
         state = DERISK
-    elif drawdown_pct >= 12.0:
+    elif drawdown_decimal >= Decimal(12):
         state = WARNING
     else:
         state = NORMAL
@@ -640,7 +670,9 @@ def _valuation_context(
 def _value_risk_account(
     account: AccountSnapshot,
     raw_prices: Mapping[str, object],
-) -> tuple[PortfolioMetrics, tuple[str, ...], bool]:
+    *,
+    equity_override: Decimal | None = None,
+) -> tuple[PortfolioMetrics, tuple[str, ...], bool, Decimal]:
     valuation_account, prices, missing, complete = _valuation_context(
         account, raw_prices
     )
@@ -648,7 +680,39 @@ def _value_risk_account(
         metrics = value_account(valuation_account, prices).metrics
     except (TypeError, ValueError, ValuationError) as exc:
         raise RiskError(f"account valuation failed: {exc}") from exc
-    return metrics, missing, complete
+    long_value = sum(
+        (
+            Decimal(str(prices[held.symbol])) * held.quantity
+            for held in valuation_account.positions
+            if held.side is PositionSide.LONG
+        ),
+        Decimal(0),
+    )
+    short_value = sum(
+        (
+            Decimal(str(prices[held.symbol])) * held.quantity
+            for held in valuation_account.positions
+            if held.side is PositionSide.SHORT
+        ),
+        Decimal(0),
+    )
+    gross = long_value + short_value
+    exact_equity = equity_override
+    if exact_equity is None:
+        exact_equity = (
+            Decimal(str(valuation_account.available_cash))
+            + Decimal(str(valuation_account.restricted_short_proceeds))
+            + long_value
+            - short_value
+            - Decimal(str(valuation_account.margin_loan))
+        )
+    stable_margin_rate = (
+        math.inf
+        if gross == 0
+        else float(exact_equity / gross * Decimal(100))
+    )
+    metrics = replace(metrics, margin_rate_pct=stable_margin_rate)
+    return metrics, missing, complete, exact_equity
 
 
 def _margin_policy(value: object) -> tuple[MarginPolicy, float, float]:
@@ -704,7 +768,9 @@ def evaluate_forced_deleveraging(
         raise TypeError("account must be AccountSnapshot")
     raw_prices = _raw_prices(prices)
     _, maintenance, threshold = _margin_policy(margin_policy)
-    initial_metrics, missing, complete = _value_risk_account(account, raw_prices)
+    initial_metrics, missing, complete, exact_equity = _value_risk_account(
+        account, raw_prices
+    )
     diagnostics: list[Mapping[str, object]] = [
         {"code": "MISSING_PRICE", "symbol": symbol} for symbol in missing
     ]
@@ -736,8 +802,10 @@ def evaluate_forced_deleveraging(
         intent = _close_intent(held, MARGIN_CALL, account.id)
         try:
             candidate_account = project_account_for_intent(account, intent, raw_prices)
-            candidate_metrics, _, _ = _value_risk_account(
-                candidate_account, raw_prices
+            candidate_metrics, _, _, _ = _value_risk_account(
+                candidate_account,
+                raw_prices,
+                equity_override=exact_equity,
             )
         except (TypeError, ValueError) as exc:
             diagnostics.append(
@@ -778,7 +846,11 @@ def evaluate_forced_deleveraging(
                 candidate.intent,
                 raw_prices,
             )
-            final_metrics, _, _ = _value_risk_account(projected_account, raw_prices)
+            final_metrics, _, _, _ = _value_risk_account(
+                projected_account,
+                raw_prices,
+                equity_override=exact_equity,
+            )
         except (TypeError, ValueError) as exc:
             diagnostics.append(
                 {
@@ -951,7 +1023,9 @@ class PortfolioRiskStage:
             )
 
         try:
-            metrics, _, _ = _value_risk_account(self._account, self._raw_prices)
+            metrics, _, _, _ = _value_risk_account(
+                self._account, self._raw_prices
+            )
             drawdown = evaluate_portfolio_drawdown(metrics, self._peak_equity)
             forced = evaluate_forced_deleveraging(
                 self._account,
