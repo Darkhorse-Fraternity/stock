@@ -243,6 +243,35 @@ def _require_nonnegative_finite_number(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be nonnegative")
 
 
+def _require_position_risk_tracking(
+    side: PositionSide,
+    peak_price: object,
+    trough_price: object,
+    trailing_active: object,
+    position_mode: object,
+) -> None:
+    if peak_price is not None:
+        _require_positive_finite_number(peak_price, "peak_price")
+    if trough_price is not None:
+        _require_positive_finite_number(trough_price, "trough_price")
+    if type(trailing_active) is not bool:
+        raise TypeError("trailing_active must be a bool")
+    if position_mode not in {"NORMAL", "COVER_ONLY"}:
+        raise ValueError(f"unsupported position_mode: {position_mode}")
+    if side is PositionSide.LONG:
+        if trough_price is not None:
+            raise ValueError("LONG position risk state must not have trough_price")
+        trailing_anchor = peak_price
+        anchor_name = "peak_price"
+    else:
+        if peak_price is not None:
+            raise ValueError("SHORT position risk state must not have peak_price")
+        trailing_anchor = trough_price
+        anchor_name = "trough_price"
+    if trailing_active and trailing_anchor is None:
+        raise ValueError(f"active {side.value} trailing state requires {anchor_name}")
+
+
 def _require_derived_metric(value: object, field_name: str) -> None:
     if type(value) not in (int, float):
         raise TypeError(f"{field_name} must be an int or float")
@@ -389,14 +418,13 @@ class PositionSnapshot(_DeeplyImmutable):
         _require_positive_finite_number(self.average_cost, "average_cost")
         if self.current_price is not None:
             _require_positive_finite_number(self.current_price, "current_price")
-        if self.peak_price is not None:
-            _require_positive_finite_number(self.peak_price, "peak_price")
-        if self.trough_price is not None:
-            _require_positive_finite_number(self.trough_price, "trough_price")
-        if type(self.trailing_active) is not bool:
-            raise TypeError("trailing_active must be a bool")
-        if self.position_mode not in {"NORMAL", "COVER_ONLY"}:
-            raise ValueError(f"unsupported position_mode: {self.position_mode}")
+        _require_position_risk_tracking(
+            self.side,
+            self.peak_price,
+            self.trough_price,
+            self.trailing_active,
+            self.position_mode,
+        )
 
     @property
     def market_value(self) -> float | None:
@@ -436,24 +464,13 @@ class PositionRiskUpdate(_DeeplyImmutable):
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
         _require_enum(self.side, PositionSide, "side")
-        if self.peak_price is not None:
-            _require_positive_finite_number(self.peak_price, "peak_price")
-        if self.trough_price is not None:
-            _require_positive_finite_number(self.trough_price, "trough_price")
-        if type(self.trailing_active) is not bool:
-            raise TypeError("trailing_active must be a bool")
-        if self.position_mode not in {"NORMAL", "COVER_ONLY"}:
-            raise ValueError(f"unsupported position_mode: {self.position_mode}")
-        if self.side is PositionSide.LONG:
-            if self.trough_price is not None:
-                raise ValueError("LONG update must not have trough_price")
-            trailing_anchor = self.peak_price
-        else:
-            if self.peak_price is not None:
-                raise ValueError("SHORT update must not have peak_price")
-            trailing_anchor = self.trough_price
-        if self.trailing_active and trailing_anchor is None:
-            raise ValueError("active trailing update must have directional anchor")
+        _require_position_risk_tracking(
+            self.side,
+            self.peak_price,
+            self.trough_price,
+            self.trailing_active,
+            self.position_mode,
+        )
 
     @classmethod
     def from_position(cls, position: PositionSnapshot) -> PositionRiskUpdate:

@@ -261,22 +261,26 @@ class DirectionAwarePositionRiskTests(unittest.TestCase):
         with self.assertRaisesRegex(RiskError, "current_price"):
             evaluate_position_risk(position(current=None))
 
-    def test_active_long_trailing_without_peak_anchor_fails_closed(self):
-        held = position(current=120.0, trailing_active=True, peak=None)
+    def test_active_long_without_peak_is_rejected_at_snapshot_construction(self):
+        with self.assertRaisesRegex(ValueError, "peak_price"):
+            position(current=120.0, trailing_active=True, peak=None)
 
-        with self.assertRaisesRegex(RiskError, "peak_price"):
-            evaluate_position_risk(held)
+    def test_active_short_without_trough_is_rejected_at_snapshot_construction(self):
+        with self.assertRaisesRegex(ValueError, "trough_price"):
+            position(
+                side=PositionSide.SHORT,
+                current=80.0,
+                trailing_active=True,
+                trough=None,
+            )
 
-    def test_active_short_trailing_without_trough_anchor_fails_closed(self):
-        held = position(
-            side=PositionSide.SHORT,
-            current=80.0,
-            trailing_active=True,
-            trough=None,
-        )
+    def test_long_snapshot_rejects_short_trough_anchor(self):
+        with self.assertRaisesRegex(ValueError, "trough_price"):
+            position(side=PositionSide.LONG, trough=90.0)
 
-        with self.assertRaisesRegex(RiskError, "trough_price"):
-            evaluate_position_risk(held)
+    def test_short_snapshot_rejects_long_peak_anchor(self):
+        with self.assertRaisesRegex(ValueError, "peak_price"):
+            position(side=PositionSide.SHORT, peak=110.0)
 
     def test_risk_decision_rejects_a_forged_reason(self):
         held = position(current=92.0)
@@ -818,6 +822,23 @@ class PositionRiskUpdateContractTests(unittest.TestCase):
 
 
 class PortfolioRiskStageTests(unittest.TestCase):
+    def test_invalid_tracking_state_is_rejected_before_stage_fallback(self):
+        with self.assertRaisesRegex(ValueError, "peak_price"):
+            PortfolioRiskStage(
+                account(
+                    position(
+                        symbol="L",
+                        current=None,
+                        quantity=1,
+                        trailing_active=True,
+                        peak=None,
+                    ),
+                    cash=100.0,
+                ),
+                {"L": 120.0},
+                peak_equity=220.0,
+            ).evaluate(stage_input())
+
     def test_insolvent_stage_suppresses_all_position_risk_intents(self):
         cases = (
             (
