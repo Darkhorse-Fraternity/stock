@@ -242,6 +242,7 @@ class PortfolioEngine:
         strategy: Mapping[str, Any],
         account: AccountSnapshot,
         occurred_at: datetime,
+        cost_multiplier: float = 1.0,
     ) -> ProcessRequest:
         """Capture execution inputs from typed ports without exposing ledger JSON."""
 
@@ -276,6 +277,7 @@ class PortfolioEngine:
             account=account,
             market=market,
             borrow=borrow,
+            cost_multiplier=cost_multiplier,
         )
 
     def evaluate(self, request: PlanRequest) -> DecisionBatch:
@@ -599,6 +601,7 @@ class PortfolioEngine:
             financing_apr_pct=margin_policy.financing_apr_pct,
             borrow_apr_by_symbol=borrow_apr,
             estimated_borrow_apr_pct=short_policy.estimated_borrow_apr_pct,
+            cost_multiplier=request.cost_multiplier,
         )
         carry_output = StageOutput(
             stage="carry_accrual",

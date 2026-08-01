@@ -1889,7 +1889,6 @@ def accrue_carry_costs(
     events = tuple(
         _carry_event(record, event_time)
         for record in new_records
-        if record.amount > 0
     )
     return CarryAccrualResult(
         updated,

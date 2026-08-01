@@ -1560,6 +1560,7 @@ class ProcessRequest(_DeeplyImmutable):
     account: AccountSnapshot
     market: MarketSnapshot
     borrow: Any
+    cost_multiplier: float = 1.0
 
     def __post_init__(self) -> None:
         from .borrow import BorrowSnapshot
@@ -1573,6 +1574,10 @@ class ProcessRequest(_DeeplyImmutable):
         _require_datetime(self.market.occurred_at, "market.occurred_at")
         if type(self.borrow) is not BorrowSnapshot:
             raise TypeError("borrow must be BorrowSnapshot")
+        _require_nonnegative_finite_number(
+            self.cost_multiplier,
+            "cost_multiplier",
+        )
         if not self.account.snapshot_id:
             raise ValueError("account must have an explicit snapshot_id")
         strategy = _deep_freeze(self.strategy)
@@ -1580,6 +1585,7 @@ class ProcessRequest(_DeeplyImmutable):
         _strategy_market_name(strategy)
         _require_finite_graph(self.market.quotes, "market.quotes")
         object.__setattr__(self, "strategy", strategy)
+        object.__setattr__(self, "cost_multiplier", float(self.cost_multiplier))
 
     @property
     def market_name(self) -> str:

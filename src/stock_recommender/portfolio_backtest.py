@@ -19,10 +19,13 @@ from .markets import market_date, market_profile, strategy_market
 from .portfolio_engine.borrow import AVAILABLE, BorrowSecurity, BorrowSnapshot
 from .portfolio_engine.contracts import (
     AccountSnapshot,
+    DecisionBatch,
     MarketSnapshot,
+    OrderIntent,
     PlanRequest,
     PortfolioEvent,
     ProcessRequest,
+    SignalCandidate,
 )
 from .portfolio_engine.ledger import InMemoryLedgerStore, LEDGER_SCHEMA_VERSION
 from .portfolio_engine.service import PortfolioEngine
@@ -187,12 +190,10 @@ class HistoricalBorrowBook:
         symbols: Iterable[str],
         *,
         estimated_borrow_apr_pct: object,
-        cost_multiplier: object,
         market: str = "us",
     ) -> BorrowResolution:
         if type(occurred_at) is not datetime or occurred_at.tzinfo is None:
             raise ValueError("borrow resolution time must be timezone-aware")
-        multiplier = _finite_cost_multiplier(cost_multiplier)
         if type(estimated_borrow_apr_pct) not in (int, float):
             raise TypeError("estimated_borrow_apr_pct must be an int or float")
         estimated_apr = float(estimated_borrow_apr_pct)
@@ -210,7 +211,7 @@ class HistoricalBorrowBook:
             record = exact.get(symbol)
             if record is None:
                 estimated = True
-                apr = estimated_apr * multiplier
+                apr = estimated_apr
                 securities[symbol] = BorrowSecurity(
                     symbol=symbol,
                     shortable=True,
@@ -219,7 +220,7 @@ class HistoricalBorrowBook:
                     available_quantity=None,
                 )
             else:
-                apr = record.borrow_apr_pct * multiplier
+                apr = record.borrow_apr_pct
                 securities[symbol] = BorrowSecurity(
                     symbol=symbol,
                     shortable=record.shortable,
@@ -312,6 +313,8 @@ class EngineReplayFrame:
 @dataclass(frozen=True)
 class EngineReplayResult:
     replay_mode: str
+    signal_fingerprints: tuple[tuple[tuple[Any, ...], ...], ...]
+    intent_fingerprints: tuple[tuple[tuple[Any, ...], ...], ...]
     event_fingerprints: tuple[tuple[tuple[Any, ...], ...], ...]
     fill_fingerprints: tuple[tuple[tuple[Any, ...], ...], ...]
     position_snapshots: tuple[tuple[tuple[Any, ...], ...], ...]
@@ -342,6 +345,48 @@ def _event_semantic_fingerprint(event: PortfolioEvent) -> tuple[Any, ...]:
     )
 
 
+def _signal_semantic_fingerprints(
+    batch: DecisionBatch,
+) -> tuple[tuple[Any, ...], ...]:
+    signals: list[SignalCandidate] = []
+    for output in batch.stage_outputs:
+        if output.stage not in {"long_signal", "short_signal"}:
+            continue
+        for fact in output.facts:
+            if fact.get("kind") != output.stage:
+                continue
+            items = fact.get("items", ())
+            if isinstance(items, (tuple, list)):
+                signals.extend(
+                    item for item in items if type(item) is SignalCandidate
+                )
+    return tuple(
+        (
+            item.symbol,
+            item.side.value,
+            item.score,
+            item.requested_weight_pct,
+            item.model_id,
+            item.thesis_id,
+        )
+        for item in signals
+    )
+
+
+def _intent_semantic_fingerprint(intent: OrderIntent) -> tuple[Any, ...]:
+    return (
+        intent.id,
+        intent.symbol,
+        intent.position_side.value,
+        intent.order_side.value,
+        intent.position_effect.value,
+        intent.quantity,
+        intent.reason,
+        intent.created_snapshot_id,
+        intent.created_market_at.isoformat(),
+    )
+
+
 def _positions_fingerprint(account: AccountSnapshot) -> tuple[tuple[Any, ...], ...]:
     return tuple(
         (
@@ -365,7 +410,7 @@ def _cost_stressed_strategy(strategy: Mapping[str, Any], multiplier: float) -> d
     for field in FEE_FIELDS:
         portfolio[field] = number(portfolio.get(field)) * multiplier
     margin = replay.setdefault("margin_policy", {})
-    margin["financing_apr_pct"] = number(margin.get("financing_apr_pct")) * multiplier
+    margin["financing_apr_pct"] = number(margin.get("financing_apr_pct"))
     short = replay.setdefault("short_policy", {})
     short["estimated_borrow_apr_pct"] = number(short.get("estimated_borrow_apr_pct"))
     return replay
@@ -409,6 +454,8 @@ def replay_engine_frames(
     )
 
     event_frames: list[tuple[tuple[Any, ...], ...]] = []
+    signal_frames: list[tuple[tuple[Any, ...], ...]] = []
+    intent_frames: list[tuple[tuple[Any, ...], ...]] = []
     fill_frames: list[tuple[tuple[Any, ...], ...]] = []
     position_frames: list[tuple[tuple[Any, ...], ...]] = []
     nav_series: list[float] = []
@@ -431,7 +478,6 @@ def replay_engine_frames(
                 estimated_borrow_apr_pct=number(
                     short_policy.get("estimated_borrow_apr_pct")
                 ),
-                cost_multiplier=multiplier,
                 market=strategy_market(replay_strategy),
             )
             estimated_any = estimated_any or resolution.estimated
@@ -459,9 +505,14 @@ def replay_engine_frames(
                         account=current_account,
                         market=frame.market,
                         borrow=resolution.snapshot,
+                        cost_multiplier=multiplier,
                     )
                 )
             total_fees += sum(fill.fees for fill in batch.fills)
+            signal_frames.append(_signal_semantic_fingerprints(batch))
+            intent_frames.append(
+                tuple(_intent_semantic_fingerprint(item) for item in batch.intents)
+            )
             fill_frames.append(
                 tuple(
                     (
@@ -504,6 +555,8 @@ def replay_engine_frames(
     }
     return EngineReplayResult(
         replay_mode=replay_mode,
+        signal_fingerprints=tuple(signal_frames),
+        intent_fingerprints=tuple(intent_frames),
         event_fingerprints=tuple(event_frames),
         fill_fingerprints=tuple(fill_frames),
         position_snapshots=tuple(position_frames),

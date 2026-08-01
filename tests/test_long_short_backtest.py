@@ -145,6 +145,22 @@ def complete_borrow_book() -> HistoricalBorrowBook:
     return HistoricalBorrowBook.from_raw(rows, history_complete=True)
 
 
+def high_apr_borrow_book() -> HistoricalBorrowBook:
+    rows = {}
+    symbols = tuple(f"L{index}" for index in range(8)) + ("S0", "S1")
+    for day in ("2026-07-31", "2026-08-03", "2026-08-04"):
+        rows[day] = {
+            symbol: {
+                "shortable": True,
+                "easy_to_borrow": True,
+                "available_quantity": 1_000_000,
+                "borrow_apr_pct": 15.0,
+            }
+            for symbol in symbols
+        }
+    return HistoricalBorrowBook.from_raw(rows, history_complete=True)
+
+
 def replay(*, mode: str, multiplier: float, book: HistoricalBorrowBook):
     registry = {
         "long-static-v1": StaticSignals(
@@ -365,6 +381,18 @@ class LongShortBacktestTests(unittest.TestCase):
         self.assertEqual(paper.nav_series, backtest.nav_series)
         self.assertGreater(len(backtest.nav_series), 1)
 
+    def test_replay_exposes_signal_and_intent_fingerprints(self):
+        result = replay(
+            mode="backtest",
+            multiplier=1.0,
+            book=complete_borrow_book(),
+        )
+
+        self.assertTrue(hasattr(result, "signal_fingerprints"))
+        self.assertTrue(hasattr(result, "intent_fingerprints"))
+        self.assertTrue(result.signal_fingerprints[0])
+        self.assertTrue(result.intent_fingerprints[0])
+
     def test_double_cost_stress_increases_financing_and_estimated_borrow(self):
         normal = replay(mode="backtest", multiplier=1.0, book=estimated_borrow_book())
         stressed = replay(mode="backtest", multiplier=2.0, book=estimated_borrow_book())
@@ -379,6 +407,37 @@ class LongShortBacktestTests(unittest.TestCase):
         self.assertEqual(stressed.event_fingerprints, normal.event_fingerprints)
         self.assertEqual(stressed.fill_fingerprints, normal.fill_fingerprints)
         self.assertEqual(stressed.position_snapshots, normal.position_snapshots)
+
+    def test_historical_borrow_stress_changes_costs_without_changing_path(self):
+        zero = replay(mode="backtest", multiplier=0.0, book=high_apr_borrow_book())
+        normal = replay(mode="backtest", multiplier=1.0, book=high_apr_borrow_book())
+        stressed = replay(mode="backtest", multiplier=2.0, book=high_apr_borrow_book())
+
+        for candidate in (zero, stressed):
+            self.assertEqual(candidate.signal_fingerprints, normal.signal_fingerprints)
+            self.assertEqual(candidate.intent_fingerprints, normal.intent_fingerprints)
+            self.assertEqual(candidate.event_fingerprints, normal.event_fingerprints)
+            self.assertEqual(candidate.fill_fingerprints, normal.fill_fingerprints)
+            self.assertEqual(candidate.position_snapshots, normal.position_snapshots)
+            self.assertEqual(candidate.final_positions, normal.final_positions)
+            self.assertEqual(
+                candidate.metadata["borrow_apr_pct"],
+                normal.metadata["borrow_apr_pct"],
+            )
+
+        self.assertEqual(normal.metadata["borrow_apr_pct"]["maximum"], 15.0)
+        self.assertEqual(zero.metrics["transaction_fees"], 0.0)
+        self.assertEqual(normal.metrics["transaction_fees"], 0.0)
+        self.assertEqual(stressed.metrics["transaction_fees"], 0.0)
+        for cost_name in ("financing_cost", "borrow_cost"):
+            with self.subTest(cost_name=cost_name):
+                self.assertEqual(zero.metrics[cost_name], 0.0)
+                self.assertGreater(normal.metrics[cost_name], 0.0)
+                self.assertAlmostEqual(
+                    stressed.metrics[cost_name],
+                    normal.metrics[cost_name] * 2.0,
+                    places=9,
+                )
 
     def test_short_live_gate_requires_complete_historical_borrow(self):
         failed = evaluate_approval_gate(
@@ -413,7 +472,6 @@ class LongShortBacktestTests(unittest.TestCase):
             CUTOFF + timedelta(days=4),
             ("S0",),
             estimated_borrow_apr_pct=10.0,
-            cost_multiplier=1.0,
         )
         self.assertTrue(resolution.estimated)
         self.assertEqual(resolution.snapshot.securities["S0"].borrow_apr_pct, 10.0)
