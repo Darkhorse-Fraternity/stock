@@ -481,7 +481,15 @@ class PreExecutionAdmissionTests(unittest.TestCase):
                 )
                 self.assertNotIn(
                     "GROSS_EXPOSURE_CAP",
-                    hard_cap_breaches(exact, market(scale), exposure, MarginPolicy()),
+                    {
+                        breach.code
+                        for breach in hard_cap_breaches(
+                            exact,
+                            market(scale),
+                            exposure,
+                            MarginPolicy(),
+                        )
+                    },
                 )
 
             with self.subTest(scale=scale, boundary="100.0000000005"):
@@ -510,7 +518,15 @@ class PreExecutionAdmissionTests(unittest.TestCase):
                 )
                 self.assertIn(
                     "GROSS_EXPOSURE_CAP",
-                    hard_cap_breaches(beyond, market(scale), exposure, MarginPolicy()),
+                    {
+                        breach.code
+                        for breach in hard_cap_breaches(
+                            beyond,
+                            market(scale),
+                            exposure,
+                            MarginPolicy(),
+                        )
+                    },
                 )
 
         nextafter_loan = math.ulp(100.0)
@@ -538,12 +554,15 @@ class PreExecutionAdmissionTests(unittest.TestCase):
         )
         self.assertIn(
             "GROSS_EXPOSURE_CAP",
-            hard_cap_breaches(
-                nextafter_account,
-                market(100.0),
-                exposure,
-                MarginPolicy(),
-            ),
+            {
+                breach.code
+                for breach in hard_cap_breaches(
+                    nextafter_account,
+                    market(100.0),
+                    exposure,
+                    MarginPolicy(),
+                )
+            },
         )
 
     def test_existing_policy_breach_is_baseline_aware_and_reduce_only_safe(self):
@@ -650,6 +669,143 @@ class PreExecutionAdmissionTests(unittest.TestCase):
         self.assertIn(
             diagnostic["items"][0]["reason"],
             {"LONG_ONLY_SHORT_FORBIDDEN", "SHORT_EXPOSURE_CAP"},
+        )
+
+    def test_baseline_position_caps_compare_exact_symbol_and_side_identity(self):
+        from stock_recommender.portfolio_engine import pre_execution
+
+        long_policy = ExposurePolicy(
+            mode="LONG_ONLY",
+            max_positions=10,
+            max_gross_exposure_pct=1_000.0,
+            max_net_exposure_pct=1_000.0,
+            max_long_exposure_pct=1_000.0,
+            max_short_exposure_pct=0.0,
+            max_long_position_pct=100.0,
+            max_short_position_pct=0.0,
+        )
+
+        def long_account(quantities):
+            total = sum(quantities.values())
+            return AccountSnapshot(
+                id="account-admission",
+                strategy_id="strategy-admission",
+                strategy_revision=1,
+                occurred_at=NOW,
+                available_cash=100.0 - total,
+                positions=tuple(
+                    PositionSnapshot(
+                        symbol=symbol,
+                        side=PositionSide.LONG,
+                        quantity=quantity,
+                        average_cost=1.0,
+                        current_price=1.0,
+                    )
+                    for symbol, quantity in sorted(quantities.items())
+                ),
+                snapshot_id="account-before",
+            )
+
+        long_market = MarketSnapshot(
+            id="market-long-position-identities",
+            occurred_at=NOW,
+            quotes={symbol: {"price": 1.0} for symbol in ("L1", "L2")},
+        )
+        baseline_long = long_account({"L1": 120})
+        reduced = pre_execution.hard_cap_breaches(
+            long_account({"L1": 119}),
+            long_market,
+            long_policy,
+            MarginPolicy(),
+            baseline_account=baseline_long,
+        )
+        worsened = pre_execution.hard_cap_breaches(
+            long_account({"L1": 121}),
+            long_market,
+            long_policy,
+            MarginPolicy(),
+            baseline_account=baseline_long,
+        )
+        new_symbol = pre_execution.hard_cap_breaches(
+            long_account({"L1": 120, "L2": 110}),
+            long_market,
+            long_policy,
+            MarginPolicy(),
+            baseline_account=baseline_long,
+        )
+
+        self.assertEqual(reduced, ())
+        self.assertEqual(
+            [item.key for item in worsened],
+            [("LONG_POSITION_CAP", "LONG", "L1")],
+        )
+        self.assertEqual(
+            [item.key for item in new_symbol],
+            [("LONG_POSITION_CAP", "LONG", "L2")],
+        )
+        for breach in (*worsened, *new_symbol):
+            self.assertIsInstance(breach, pre_execution.HardCapBreach)
+            self.assertGreater(breach.actual, breach.maximum)
+
+        short_policy = ExposurePolicy(
+            mode="LONG_SHORT",
+            max_positions=10,
+            max_gross_exposure_pct=1_000.0,
+            max_net_exposure_pct=1_000.0,
+            max_long_exposure_pct=1_000.0,
+            max_short_exposure_pct=1_000.0,
+            max_long_position_pct=1_000.0,
+            max_short_position_pct=100.0,
+        )
+
+        def short_account(quantities):
+            total = sum(quantities.values())
+            return AccountSnapshot(
+                id="account-admission",
+                strategy_id="strategy-admission",
+                strategy_revision=1,
+                occurred_at=NOW,
+                available_cash=100.0,
+                restricted_short_proceeds=float(total),
+                positions=tuple(
+                    PositionSnapshot(
+                        symbol=symbol,
+                        side=PositionSide.SHORT,
+                        quantity=quantity,
+                        average_cost=1.0,
+                        current_price=1.0,
+                    )
+                    for symbol, quantity in sorted(quantities.items())
+                ),
+                snapshot_id="account-before",
+            )
+
+        short_market = MarketSnapshot(
+            id="market-short-position-identities",
+            occurred_at=NOW,
+            quotes={symbol: {"price": 1.0} for symbol in ("S1", "S2")},
+        )
+        baseline_short = short_account({"S1": 120})
+        self.assertEqual(
+            pre_execution.hard_cap_breaches(
+                short_account({"S1": 119}),
+                short_market,
+                short_policy,
+                MarginPolicy(),
+                baseline_account=baseline_short,
+            ),
+            (),
+        )
+        short_new_symbol = pre_execution.hard_cap_breaches(
+            short_account({"S1": 120, "S2": 110}),
+            short_market,
+            short_policy,
+            MarginPolicy(),
+            baseline_account=baseline_short,
+        )
+        self.assertEqual(
+            [item.key for item in short_new_symbol],
+            [("SHORT_POSITION_CAP", "SHORT", "S2")],
         )
 
     def test_margin_maintenance_and_liquidation_buffer_is_a_hard_cap(self):

@@ -41,7 +41,10 @@ from .execution import (
 )
 from .exposure import ExposureBudgetStage
 from .margin import MarginAdmissionStage
-from .pre_execution import PreExecutionAdmissionStage, hard_cap_breaches
+from .pre_execution import (
+    PreExecutionAdmissionStage,
+    hard_cap_breaches,
+)
 from .risk import PortfolioRiskStage
 from .request_identity import request_fingerprint
 from .signal_ports import SIGNAL_MODELS, SignalModel
@@ -587,7 +590,7 @@ class PortfolioEngine:
             if post_execution_breaches:
                 raise RuntimeError(
                     "post-execution hard-cap breach: "
-                    + ", ".join(post_execution_breaches)
+                    + ", ".join(item.code for item in post_execution_breaches)
                 )
 
         borrow_apr = {

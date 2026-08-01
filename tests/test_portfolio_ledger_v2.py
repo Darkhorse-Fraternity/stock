@@ -271,6 +271,12 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
         )
         with self.assertRaisesRegex(LedgerError, "collision|different"):
             store.transition_revision(collision)
+        changed_time = replace(
+            transition,
+            occurred_at=transition.occurred_at + timedelta(seconds=1),
+        )
+        with self.assertRaisesRegex(LedgerError, "collision|different"):
+            store.transition_revision(changed_time)
 
     def test_revision_transition_rejects_downgrade_and_wrong_strategy(self):
         transaction_type = portfolio_contracts.RevisionTransition

@@ -736,6 +736,7 @@ def _transition_matches_request(
         and fact.from_revision == transition.from_revision
         and fact.to_revision == transition.to_revision
         and fact.source_snapshot_id == transition.expected_snapshot_id
+        and fact.occurred_at == transition.occurred_at
     )
 
 

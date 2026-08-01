@@ -42,6 +42,21 @@ def _utc_datetime(value: object, field_name: str = "occurred_at") -> datetime:
     return value.astimezone(timezone.utc)
 
 
+def _strategy_revision_time(strategy: Mapping[str, Any]) -> datetime:
+    raw = strategy.get("updated_at")
+    if type(raw) is not str or not raw:
+        raise ValueError(
+            "strategy.updated_at must be an explicit timezone-aware revision timestamp"
+        )
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            "strategy.updated_at must be an ISO timezone-aware revision timestamp"
+        ) from exc
+    return _utc_datetime(parsed, "strategy.updated_at")
+
+
 def _snapshot_id(
     market: str,
     occurred_at: datetime,
@@ -191,6 +206,7 @@ def open_portfolio_runtime(
         )
     if account.strategy_revision < revision:
         source_revision = account.strategy_revision
+        revision_time = _strategy_revision_time(strategy)
         transition_material = (
             f"{strategy_id}|{account.snapshot_id}|{source_revision}|{revision}"
         )
@@ -202,7 +218,7 @@ def open_portfolio_runtime(
                 expected_snapshot_id=account.snapshot_id,
                 from_revision=source_revision,
                 to_revision=revision,
-                occurred_at=captured_at,
+                occurred_at=revision_time,
             )
         )
     engine = PortfolioEngine(

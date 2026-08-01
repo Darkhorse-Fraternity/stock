@@ -6,6 +6,7 @@ import threading
 import unittest
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -35,6 +36,7 @@ from stock_recommender.portfolio_engine.contracts import (
     SignalCandidate,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerError
+from stock_recommender.portfolio_engine.pre_execution import HardCapBreach
 from stock_recommender.portfolio_engine.risk import COVER_ONLY
 from stock_recommender.recommendation import RecommendationPlan
 from stock_recommender.reports import render_report
@@ -1030,11 +1032,17 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             )
             before = ledger.load_view("strategy-us")
             commit_calls_before = ledger.commit_calls
+            structured_breach = HardCapBreach(
+                code="GROSS_EXPOSURE_CAP",
+                key=("GROSS_EXPOSURE_CAP",),
+                actual=Decimal("101"),
+                maximum=Decimal("100"),
+            )
             with patch.object(
                 service,
                 "hard_cap_breaches",
-                return_value=("GROSS_EXPOSURE_CAP",),
-            ):
+                return_value=(structured_breach,),
+            ) as checked:
                 with self.assertRaisesRegex(RuntimeError, "post-execution hard-cap"):
                     engine.process_and_commit(
                         ProcessRequest(
@@ -1050,6 +1058,10 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                     )
             self.assertEqual(ledger.commit_calls, commit_calls_before)
             self.assertEqual(ledger.load_view("strategy-us"), before)
+            self.assertIs(
+                checked.call_args.kwargs["baseline_account"],
+                before.account,
+            )
 
     def test_process_accrues_short_carry_once_per_market_day(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")

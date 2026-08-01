@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import unittest
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from stock_recommender.parameters import default_strategy_config
 from stock_recommender.portfolio_engine.contracts import (
@@ -38,6 +40,7 @@ def strategy() -> dict:
             "name": "Runtime US",
             "revision": 2,
             "market": "us",
+            "updated_at": "2026-08-03T14:00:00+00:00",
         }
     )
     value["parameters"]["market"] = {"enabled": True, "value": "us"}
@@ -315,6 +318,96 @@ class PortfolioRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(snapshot.account.strategy_revision, 4)
             self.assertIn("AAPL", report)
+
+    def test_concurrent_revision_open_uses_one_canonical_strategy_timestamp(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            open_portfolio_runtime(
+                strategy(),
+                path=path,
+                adapter=Adapter(),
+                occurred_at=NOW,
+            )
+            revised = {
+                **strategy(),
+                "revision": 3,
+                "updated_at": "2026-08-04T08:15:30+08:00",
+            }
+            barrier = threading.Barrier(2)
+            captured = []
+            accounts = []
+            errors = []
+            original = JsonLedgerStore.transition_revision
+
+            def synchronized_transition(store, transition):
+                captured.append(transition)
+                barrier.wait(timeout=5)
+                return original(store, transition)
+
+            def open_at(occurred_at):
+                try:
+                    _, account = open_portfolio_runtime(
+                        revised,
+                        path=path,
+                        adapter=Adapter(),
+                        occurred_at=occurred_at,
+                    )
+                    accounts.append(account)
+                except Exception as exc:
+                    errors.append(exc)
+
+            with patch.object(
+                JsonLedgerStore,
+                "transition_revision",
+                synchronized_transition,
+            ):
+                threads = [
+                    threading.Thread(
+                        target=open_at,
+                        args=(NOW + timedelta(minutes=minute),),
+                    )
+                    for minute in (1, 2)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                    self.assertFalse(thread.is_alive())
+
+            self.assertEqual(errors, [])
+            self.assertEqual(len(accounts), 2)
+            self.assertEqual(len(captured), 2)
+            self.assertEqual(captured[0], captured[1])
+            self.assertEqual(
+                captured[0].occurred_at,
+                datetime(2026, 8, 4, 0, 15, 30, tzinfo=timezone.utc),
+            )
+            self.assertEqual(accounts[0].strategy_revision, 3)
+            self.assertEqual(accounts[1].strategy_revision, 3)
+
+    def test_revision_open_requires_an_explicit_aware_strategy_timestamp(self):
+        for invalid in (None, "2026-08-04T08:15:30"):
+            with self.subTest(updated_at=invalid), TemporaryDirectory() as temporary:
+                path = Path(temporary) / "portfolio-v2.json"
+                open_portfolio_runtime(
+                    strategy(),
+                    path=path,
+                    adapter=Adapter(),
+                    occurred_at=NOW,
+                )
+                revised = {**strategy(), "revision": 3, "updated_at": invalid}
+
+                with self.assertRaisesRegex(ValueError, "updated_at|timezone-aware"):
+                    open_portfolio_runtime(
+                        revised,
+                        path=path,
+                        adapter=Adapter(),
+                        occurred_at=NOW + timedelta(minutes=1),
+                    )
+                self.assertEqual(
+                    JsonLedgerStore(path).load("runtime-us").strategy_revision,
+                    2,
+                )
 
 
 if __name__ == "__main__":

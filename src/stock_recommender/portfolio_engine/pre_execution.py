@@ -26,9 +26,32 @@ class _DecimalCapState:
     net_absolute: Decimal
     long_value: Decimal
     short_value: Decimal
-    long_position_max: Decimal
-    short_position_max: Decimal
+    positions: tuple[tuple[str, PositionSide, Decimal], ...]
     position_count: int
+
+
+@dataclass(frozen=True)
+class HardCapBreach:
+    """One exact hard-cap violation with a stable comparison identity."""
+
+    code: str
+    key: tuple[str, ...]
+    actual: Decimal
+    maximum: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.code) is not str or not self.code:
+            raise ValueError("hard-cap breach code must be non-empty")
+        if (
+            type(self.key) is not tuple
+            or not self.key
+            or any(type(item) is not str or not item for item in self.key)
+        ):
+            raise ValueError("hard-cap breach key must contain non-empty strings")
+        if self.key[0] != self.code:
+            raise ValueError("hard-cap breach key must start with its code")
+        if type(self.actual) is not Decimal or type(self.maximum) is not Decimal:
+            raise TypeError("hard-cap breach actual and maximum must be Decimal")
 
 
 def _decimal(value: object, field_name: str) -> Decimal:
@@ -49,6 +72,7 @@ def _cap_state(
 ) -> _DecimalCapState:
     long_values: list[Decimal] = []
     short_values: list[Decimal] = []
+    position_values: list[tuple[str, PositionSide, Decimal]] = []
     for held in account.positions:
         quote = market.quotes.get(held.symbol)
         if not isinstance(quote, Mapping) or quote.get("price") is None:
@@ -57,6 +81,7 @@ def _cap_state(
         if price <= 0:
             raise ValueError(f"quote[{held.symbol}].price must be positive")
         market_value = Decimal(held.quantity) * price
+        position_values.append((held.symbol, held.side, market_value))
         if held.side is PositionSide.LONG:
             long_values.append(market_value)
         else:
@@ -79,8 +104,9 @@ def _cap_state(
         net_absolute=abs(long_value - short_value),
         long_value=long_value,
         short_value=short_value,
-        long_position_max=max(long_values, default=Decimal(0)),
-        short_position_max=max(short_values, default=Decimal(0)),
+        positions=tuple(
+            sorted(position_values, key=lambda item: (item[1].value, item[0]))
+        ),
         position_count=len(account.positions),
     )
 
@@ -109,86 +135,86 @@ def _raw_hard_cap_breaches(
     state: _DecimalCapState,
     exposure: ExposurePolicy,
     margin: MarginPolicy,
-) -> tuple[str, ...]:
-    breaches: list[str] = []
+) -> tuple[HardCapBreach, ...]:
+    breaches: list[HardCapBreach] = []
     if state.equity <= 0:
-        breaches.append("NON_POSITIVE_EQUITY")
+        breaches.append(
+            HardCapBreach(
+                code="NON_POSITIVE_EQUITY",
+                key=("NON_POSITIVE_EQUITY",),
+                actual=max(Decimal(0), -state.equity),
+                maximum=Decimal(0),
+            )
+        )
     if state.position_count > exposure.max_positions:
-        breaches.append("POSITION_COUNT_CAP")
+        breaches.append(
+            HardCapBreach(
+                code="POSITION_COUNT_CAP",
+                key=("POSITION_COUNT_CAP",),
+                actual=Decimal(state.position_count),
+                maximum=Decimal(exposure.max_positions),
+            )
+        )
     if exposure.mode == "LONG_ONLY" and state.short_value > 0:
-        breaches.append("LONG_ONLY_SHORT_FORBIDDEN")
+        breaches.append(
+            HardCapBreach(
+                code="LONG_ONLY_SHORT_FORBIDDEN",
+                key=("LONG_ONLY_SHORT_FORBIDDEN",),
+                actual=_percentage(state.short_value, state.equity),
+                maximum=Decimal(0),
+            )
+        )
     comparisons = (
         (state.gross, exposure.max_gross_exposure_pct, "GROSS_EXPOSURE_CAP"),
         (state.net_absolute, exposure.max_net_exposure_pct, "NET_EXPOSURE_CAP"),
         (state.long_value, exposure.max_long_exposure_pct, "LONG_EXPOSURE_CAP"),
         (state.short_value, exposure.max_short_exposure_pct, "SHORT_EXPOSURE_CAP"),
-        (
-            state.long_position_max,
-            exposure.max_long_position_pct,
-            "LONG_POSITION_CAP",
-        ),
-        (
-            state.short_position_max,
-            exposure.max_short_position_pct,
-            "SHORT_POSITION_CAP",
-        ),
     )
     for numerator, maximum, reason in comparisons:
         if _exceeds_percentage(numerator, state.equity, maximum):
-            breaches.append(reason)
+            breaches.append(
+                HardCapBreach(
+                    code=reason,
+                    key=(reason,),
+                    actual=_percentage(numerator, state.equity),
+                    maximum=_decimal(maximum, f"{reason}.maximum"),
+                )
+            )
+    for symbol, side, market_value in state.positions:
+        maximum = (
+            exposure.max_long_position_pct
+            if side is PositionSide.LONG
+            else exposure.max_short_position_pct
+        )
+        if _exceeds_percentage(market_value, state.equity, maximum):
+            code = (
+                "LONG_POSITION_CAP"
+                if side is PositionSide.LONG
+                else "SHORT_POSITION_CAP"
+            )
+            breaches.append(
+                HardCapBreach(
+                    code=code,
+                    key=(code, side.value, symbol),
+                    actual=_percentage(market_value, state.equity),
+                    maximum=_decimal(maximum, f"{code}.maximum"),
+                )
+            )
     threshold = (
         _decimal(margin.maintenance_margin_pct, "maintenance_margin_pct")
         + _decimal(margin.liquidation_buffer_pct, "liquidation_buffer_pct")
     )
     if state.gross > 0 and state.equity * Decimal(100) < state.gross * threshold:
-        breaches.append("MARGIN_BUFFER_BREACH")
-    return tuple(dict.fromkeys(breaches))
-
-
-def _breach_worsened(
-    reason: str,
-    current: _DecimalCapState,
-    baseline: _DecimalCapState,
-) -> bool:
-    if reason == "NON_POSITIVE_EQUITY":
-        return current.equity < baseline.equity
-    if reason == "POSITION_COUNT_CAP":
-        return current.position_count > baseline.position_count
-    if reason == "LONG_ONLY_SHORT_FORBIDDEN":
-        return current.short_value > baseline.short_value
-    numerators = {
-        "GROSS_EXPOSURE_CAP": (current.gross, baseline.gross),
-        "NET_EXPOSURE_CAP": (current.net_absolute, baseline.net_absolute),
-        "LONG_EXPOSURE_CAP": (current.long_value, baseline.long_value),
-        "SHORT_EXPOSURE_CAP": (current.short_value, baseline.short_value),
-        "LONG_POSITION_CAP": (
-            current.long_position_max,
-            baseline.long_position_max,
-        ),
-        "SHORT_POSITION_CAP": (
-            current.short_position_max,
-            baseline.short_position_max,
-        ),
-    }
-    if reason in numerators:
-        current_value, baseline_value = numerators[reason]
-        return _percentage(current_value, current.equity) > _percentage(
-            baseline_value,
-            baseline.equity,
+        margin_rate = state.equity * Decimal(100) / state.gross
+        breaches.append(
+            HardCapBreach(
+                code="MARGIN_BUFFER_BREACH",
+                key=("MARGIN_BUFFER_BREACH",),
+                actual=threshold - margin_rate,
+                maximum=Decimal(0),
+            )
         )
-    if reason == "MARGIN_BUFFER_BREACH":
-        current_rate = (
-            Decimal("Infinity")
-            if current.gross == 0
-            else current.equity * Decimal(100) / current.gross
-        )
-        baseline_rate = (
-            Decimal("Infinity")
-            if baseline.gross == 0
-            else baseline.equity * Decimal(100) / baseline.gross
-        )
-        return current_rate < baseline_rate
-    return True
+    return tuple(breaches)
 
 
 def hard_cap_breaches(
@@ -198,7 +224,7 @@ def hard_cap_breaches(
     margin: MarginPolicy,
     *,
     baseline_account: AccountSnapshot | None = None,
-) -> tuple[str, ...]:
+) -> tuple[HardCapBreach, ...]:
     """Return deterministic hard-cap breach codes for one valued account."""
 
     if type(account) is not AccountSnapshot:
@@ -219,16 +245,26 @@ def hard_cap_breaches(
             else _cap_state(baseline_account, market)
         )
     except (TypeError, ValueError, InvalidOperation):
-        return ("VALUATION_UNAVAILABLE",)
+        return (
+            HardCapBreach(
+                code="VALUATION_UNAVAILABLE",
+                key=("VALUATION_UNAVAILABLE",),
+                actual=Decimal("Infinity"),
+                maximum=Decimal(0),
+            ),
+        )
     breaches = _raw_hard_cap_breaches(state, exposure, margin)
     if baseline is None:
         return breaches
-    baseline_breaches = set(_raw_hard_cap_breaches(baseline, exposure, margin))
+    baseline_by_key = {
+        breach.key: breach
+        for breach in _raw_hard_cap_breaches(baseline, exposure, margin)
+    }
     return tuple(
-        reason
-        for reason in breaches
-        if reason not in baseline_breaches
-        or _breach_worsened(reason, state, baseline)
+        breach
+        for breach in breaches
+        if breach.key not in baseline_by_key
+        or breach.actual > baseline_by_key[breach.key].actual
     )
 
 
@@ -396,8 +432,16 @@ class PreExecutionAdmissionStage:
                     {
                         "intent_id": item.id,
                         "symbol": item.symbol,
-                        "reason": breaches[0],
-                        "breaches": breaches,
+                        "reason": breaches[0].code,
+                        "breaches": tuple(
+                            {
+                                "code": breach.code,
+                                "key": breach.key,
+                                "actual": str(breach.actual),
+                                "maximum": str(breach.maximum),
+                            }
+                            for breach in breaches
+                        ),
                     }
                 )
                 continue
@@ -419,4 +463,8 @@ class PreExecutionAdmissionStage:
         )
 
 
-__all__ = ("PreExecutionAdmissionStage", "hard_cap_breaches")
+__all__ = (
+    "HardCapBreach",
+    "PreExecutionAdmissionStage",
+    "hard_cap_breaches",
+)
