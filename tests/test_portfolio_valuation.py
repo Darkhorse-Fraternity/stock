@@ -154,6 +154,28 @@ class PortfolioValuationTests(unittest.TestCase):
             ), self.assertRaises((TypeError, ValueError)):
                 self._position(current_price=current_price)
 
+    def test_position_snapshot_has_one_valuation_source_and_derived_properties(self):
+        with self.assertRaises(TypeError):
+            self._position(
+                current_price=110.0,
+                market_value=999.0,
+                unrealized_pnl=-777.0,
+            )
+
+        unvalued = self._position()
+        self.assertIsNone(unvalued.market_value)
+        self.assertIsNone(unvalued.unrealized_pnl)
+
+        long = self._position(current_price=110.0)
+        short = self._position(
+            side=contracts.PositionSide.SHORT,
+            current_price=110.0,
+        )
+        self.assertEqual(long.market_value, 1100.0)
+        self.assertEqual(short.market_value, 1100.0)
+        self.assertEqual(long.unrealized_pnl, 100.0)
+        self.assertEqual(short.unrealized_pnl, -100.0)
+
     def test_account_rejects_invalid_balances_and_costs(self):
         nonnegative_fields = (
             "restricted_short_proceeds",
@@ -244,6 +266,106 @@ class PortfolioValuationTests(unittest.TestCase):
         for updates in invalid_updates:
             with self.subTest(updates=updates), self.assertRaises(ValueError):
                 contracts.PortfolioMetrics(**(values | updates))
+
+    def test_metrics_contract_rejects_finite_accounting_and_ratio_conflicts(self):
+        values = {
+            "available_cash": 100.0,
+            "restricted_short_proceeds": 1000.0,
+            "margin_loan": 200.0,
+            "accrued_financing_cost": 8.0,
+            "accrued_borrow_cost": 3.0,
+            "long_market_value": 600.0,
+            "short_liability": 900.0,
+            "equity": 600.0,
+            "long_exposure_pct": 100.0,
+            "short_exposure_pct": 150.0,
+            "gross_exposure_pct": 250.0,
+            "net_exposure_pct": -50.0,
+            "margin_rate_pct": 40.0,
+        }
+        self.assertEqual(contracts.PortfolioMetrics(**values).equity, 600.0)
+
+        invalid_updates = (
+            {"equity": 600.01},
+            {"long_exposure_pct": 100.01},
+            {"short_exposure_pct": 150.01},
+            {"gross_exposure_pct": 250.01},
+            {"net_exposure_pct": -50.01},
+            {"margin_rate_pct": 40.01},
+        )
+        for updates in invalid_updates:
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                contracts.PortfolioMetrics(**(values | updates))
+
+    def test_metrics_contract_accepts_exact_invariants_for_all_account_states(self):
+        common = {
+            "restricted_short_proceeds": 0.0,
+            "margin_loan": 0.0,
+            "accrued_financing_cost": 7.0,
+            "accrued_borrow_cost": 2.0,
+            "short_liability": 0.0,
+            "short_exposure_pct": 0.0,
+        }
+        cases = (
+            {
+                "available_cash": 1000.0,
+                "long_market_value": 1000.0,
+                "equity": 2000.0,
+                "long_exposure_pct": 50.0,
+                "gross_exposure_pct": 50.0,
+                "net_exposure_pct": 50.0,
+                "margin_rate_pct": 200.0,
+            },
+            {
+                "available_cash": -2000.0,
+                "long_market_value": 1000.0,
+                "equity": -1000.0,
+                "long_exposure_pct": -100.0,
+                "gross_exposure_pct": -100.0,
+                "net_exposure_pct": -100.0,
+                "margin_rate_pct": -100.0,
+            },
+            {
+                "available_cash": -1000.0,
+                "long_market_value": 1000.0,
+                "equity": 0.0,
+                "long_exposure_pct": math.inf,
+                "gross_exposure_pct": math.inf,
+                "net_exposure_pct": math.inf,
+                "margin_rate_pct": 0.0,
+            },
+            {
+                "available_cash": 100.0,
+                "long_market_value": 0.0,
+                "equity": 100.0,
+                "long_exposure_pct": 0.0,
+                "gross_exposure_pct": 0.0,
+                "net_exposure_pct": 0.0,
+                "margin_rate_pct": math.inf,
+            },
+        )
+        for values in cases:
+            with self.subTest(equity=values["equity"]):
+                metrics = contracts.PortfolioMetrics(**(common | values))
+                self.assertEqual(metrics.equity, values["equity"])
+
+    def test_metrics_contract_rejects_overflowing_base_arithmetic(self):
+        with self.assertRaisesRegex(ValueError, "finite"):
+            contracts.PortfolioMetrics(
+                available_cash=1e308,
+                restricted_short_proceeds=1e308,
+                margin_loan=0.0,
+                accrued_financing_cost=0.0,
+                accrued_borrow_cost=0.0,
+                long_market_value=0.0,
+                short_liability=0.0,
+                equity=0.0,
+                long_exposure_pct=0.0,
+                short_exposure_pct=0.0,
+                gross_exposure_pct=0.0,
+                net_exposure_pct=0.0,
+                margin_rate_pct=math.inf,
+            )
 
     def test_prices_must_cover_every_position_and_extra_prices_are_ignored(self):
         account = self._account(

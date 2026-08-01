@@ -248,6 +248,37 @@ def _require_derived_metric(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must not be NaN")
 
 
+def _finite_derived_value(value: object, field_name: str) -> float:
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be finite") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite")
+    if number == 0:
+        return 0.0
+    return number
+
+
+def _expected_ratio(numerator: float, denominator: float, field_name: str) -> float:
+    try:
+        ratio = numerator / denominator * 100.0
+    except (OverflowError, ZeroDivisionError) as exc:
+        raise ValueError(f"{field_name} calculation overflowed") from exc
+    return _finite_derived_value(ratio, field_name)
+
+
+def _metric_matches(actual: int | float, expected: float) -> bool:
+    if math.isinf(expected):
+        return actual == expected
+    return math.isclose(
+        float(actual),
+        expected,
+        rel_tol=1e-12,
+        abs_tol=1e-12,
+    )
+
+
 def _require_integer(value: object, field_name: str) -> None:
     if type(value) is not int:
         raise TypeError(f"{field_name} must be an integer")
@@ -340,8 +371,6 @@ class PositionSnapshot(_DeeplyImmutable):
     quantity: int
     average_cost: float
     current_price: float | None = None
-    market_value: float | None = None
-    unrealized_pnl: float | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
@@ -350,12 +379,31 @@ class PositionSnapshot(_DeeplyImmutable):
         _require_positive_finite_number(self.average_cost, "average_cost")
         if self.current_price is not None:
             _require_positive_finite_number(self.current_price, "current_price")
-        if self.market_value is not None:
-            _require_positive_finite_number(self.market_value, "market_value")
-        if self.unrealized_pnl is not None:
-            _require_finite_number(self.unrealized_pnl, "unrealized_pnl")
-            if self.unrealized_pnl == 0:
-                object.__setattr__(self, "unrealized_pnl", 0.0)
+
+    @property
+    def market_value(self) -> float | None:
+        if self.current_price is None:
+            return None
+        try:
+            value = self.quantity * self.current_price
+        except OverflowError as exc:
+            raise ValueError("market_value calculation overflowed") from exc
+        return _finite_derived_value(value, "market_value")
+
+    @property
+    def unrealized_pnl(self) -> float | None:
+        if self.current_price is None:
+            return None
+        direction = 1.0 if self.side is PositionSide.LONG else -1.0
+        try:
+            pnl = (
+                direction
+                * (self.current_price - self.average_cost)
+                * self.quantity
+            )
+        except OverflowError as exc:
+            raise ValueError("unrealized_pnl calculation overflowed") from exc
+        return _finite_derived_value(pnl, "unrealized_pnl")
 
 
 @dataclass(frozen=True)
@@ -442,26 +490,34 @@ class PortfolioMetrics(_DeeplyImmutable):
         ):
             _require_derived_metric(getattr(self, field_name), field_name)
 
-        gross_value = self.long_market_value + self.short_liability
-        _require_finite_number(gross_value, "gross_market_value")
-        exposure_values = (
-            self.long_exposure_pct,
-            self.short_exposure_pct,
-            self.gross_exposure_pct,
-            self.net_exposure_pct,
-        )
+        available_cash = float(self.available_cash)
+        restricted_proceeds = float(self.restricted_short_proceeds)
+        long_value = float(self.long_market_value)
+        short_value = float(self.short_liability)
+        margin_loan = float(self.margin_loan)
+        try:
+            expected_equity = (
+                available_cash
+                + restricted_proceeds
+                + long_value
+                - short_value
+                - margin_loan
+            )
+            gross_value = long_value + short_value
+        except OverflowError as exc:
+            raise ValueError("portfolio metric base calculation overflowed") from exc
+        expected_equity = _finite_derived_value(expected_equity, "equity")
+        gross_value = _finite_derived_value(gross_value, "gross_market_value")
+        if not _metric_matches(self.equity, expected_equity):
+            raise ValueError("equity is inconsistent with account balances")
+
         if gross_value == 0:
-            if any(value != 0 for value in exposure_values):
-                raise ValueError("exposures must be zero when there are no positions")
-            if self.margin_rate_pct != math.inf:
-                raise ValueError(
-                    "margin_rate_pct must be positive infinity with no positions"
-                )
-        elif self.equity == 0:
-            net_value = self.long_market_value - self.short_liability
-            expected_exposures = (
-                math.inf if self.long_market_value > 0 else 0.0,
-                math.inf if self.short_liability > 0 else 0.0,
+            expected_ratios = (0.0, 0.0, 0.0, 0.0, math.inf)
+        elif expected_equity == 0:
+            net_value = long_value - short_value
+            expected_ratios = (
+                math.inf if long_value > 0 else 0.0,
+                math.inf if short_value > 0 else 0.0,
                 math.inf,
                 (
                     math.inf
@@ -470,16 +526,30 @@ class PortfolioMetrics(_DeeplyImmutable):
                     if net_value < 0
                     else 0.0
                 ),
+                0.0,
             )
-            if exposure_values != expected_exposures:
-                raise ValueError("zero-equity exposures have invalid infinity signs")
-            if self.margin_rate_pct != 0:
-                raise ValueError("margin_rate_pct must be zero at zero equity")
-        elif any(
-            math.isinf(float(value))
-            for value in (*exposure_values, self.margin_rate_pct)
-        ):
-            raise ValueError("infinite metrics require no positions or zero equity")
+        else:
+            expected_ratios = (
+                _expected_ratio(long_value, expected_equity, "long_exposure_pct"),
+                _expected_ratio(short_value, expected_equity, "short_exposure_pct"),
+                _expected_ratio(gross_value, expected_equity, "gross_exposure_pct"),
+                _expected_ratio(
+                    long_value - short_value,
+                    expected_equity,
+                    "net_exposure_pct",
+                ),
+                _expected_ratio(expected_equity, gross_value, "margin_rate_pct"),
+            )
+        ratio_fields = (
+            "long_exposure_pct",
+            "short_exposure_pct",
+            "gross_exposure_pct",
+            "net_exposure_pct",
+            "margin_rate_pct",
+        )
+        for field_name, expected in zip(ratio_fields, expected_ratios, strict=True):
+            if not _metric_matches(getattr(self, field_name), expected):
+                raise ValueError(f"{field_name} is inconsistent with portfolio values")
 
         for field_name in self.__dataclass_fields__:
             if getattr(self, field_name) == 0:

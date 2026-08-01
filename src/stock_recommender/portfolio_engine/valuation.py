@@ -63,10 +63,12 @@ def position_market_value(position: PositionSnapshot, price: object) -> float:
     resolved_position = _require_position(position)
     resolved_price = _require_price(price, resolved_position.symbol)
     try:
-        value = resolved_position.quantity * resolved_price
-    except OverflowError as exc:
-        raise ValuationError("position market value overflowed") from exc
-    return _finite_result(value, "position market value")
+        value = replace(resolved_position, current_price=resolved_price).market_value
+    except (OverflowError, ValueError) as exc:
+        raise ValuationError("position market value must be finite") from exc
+    if value is None:
+        raise ValuationError("position market value was not calculated")
+    return value
 
 
 def position_unrealized_pnl(position: PositionSnapshot, price: object) -> float:
@@ -74,16 +76,13 @@ def position_unrealized_pnl(position: PositionSnapshot, price: object) -> float:
 
     resolved_position = _require_position(position)
     resolved_price = _require_price(price, resolved_position.symbol)
-    direction = 1.0 if resolved_position.side is PositionSide.LONG else -1.0
     try:
-        pnl = (
-            direction
-            * (resolved_price - resolved_position.average_cost)
-            * resolved_position.quantity
-        )
-    except OverflowError as exc:
-        raise ValuationError("position unrealized P&L overflowed") from exc
-    return _finite_result(pnl, "position unrealized P&L")
+        pnl = replace(resolved_position, current_price=resolved_price).unrealized_pnl
+    except (OverflowError, ValueError) as exc:
+        raise ValuationError("position unrealized P&L must be finite") from exc
+    if pnl is None:
+        raise ValuationError("position unrealized P&L was not calculated")
+    return pnl
 
 
 def account_equity(
@@ -103,11 +102,11 @@ def account_equity(
     short_value = _require_nonnegative_amount(short_liability, "short_liability")
     try:
         equity = (
-            account.available_cash
-            + account.restricted_short_proceeds
+            float(account.available_cash)
+            + float(account.restricted_short_proceeds)
             + long_value
             - short_value
-            - account.margin_loan
+            - float(account.margin_loan)
         )
     except OverflowError as exc:
         raise ValuationError("account equity overflowed") from exc
@@ -188,13 +187,11 @@ def value_account(
     for position in account.positions:
         price = resolved_prices[position.symbol]
         market_value = position_market_value(position, price)
-        unrealized_pnl = position_unrealized_pnl(position, price)
+        position_unrealized_pnl(position, price)
         valued_positions.append(
             replace(
                 position,
                 current_price=price,
-                market_value=market_value,
-                unrealized_pnl=unrealized_pnl,
             )
         )
         if position.side is PositionSide.LONG:
