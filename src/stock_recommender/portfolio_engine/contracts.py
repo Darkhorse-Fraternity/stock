@@ -371,6 +371,10 @@ class PositionSnapshot(_DeeplyImmutable):
     quantity: int
     average_cost: float
     current_price: float | None = None
+    peak_price: float | None = None
+    trough_price: float | None = None
+    trailing_active: bool = False
+    position_mode: str = "NORMAL"
 
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
@@ -379,6 +383,14 @@ class PositionSnapshot(_DeeplyImmutable):
         _require_positive_finite_number(self.average_cost, "average_cost")
         if self.current_price is not None:
             _require_positive_finite_number(self.current_price, "current_price")
+        if self.peak_price is not None:
+            _require_positive_finite_number(self.peak_price, "peak_price")
+        if self.trough_price is not None:
+            _require_positive_finite_number(self.trough_price, "trough_price")
+        if type(self.trailing_active) is not bool:
+            raise TypeError("trailing_active must be a bool")
+        if self.position_mode not in {"NORMAL", "COVER_ONLY"}:
+            raise ValueError(f"unsupported position_mode: {self.position_mode}")
 
     @property
     def market_value(self) -> float | None:
@@ -592,7 +604,16 @@ class ValuationResult(_DeeplyImmutable):
 
         if len(positions) != len(self.account.positions):
             raise ValueError("positions length does not match account.positions")
-        identity_fields = ("symbol", "side", "quantity", "average_cost")
+        identity_fields = (
+            "symbol",
+            "side",
+            "quantity",
+            "average_cost",
+            "peak_price",
+            "trough_price",
+            "trailing_active",
+            "position_mode",
+        )
         for index, (account_position, valued_position) in enumerate(
             zip(self.account.positions, positions, strict=True)
         ):
