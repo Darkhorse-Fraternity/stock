@@ -10,6 +10,7 @@ from .context import (
     enrich_recommendation_plan_with_ticks,
     extract_market_payload,
     generate_agent_context_from_plan,
+    portfolio_signal_payload,
     recommendation_context_payload,
 )
 from .llm import call_llm_analysis
@@ -141,6 +142,20 @@ def format_data_quality_funnel(data_quality: dict) -> str:
     )
 
 
+def format_portfolio_signal_facts(plan: RecommendationPlan) -> str:
+    signals = portfolio_signal_payload(plan)
+    if not signals:
+        return ""
+    lines = ["🧭 **组合模型信号**"]
+    for item in signals:
+        direction = "做多" if item["side"] == "LONG" else "做空"
+        lines.append(
+            f"- {direction} {item['symbol']} · 权重 {item['requested_weight_pct']:g}% "
+            f"· {item['model_id']}"
+        )
+    return "\n".join(lines)
+
+
 def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:
     current_strategy = strategy
     report_time = plan.generated_at
@@ -148,6 +163,7 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
     error = plan.fetch_error
     market_regime = plan.market_regime
     profile = market_profile(plan.market)
+    signal_facts = format_portfolio_signal_facts(plan)
 
     if not plan.selected_candidates:
         return decorate_strategy_output("\n".join(
@@ -158,6 +174,7 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
                 "",
                 format_data_quality_funnel(plan.data_quality),
                 "",
+                *([signal_facts, ""] if signal_facts else []),
                 "本次没有匹配股票，不新增持仓；既有持仓继续由退出 Pipeline 管理。",
                 f"数据状态：{error or market_regime['reason']}",
                 "",
@@ -181,6 +198,7 @@ def render_report(plan: RecommendationPlan, *, strategy: dict | None = None) -> 
         "",
         format_data_quality_funnel(plan.data_quality),
         "",
+        *([signal_facts, ""] if signal_facts else []),
     ]
 
     for index, stock in enumerate(top, 1):
@@ -251,6 +269,7 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
     profile = market_profile(plan.market)
     universe_label = "自选股池" if plan.universe_type == "watchlist" else f"{plan.board_name}板块"
     filter_label = f"（板块：{'、'.join(plan.sector_filters)}）" if plan.sector_filters else ""
+    signal_facts = format_portfolio_signal_facts(plan)
 
     report = [
         f"📋 **确定性策略入场计划** ({report_time.strftime('%Y 年%m月%d日')})",
@@ -260,6 +279,7 @@ def render_strategy_plan_report(plan: RecommendationPlan, *, strategy: dict | No
         format_data_quality_funnel(plan.data_quality),
         "",
         f"候选范围：{universe_label}{filter_label}",
+        *(["", signal_facts] if signal_facts else []),
     ]
     if not selected:
         report.extend(

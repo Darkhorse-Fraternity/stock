@@ -24,6 +24,7 @@ from .contracts import (
     OrderIntent,
     OrderSide,
     PortfolioEvent,
+    PortfolioLedgerView,
     PositionEffect,
     PositionRiskUpdate,
     PositionSettlementUpdate,
@@ -1332,7 +1333,9 @@ def _touch_position_after_fill(
         if held.side is PositionSide.SHORT and lifecycle is None:
             lifecycle = AccrualLifecycle(
                 id="borrow-" + hashlib.sha256(
-                    f"{account.id}|{intent.id}|{fill.snapshot_id}".encode("utf-8")
+                    f"borrow|{account.id}|{intent.id}|{fill.snapshot_id}".encode(
+                        "utf-8"
+                    )
                 ).hexdigest()[:24],
                 started_on=fill.occurred_at.date(),
             )
@@ -1349,7 +1352,9 @@ def _touch_position_after_fill(
     elif financing is None:
         financing = AccrualLifecycle(
             id="financing-" + hashlib.sha256(
-                f"{account.id}|{intent.id}|{fill.snapshot_id}".encode("utf-8")
+                f"financing|{account.id}|{intent.id}|{fill.snapshot_id}".encode(
+                    "utf-8"
+                )
             ).hexdigest()[:24],
             started_on=fill.occurred_at.date(),
         )
@@ -1903,6 +1908,50 @@ class JsonLedgerStore:
             except KeyError as exc:
                 raise KeyError(f"portfolio account not found: {strategy_id}") from exc
             return decode_account_snapshot(payload)
+
+    def load_view(self, strategy_id: str) -> PortfolioLedgerView:
+        """Return the strict typed service read model under one store lock."""
+
+        if type(strategy_id) is not str or not strategy_id:
+            raise ValueError("strategy_id must be a non-empty string")
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
+            store = _read_store(self.path)
+            try:
+                payload = _require_mapping(
+                    store["accounts"][strategy_id],
+                    "account",
+                )
+            except KeyError as exc:
+                raise KeyError(f"portfolio account not found: {strategy_id}") from exc
+            account = decode_account_snapshot(payload)
+            intents = tuple(
+                _intent_from_json(item)
+                for item in _require_list(payload["open_intents"], "account.open_intents")
+            )
+            open_ids = {item.id for item in intents}
+            progress = tuple(
+                item
+                for item in (
+                    _progress_from_json(raw)
+                    for raw in _require_list(
+                        payload["execution_progress"],
+                        "account.execution_progress",
+                    )
+                )
+                if item.intent_id in open_ids
+            )
+            events = tuple(
+                _event_from_json(item)
+                for item in _require_list(payload["events"], "account.events")[-100:]
+            )
+            return PortfolioLedgerView(
+                account=account,
+                open_intents=tuple(sorted(intents, key=lambda item: item.id)),
+                execution_progress=tuple(
+                    sorted(progress, key=lambda item: item.intent_id)
+                ),
+                recent_events=events,
+            )
 
     def list_accounts(self) -> tuple[AccountSnapshot, ...]:
         with _PROCESS_LOCK, transaction_guard((self.path,)):

@@ -11,7 +11,12 @@ from .delivery import should_deliver_report
 from .market_adapters import get_market_adapter
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
 from .markets import strategy_market
-from .portfolio import format_action_notifications, format_portfolio_summary, monitor_portfolio
+from .portfolio_runtime import (
+    format_portfolio_actions,
+    format_portfolio_snapshot,
+    open_portfolio_runtime,
+    process_portfolio_runtime,
+)
 from .reports import append_performance_link, render_ai_report_result, render_report_result
 from .runtime import assert_strategy_runnable
 from .schedule import (
@@ -21,6 +26,7 @@ from .schedule import (
 )
 from .tracking import save_daily_selection
 from .universe import normalize_sector_filters
+from .utils import beijing_now
 
 
 def _persist_scheduled_plan(
@@ -31,6 +37,7 @@ def _persist_scheduled_plan(
     state_path: str,
     history_path: str,
     portfolio_path: str,
+    portfolio_engine=None,
 ) -> None:
     if execution_kind != "scheduled":
         return
@@ -45,6 +52,7 @@ def _persist_scheduled_plan(
         ),
         history_path=history_path,
         portfolio_path=portfolio_path,
+        portfolio_engine=portfolio_engine,
     )
 
 
@@ -106,18 +114,50 @@ def main() -> None:
         sector_raw if sector_raw is not None else parameter_value(strategy, "sector_filters", [])
     )
     universe_options = {"watchlist": watchlist, "sector_filters": sector_filters}
+    portfolio_engine = None
+    portfolio_account = None
+    portfolio_enabled = bool(strategy.get("id")) and bool(
+        strategy.get("portfolio", {}).get("enabled", True)
+    )
+    if portfolio_enabled and mode in {"report", "ai", "track", "risk"}:
+        portfolio_engine, portfolio_account = open_portfolio_runtime(
+            strategy,
+            path=portfolio_path,
+            adapter=adapter,
+            occurred_at=beijing_now(),
+        )
     if mode == "track":
-        account, _, quote_error = monitor_portfolio(strategy, path=portfolio_path)
-        report = format_portfolio_summary(account, performance_url=performance_url, quote_error=quote_error)
+        batch, snapshot = process_portfolio_runtime(
+            strategy,
+            engine=portfolio_engine,
+            account=portfolio_account,
+            occurred_at=beijing_now(),
+        )
+        report = format_portfolio_snapshot(
+            strategy,
+            snapshot,
+            performance_url=performance_url,
+        )
     elif mode == "risk":
-        account, events, _ = monitor_portfolio(strategy, path=portfolio_path)
-        report = format_action_notifications(account, events, performance_url=performance_url) if events else ""
+        batch, _ = process_portfolio_runtime(
+            strategy,
+            engine=portfolio_engine,
+            account=portfolio_account,
+            occurred_at=beijing_now(),
+        )
+        report = format_portfolio_actions(
+            strategy,
+            batch,
+            performance_url=performance_url,
+        )
     elif mode == "data":
         report = generate_agent_context(
             board_code=board_code,
             board_name=board_name,
             candidate_limit=int(os.getenv("STOCK_AGENT_CANDIDATE_LIMIT", "8")),
             strategy=strategy,
+            portfolio_engine=portfolio_engine,
+            portfolio_account=portfolio_account,
             **universe_options,
         )
     elif mode == "ai":
@@ -139,6 +179,7 @@ def main() -> None:
             state_path=state_path,
             history_path=history_path,
             portfolio_path=portfolio_path,
+            portfolio_engine=portfolio_engine,
         )
         configured_llm_timeout = int(
             os.getenv("STOCK_AGENT_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_SECONDS))
@@ -168,6 +209,8 @@ def main() -> None:
             candidate_limit=top_n,
             selection_limit=top_n,
             strategy=strategy,
+            portfolio_engine=portfolio_engine,
+            portfolio_account=portfolio_account,
             **universe_options,
         )
         _persist_scheduled_plan(
@@ -177,6 +220,7 @@ def main() -> None:
             state_path=state_path,
             history_path=history_path,
             portfolio_path=portfolio_path,
+            portfolio_engine=portfolio_engine,
         )
         recommendation = render_report_result(plan, strategy=strategy)
         report = recommendation.report

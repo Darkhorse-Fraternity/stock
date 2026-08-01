@@ -7,13 +7,16 @@ import re
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME
 from .enrichment import enrich_candidates
 from .market_adapters import get_market_adapter
 from .markets import CN_MARKET, market_profile, order_session_date, strategy_market
 from .parameters import chase_risk_threshold, load_strategy_config, parameter_value
+from .portfolio_engine import PlanRequest, PortfolioEngine
+from .portfolio_engine.borrow import BorrowSnapshot
+from .portfolio_engine.contracts import AccountSnapshot, MarketSnapshot, SignalCandidate
 from .recommendation import RecommendationPlan, build_recommendation_plan
 from .selection import analyze_candidates, attach_ignition_signals, filter_candidates, missing_required_parameter_data, price_position
 from .universe import normalize_sector_filters
@@ -355,6 +358,11 @@ def collect_recommendation_plan(
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
     universe_provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
+    portfolio_engine: PortfolioEngine | None = None,
+    portfolio_account: AccountSnapshot | None = None,
+    portfolio_market: MarketSnapshot | None = None,
+    portfolio_borrow: BorrowSnapshot | None = None,
+    portfolio_event_calendar: Mapping[str, int | None] | None = None,
 ) -> RecommendationPlan:
     current = strategy if strategy is not None else load_strategy_config()
     market = strategy_market(current)
@@ -398,6 +406,43 @@ def collect_recommendation_plan(
         selection_limit=selection_limit,
         market=market,
     )
+    portfolio_inputs = (portfolio_market, portfolio_borrow)
+    if portfolio_engine is None:
+        if portfolio_account is not None or any(
+            item is not None for item in portfolio_inputs
+        ):
+            raise ValueError("portfolio inputs require portfolio_engine")
+    else:
+        if portfolio_account is None:
+            raise ValueError("portfolio_engine requires an account snapshot")
+        if all(item is None for item in portfolio_inputs):
+            request = portfolio_engine.prepare_plan_request(
+                run_key=(
+                    f"recommendation:{current['id']}:"
+                    f"{collection.generated_at.isoformat()}"
+                ),
+                strategy=current,
+                account=portfolio_account,
+                analyzed_rows=collection.analyses,
+                occurred_at=collection.generated_at,
+            )
+        elif any(item is None for item in portfolio_inputs):
+            raise ValueError(
+                "portfolio market and borrow snapshots must be supplied together"
+            )
+        else:
+            request = PlanRequest(
+                run_key=(
+                    f"recommendation:{current['id']}:{portfolio_market.id}"
+                ),
+                strategy=current,
+                account=portfolio_account,
+                analyzed_rows=collection.analyses,
+                market=portfolio_market,
+                borrow=portfolio_borrow,
+                event_calendar=portfolio_event_calendar or {},
+            )
+        plan = replace(plan, portfolio_decision=portfolio_engine.evaluate(request))
     return plan
 
 
@@ -438,6 +483,7 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
         "market_regime": deepcopy(plan.market_regime),
         "signal_contract": deepcopy(plan.signal_contract),
         "portfolio_candidates": [str(item.get("symbol")) for item in plan.selected_candidates],
+        "portfolio_signals": portfolio_signal_payload(plan),
         "candidates": [
             {
                 "symbol": item["symbol"],
@@ -491,6 +537,39 @@ def recommendation_context_payload(plan: RecommendationPlan) -> dict:
             for item in plan.candidates
         ],
     }
+
+
+def portfolio_signal_payload(plan: RecommendationPlan) -> list[dict]:
+    """Expose signed model facts without reconstructing them from report text."""
+
+    if plan.portfolio_decision is None:
+        return []
+    signals: list[dict] = []
+    for output in plan.portfolio_decision.stage_outputs:
+        if output.stage not in {"long_signal", "short_signal"}:
+            continue
+        for fact in output.facts:
+            if fact.get("kind") != output.stage:
+                continue
+            items = fact.get("items", ())
+            if not isinstance(items, (tuple, list)):
+                raise TypeError("portfolio signal fact items must be a sequence")
+            for item in items:
+                if type(item) is not SignalCandidate:
+                    raise TypeError(
+                        "portfolio signal fact items must be SignalCandidate"
+                    )
+                signals.append(
+                    {
+                        "symbol": item.symbol,
+                        "side": item.side.value,
+                        "score": item.score,
+                        "requested_weight_pct": item.requested_weight_pct,
+                        "model_id": item.model_id,
+                        "thesis_id": item.thesis_id,
+                    }
+                )
+    return signals
 
 
 def generate_agent_context_from_plan(plan: RecommendationPlan, *, strategy: dict | None = None) -> str:

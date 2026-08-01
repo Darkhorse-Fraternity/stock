@@ -396,23 +396,22 @@ class StrategyPortfolioTests(unittest.TestCase):
             ["candidate_normalization", "market_regime", "portfolio_capacity", "risk_admission"],
         )
 
-    def test_daily_recommendation_is_committed_to_strategy_portfolio(self):
+    def test_daily_recommendation_without_decision_does_not_regenerate_portfolio(self):
         plan = make_recommendation_plan(
             [{"symbol": "600001", "name": "测试股票", "price": 10.0, "percent": 1.0, "score": 0.8}],
             now=self.t0,
         )
-        symbols = save_daily_selection(
-            Path(self.temp_dir.name) / "daily.json",
-            plan,
-            strategy=self.strategy,
-            now=self.t0,
-            portfolio_path=self.path,
-        )
+        with self.assertRaisesRegex(ValueError, "portfolio_decision"):
+            save_daily_selection(
+                Path(self.temp_dir.name) / "daily.json",
+                plan,
+                strategy=self.strategy,
+                now=self.t0,
+                portfolio_path=self.path,
+            )
         account = load_portfolio_account("tech-ai", path=self.path)
 
-        self.assertEqual(symbols, ["600001"])
-        self.assertEqual(account["orders"][0]["symbol"], "600001")
-        self.assertEqual(account["last_pipeline_trace"][-1]["stage"], "risk_admission")
+        self.assertIsNone(account)
 
 
 if __name__ == "__main__":

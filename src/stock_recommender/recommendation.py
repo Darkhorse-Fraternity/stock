@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Iterable, Mapping
 
 from .market_regime import evaluate_market_regime, filter_absolute_momentum
+from .portfolio_engine.contracts import DecisionBatch
 from .selection import select_agent_candidates
 from .signal_engine import signal_contract
 from .utils import number
@@ -36,6 +37,7 @@ class RecommendationPlan:
     candidates: tuple[dict, ...]
     selected_candidates: tuple[dict, ...]
     market: str = "cn"
+    portfolio_decision: DecisionBatch | None = None
 
     def __post_init__(self) -> None:
         candidate_symbols = tuple(str(item.get("symbol") or "") for item in self.candidates)
@@ -50,6 +52,8 @@ class RecommendationPlan:
             raise ValueError("recommendation plan requires an explicit market regime")
         if not isinstance(self.data_quality, dict) or self.data_quality.get("status") not in {"READY", "BLOCKED"}:
             raise ValueError("recommendation plan requires explicit data quality")
+        if self.portfolio_decision is not None and type(self.portfolio_decision) is not DecisionBatch:
+            raise TypeError("portfolio_decision must be DecisionBatch or None")
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +77,7 @@ def build_recommendation_plan(
     candidate_limit: int = 8,
     selection_limit: int = 3,
     market: str = "cn",
+    portfolio_decision: DecisionBatch | None = None,
 ) -> RecommendationPlan:
     analyzed = [deepcopy(dict(item)) for item in analyses]
     market_rows = (
@@ -125,6 +130,7 @@ def build_recommendation_plan(
         candidates=tuple(deepcopy(item) for item in candidates),
         selected_candidates=tuple(deepcopy(item) for item in selected),
         market=str(market),
+        portfolio_decision=portfolio_decision,
     )
 
 

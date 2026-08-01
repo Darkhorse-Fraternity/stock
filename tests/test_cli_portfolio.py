@@ -41,8 +41,29 @@ class PortfolioCliTests(unittest.TestCase):
                 "STOCK_AGENT_SCHEDULE_GUARD": "0",
             }
             stream = io.StringIO()
-            with patch.dict(os.environ, environment, clear=False), patch.object(cli, "load_strategy_config", return_value=self.strategy), patch.object(cli, "monitor_portfolio", return_value=(self.account, [], None)), redirect_stdout(stream):
+            report_text = "\n".join(
+                (
+                    "📊 **策略持仓每小时报告**",
+                    "策略：科技 AI · v4",
+                    "https://stock.example.com/strategies/tech-ai/portfolio",
+                )
+            )
+            with patch.dict(os.environ, environment, clear=False), patch.object(
+                cli, "load_strategy_config", return_value=self.strategy
+            ), patch.object(
+                cli,
+                "open_portfolio_runtime",
+                return_value=("engine", "account"),
+            ), patch.object(
+                cli,
+                "process_portfolio_runtime",
+                return_value=("batch", "snapshot"),
+            ) as process, patch.object(
+                cli, "format_portfolio_snapshot", return_value=report_text
+            ), redirect_stdout(stream):
                 cli.main()
+
+            process.assert_called_once()
 
             report = output.read_text(encoding="utf-8")
         self.assertIn("策略持仓每小时报告", report)
@@ -57,10 +78,23 @@ class PortfolioCliTests(unittest.TestCase):
             "STOCK_AGENT_SCHEDULE_GUARD": "0",
         }
         stream = io.StringIO()
-        with patch.dict(os.environ, environment, clear=False), patch.object(cli, "load_strategy_config", return_value=self.strategy), patch.object(cli, "monitor_portfolio", return_value=(self.account, [], None)), redirect_stdout(stream):
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            cli, "load_strategy_config", return_value=self.strategy
+        ), patch.object(
+            cli,
+            "open_portfolio_runtime",
+            return_value=("engine", "account"),
+        ), patch.object(
+            cli,
+            "process_portfolio_runtime",
+            return_value=("batch", "snapshot"),
+        ) as process, patch.object(
+            cli, "format_portfolio_actions", return_value=""
+        ), redirect_stdout(stream):
             cli.main()
 
         self.assertEqual(stream.getvalue(), "")
+        process.assert_called_once()
 
 
 if __name__ == "__main__":

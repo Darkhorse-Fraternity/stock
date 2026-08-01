@@ -1638,7 +1638,7 @@ def _accrual_elapsed_days(
     elapsed = (as_of - start).days
     if elapsed < 0:
         raise ValueError("as_of must not precede the last carry accrual date")
-    return elapsed
+    return elapsed or None
 
 
 def _short_price(

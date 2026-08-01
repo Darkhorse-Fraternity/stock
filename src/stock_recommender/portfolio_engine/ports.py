@@ -13,6 +13,7 @@ from .contracts import (
     ExecutionFill,
     MarketSnapshot,
     OrderIntent,
+    PortfolioLedgerView,
 )
 
 
@@ -44,6 +45,8 @@ class LedgerStore(Protocol):
     def create_account(self, account: AccountSnapshot) -> AccountSnapshot: ...
 
     def load(self, strategy_id: str) -> AccountSnapshot: ...
+
+    def load_view(self, strategy_id: str) -> PortfolioLedgerView: ...
 
     def commit(self, batch: DecisionBatch) -> AccountSnapshot: ...
 

@@ -1381,6 +1381,217 @@ class DecisionBatch(_DeeplyImmutable):
         )
 
 
+def _require_finite_graph(value: object, field_name: str) -> None:
+    """Reject non-finite numbers anywhere in a plain immutable input graph."""
+
+    if type(value) in (int, float):
+        _require_finite_number(value, field_name)
+        return
+    if (
+        value is None
+        or type(value) in (bool, str, bytes, date, datetime)
+        or isinstance(value, Enum)
+    ):
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            _require_finite_graph(key, f"{field_name}.key")
+            _require_finite_graph(item, f"{field_name}[{key!r}]")
+        return
+    if isinstance(value, (tuple, list, set, frozenset)):
+        for index, item in enumerate(value):
+            _require_finite_graph(item, f"{field_name}[{index}]")
+
+
+def _require_v6_strategy_identity(
+    strategy: Mapping[str, Any],
+    account: AccountSnapshot,
+) -> None:
+    if type(strategy.get("version")) is not int or strategy.get("version") != 6:
+        raise ValueError("strategy.version must be strict schema v6")
+    _require_string(strategy.get("id"), "strategy.id")
+    revision = strategy.get("revision")
+    _require_integer(revision, "strategy.revision")
+    if revision < 1:  # type: ignore[operator]
+        raise ValueError("strategy.revision must be positive")
+    if strategy["id"] != account.strategy_id:
+        raise ValueError("strategy.id must match account.strategy_id")
+    if revision != account.strategy_revision:
+        raise ValueError("strategy.revision must match account.strategy_revision")
+    for section in ("exposure_policy", "margin_policy", "short_policy"):
+        if not isinstance(strategy.get(section), Mapping):
+            raise ValueError(f"strategy.{section} must be explicit in schema v6")
+
+
+def _freeze_analyzed_rows(
+    rows: object,
+    *,
+    market_name: str,
+) -> tuple[Mapping[str, Any], ...]:
+    items = _mapping_tuple(rows, "analyzed_rows")
+    frozen: list[Mapping[str, Any]] = []
+    for index, item in enumerate(items):
+        _require_finite_graph(item, f"analyzed_rows[{index}]")
+        row_market = item.get("market")
+        if row_market is not None and row_market != market_name:
+            raise ValueError("analyzed row market must match strategy market")
+        frozen.append(_deep_freeze(item))
+    return tuple(frozen)
+
+
+def _strategy_market_name(strategy: Mapping[str, Any]) -> str:
+    direct = strategy.get("market")
+    parameters = strategy.get("parameters")
+    nested = None
+    if isinstance(parameters, Mapping):
+        market_parameter = parameters.get("market")
+        if isinstance(market_parameter, Mapping):
+            nested = market_parameter.get("value")
+    values = [str(item).strip().lower() for item in (direct, nested) if item]
+    if not values or any(item not in {"cn", "us"} for item in values):
+        raise ValueError("strategy market must be explicitly cn or us")
+    if len(set(values)) != 1:
+        raise ValueError("strategy market identities conflict")
+    return values[0]
+
+
+def _freeze_event_calendar(
+    calendar: object,
+) -> Mapping[str, int | None]:
+    _require_mapping(calendar, "event_calendar")
+    frozen: dict[str, int | None] = {}
+    for symbol, sessions in calendar.items():  # type: ignore[union-attr]
+        _require_string(symbol, "event_calendar symbol")
+        if sessions is not None:
+            _require_integer(sessions, f"event_calendar[{symbol!r}]")
+            if sessions < 0:
+                raise ValueError("event calendar sessions must be nonnegative")
+        frozen[symbol] = sessions
+    return MappingProxyType(frozen)
+
+
+@dataclass(frozen=True)
+class PlanRequest(_DeeplyImmutable):
+    run_key: str
+    strategy: Mapping[str, Any]
+    account: AccountSnapshot
+    analyzed_rows: tuple[Mapping[str, Any], ...]
+    market: MarketSnapshot
+    borrow: Any
+    event_calendar: Mapping[str, int | None]
+
+    def __post_init__(self) -> None:
+        from .borrow import BorrowSnapshot
+
+        _require_string(self.run_key, "run_key")
+        _require_mapping(self.strategy, "strategy")
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        if type(self.market) is not MarketSnapshot:
+            raise TypeError("market must be MarketSnapshot")
+        if type(self.borrow) is not BorrowSnapshot:
+            raise TypeError("borrow must be BorrowSnapshot")
+        if not self.account.snapshot_id:
+            raise ValueError("account must have an explicit snapshot_id")
+        strategy = _deep_freeze(self.strategy)
+        _require_v6_strategy_identity(strategy, self.account)
+        market_name = _strategy_market_name(strategy)
+        _require_finite_graph(self.market.quotes, "market.quotes")
+        rows = _freeze_analyzed_rows(self.analyzed_rows, market_name=market_name)
+        calendar = _freeze_event_calendar(self.event_calendar)
+        object.__setattr__(self, "strategy", strategy)
+        object.__setattr__(self, "analyzed_rows", rows)
+        object.__setattr__(self, "event_calendar", calendar)
+
+    @property
+    def market_name(self) -> str:
+        return _strategy_market_name(self.strategy)
+
+
+@dataclass(frozen=True)
+class ProcessRequest(_DeeplyImmutable):
+    run_key: str
+    strategy: Mapping[str, Any]
+    account: AccountSnapshot
+    market: MarketSnapshot
+    borrow: Any
+
+    def __post_init__(self) -> None:
+        from .borrow import BorrowSnapshot
+
+        _require_string(self.run_key, "run_key")
+        _require_mapping(self.strategy, "strategy")
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        if type(self.market) is not MarketSnapshot:
+            raise TypeError("market must be MarketSnapshot")
+        if type(self.borrow) is not BorrowSnapshot:
+            raise TypeError("borrow must be BorrowSnapshot")
+        if not self.account.snapshot_id:
+            raise ValueError("account must have an explicit snapshot_id")
+        strategy = _deep_freeze(self.strategy)
+        _require_v6_strategy_identity(strategy, self.account)
+        _strategy_market_name(strategy)
+        _require_finite_graph(self.market.quotes, "market.quotes")
+        object.__setattr__(self, "strategy", strategy)
+
+    @property
+    def market_name(self) -> str:
+        return _strategy_market_name(self.strategy)
+
+
+@dataclass(frozen=True)
+class PortfolioSnapshot(_DeeplyImmutable):
+    account: AccountSnapshot
+    metrics: PortfolioMetrics
+    positions: tuple[PositionSnapshot, ...]
+    open_intents: tuple[OrderIntent, ...]
+    recent_events: tuple[PortfolioEvent, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        if type(self.metrics) is not PortfolioMetrics:
+            raise TypeError("metrics must be PortfolioMetrics")
+        positions = _typed_tuple(self.positions, PositionSnapshot, "positions")
+        intents = _typed_tuple(self.open_intents, OrderIntent, "open_intents")
+        events = _typed_tuple(self.recent_events, PortfolioEvent, "recent_events")
+        if tuple(item.symbol for item in positions) != tuple(
+            item.symbol for item in self.account.positions
+        ):
+            raise ValueError("portfolio positions must match the account position order")
+        object.__setattr__(self, "positions", positions)
+        object.__setattr__(self, "open_intents", intents)
+        object.__setattr__(self, "recent_events", events)
+
+
+@dataclass(frozen=True)
+class PortfolioLedgerView(_DeeplyImmutable):
+    """Typed read model for service workflows; never exposes persisted JSON."""
+
+    account: AccountSnapshot
+    open_intents: tuple[OrderIntent, ...] = ()
+    execution_progress: tuple[OrderExecutionProgress, ...] = ()
+    recent_events: tuple[PortfolioEvent, ...] = ()
+
+    def __post_init__(self) -> None:
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        intents = _typed_tuple(self.open_intents, OrderIntent, "open_intents")
+        progress = _typed_tuple(
+            self.execution_progress,
+            OrderExecutionProgress,
+            "execution_progress",
+        )
+        events = _typed_tuple(self.recent_events, PortfolioEvent, "recent_events")
+        intent_ids = {item.id for item in intents}
+        if any(item.intent_id not in intent_ids for item in progress):
+            raise ValueError("execution progress must refer to an open intent")
+        object.__setattr__(self, "open_intents", intents)
+        object.__setattr__(self, "execution_progress", progress)
+        object.__setattr__(self, "recent_events", events)
+
+
 _DEEPLY_IMMUTABLE_TYPES = (
     AccrualLifecycle,
     PositionSnapshot,
@@ -1399,4 +1610,8 @@ _DEEPLY_IMMUTABLE_TYPES = (
     OrderExecutionProgress,
     PortfolioEvent,
     DecisionBatch,
+    PlanRequest,
+    ProcessRequest,
+    PortfolioSnapshot,
+    PortfolioLedgerView,
 )
