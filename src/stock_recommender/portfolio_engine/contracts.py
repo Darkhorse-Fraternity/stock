@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
@@ -13,6 +14,7 @@ from ..pipeline import StageOutput
 
 SignalRow: TypeAlias = Mapping[str, Any]
 EventCalendar: TypeAlias = Mapping[str, int | None]
+_DEEPLY_IMMUTABLE_TYPES: tuple[type[Any], ...] = ()
 
 
 def normalize_cutoff_date(value: object) -> str | None:
@@ -113,10 +115,15 @@ def _deep_freeze_value(value: Any, active: set[int]) -> Any:
     if isinstance(value, Enum):
         _assert_deeply_immutable_enum_value(value)
         return value
-    if value is None or isinstance(
-        value,
-        (bool, int, float, str, bytes, date, datetime, _DeeplyImmutable),
-    ):
+    if value is None or type(value) in {
+        bool,
+        int,
+        float,
+        str,
+        bytes,
+        date,
+        datetime,
+    } or type(value) in _DEEPLY_IMMUTABLE_TYPES:
         return value
     if isinstance(value, (bytearray, memoryview)):
         try:
@@ -195,13 +202,101 @@ def _deep_thaw(value: Any) -> Any:
     return value
 
 
+def _require_string(value: object, field_name: str) -> None:
+    if type(value) is not str:
+        raise TypeError(f"{field_name} must be a string")
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+
+
+def _require_enum(value: object, enum_type: type[Enum], field_name: str) -> None:
+    if type(value) is not enum_type:
+        raise TypeError(f"{field_name} must be {enum_type.__name__}")
+
+
+def _require_finite_number(value: object, field_name: str) -> None:
+    if type(value) not in (int, float):
+        raise TypeError(f"{field_name} must be an int or float")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be finite") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name} must be finite")
+
+
+def _require_integer(value: object, field_name: str) -> None:
+    if type(value) is not int:
+        raise TypeError(f"{field_name} must be an integer")
+
+
+def _require_datetime(value: object, field_name: str) -> None:
+    if type(value) is not datetime:
+        raise TypeError(f"{field_name} must be a datetime")
+
+
+def _require_mapping(value: object, field_name: str) -> None:
+    if not isinstance(value, Mapping):
+        raise TypeError(f"{field_name} must be a mapping")
+
+
+def _typed_tuple(
+    value: object,
+    item_type: type[Any],
+    field_name: str,
+) -> tuple[Any, ...]:
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        raise TypeError(f"{field_name} must be an iterable of {item_type.__name__}")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(
+            f"{field_name} must be an iterable of {item_type.__name__}"
+        ) from exc
+    for item in items:
+        if type(item) is not item_type:
+            raise TypeError(
+                f"{field_name} items must be {item_type.__name__}, got "
+                f"{type(item).__name__}"
+            )
+    return items
+
+
+def _mapping_tuple(value: object, field_name: str) -> tuple[Mapping[str, Any], ...]:
+    if isinstance(value, (str, bytes, bytearray, Mapping)):
+        raise TypeError(f"{field_name} must be an iterable of mappings")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be an iterable of mappings") from exc
+    for item in items:
+        if not isinstance(item, Mapping):
+            raise TypeError(
+                f"{field_name} items must be mappings, got {type(item).__name__}"
+            )
+    return items
+
+
 def _freeze_stage_output(output: StageOutput) -> StageOutput:
+    if type(output) is not StageOutput:
+        raise TypeError(
+            "stage_outputs items must be StageOutput, got "
+            f"{type(output).__name__}"
+        )
+    _require_string(output.stage, "stage_output.stage")
+    _require_string(output.component_version, "stage_output.component_version")
+    _require_integer(output.schema_version, "stage_output.schema_version")
+    facts = _mapping_tuple(output.facts, "stage_output.facts")
+    diagnostics = _mapping_tuple(
+        output.diagnostics,
+        "stage_output.diagnostics",
+    )
     return StageOutput(
         stage=output.stage,
         component_version=output.component_version,
         schema_version=output.schema_version,
-        facts=tuple(_deep_freeze(item) for item in output.facts),
-        diagnostics=tuple(_deep_freeze(item) for item in output.diagnostics),
+        facts=tuple(_deep_freeze(item) for item in facts),
+        diagnostics=tuple(_deep_freeze(item) for item in diagnostics),
     )
 
 
@@ -226,6 +321,16 @@ class SignalCandidate(_DeeplyImmutable):
     facts: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.side, PositionSide, "side")
+        _require_finite_number(self.score, "score")
+        _require_finite_number(
+            self.requested_weight_pct,
+            "requested_weight_pct",
+        )
+        _require_string(self.model_id, "model_id")
+        _require_string(self.thesis_id, "thesis_id")
+        _require_mapping(self.facts, "facts")
         object.__setattr__(self, "facts", _deep_freeze(self.facts))
 
 
@@ -238,9 +343,17 @@ class TargetPosition(_DeeplyImmutable):
     model_id: str
     thesis_id: str
 
+    def __post_init__(self) -> None:
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.side, PositionSide, "side")
+        _require_finite_number(self.target_weight_pct, "target_weight_pct")
+        _require_finite_number(self.signal_score, "signal_score")
+        _require_string(self.model_id, "model_id")
+        _require_string(self.thesis_id, "thesis_id")
+
 
 def _require_positive_quantity(quantity: int) -> None:
-    if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity <= 0:
+    if type(quantity) is not int or quantity <= 0:
         raise ValueError("quantity must be a positive integer")
 
 
@@ -256,7 +369,14 @@ class OrderIntent(_DeeplyImmutable):
     created_snapshot_id: str
 
     def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.position_side, PositionSide, "position_side")
+        _require_enum(self.order_side, OrderSide, "order_side")
+        _require_enum(self.position_effect, PositionEffect, "position_effect")
         _require_positive_quantity(self.quantity)
+        _require_string(self.reason, "reason")
+        _require_string(self.created_snapshot_id, "created_snapshot_id")
 
     @property
     def increases_risk(self) -> bool:
@@ -273,6 +393,9 @@ class MarketSnapshot(_DeeplyImmutable):
     quotes: Mapping[str, Mapping[str, Any]]
 
     def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_datetime(self.occurred_at, "occurred_at")
+        _require_mapping(self.quotes, "quotes")
         object.__setattr__(self, "quotes", _deep_freeze(self.quotes))
 
 
@@ -286,7 +409,12 @@ class ExecutionFill(_DeeplyImmutable):
     status: str
 
     def __post_init__(self) -> None:
+        _require_string(self.intent_id, "intent_id")
+        _require_string(self.symbol, "symbol")
         _require_positive_quantity(self.quantity)
+        _require_finite_number(self.price, "price")
+        _require_finite_number(self.fees, "fees")
+        _require_string(self.status, "status")
 
 
 @dataclass(frozen=True)
@@ -297,6 +425,10 @@ class PortfolioEvent(_DeeplyImmutable):
     data: Mapping[str, Any]
 
     def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_string(self.type, "type")
+        _require_datetime(self.occurred_at, "occurred_at")
+        _require_mapping(self.data, "data")
         object.__setattr__(self, "data", _deep_freeze(self.data))
 
 
@@ -314,15 +446,32 @@ class DecisionBatch(_DeeplyImmutable):
     stage_outputs: tuple[StageOutput, ...] = ()
 
     def __post_init__(self) -> None:
+        _require_string(self.run_key, "run_key")
+        _require_string(self.strategy_id, "strategy_id")
+        _require_integer(self.strategy_revision, "strategy_revision")
+        _require_string(self.portfolio_snapshot_id, "portfolio_snapshot_id")
+        _require_string(self.market_snapshot_id, "market_snapshot_id")
+        intents = _typed_tuple(self.intents, OrderIntent, "intents")
+        fills = _typed_tuple(self.fills, ExecutionFill, "fills")
+        events = _typed_tuple(self.events, PortfolioEvent, "events")
+        diagnostics = _mapping_tuple(self.diagnostics, "diagnostics")
+        stage_outputs = _typed_tuple(
+            self.stage_outputs,
+            StageOutput,
+            "stage_outputs",
+        )
+        object.__setattr__(self, "intents", intents)
+        object.__setattr__(self, "fills", fills)
+        object.__setattr__(self, "events", events)
         object.__setattr__(
             self,
             "diagnostics",
-            tuple(_deep_freeze(item) for item in self.diagnostics),
+            tuple(_deep_freeze(item) for item in diagnostics),
         )
         object.__setattr__(
             self,
             "stage_outputs",
-            tuple(_freeze_stage_output(item) for item in self.stage_outputs),
+            tuple(_freeze_stage_output(item) for item in stage_outputs),
         )
 
     @property
@@ -332,3 +481,14 @@ class DecisionBatch(_DeeplyImmutable):
             for item in self.diagnostics
             if item.get("code")
         )
+
+
+_DEEPLY_IMMUTABLE_TYPES = (
+    SignalCandidate,
+    TargetPosition,
+    OrderIntent,
+    MarketSnapshot,
+    ExecutionFill,
+    PortfolioEvent,
+    DecisionBatch,
+)

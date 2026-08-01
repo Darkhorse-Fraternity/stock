@@ -52,6 +52,8 @@ class ExposureDiagnostic:
                 raise ValueError(f"{field_name} must be a finite number") from exc
             if not math.isfinite(value):
                 raise ValueError(f"{field_name} must be a finite number")
+            if value == 0.0:
+                value = 0.0
             object.__setattr__(self, field_name, value)
         for field_name in (
             "gross_exposure_pct",
@@ -111,7 +113,7 @@ def _finite_nonnegative(value: object, field_name: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number < 0:
         raise ValueError(f"{field_name} must be a finite nonnegative number")
-    return number
+    return 0.0 if number == 0.0 else number
 
 
 def _effective_limits(policy: ExposurePolicy) -> _Limits:
@@ -214,12 +216,14 @@ def _adjustment(
     original_weight: float,
     adjusted_weight: float,
 ) -> dict[str, object]:
+    original = float(original_weight)
+    adjusted = float(adjusted_weight)
     return {
         "symbol": item.symbol,
         "side": item.side.value,
         "reason": reason,
-        "original_weight_pct": float(original_weight),
-        "adjusted_weight_pct": float(adjusted_weight),
+        "original_weight_pct": 0.0 if original == 0.0 else original,
+        "adjusted_weight_pct": 0.0 if adjusted == 0.0 else adjusted,
     }
 
 

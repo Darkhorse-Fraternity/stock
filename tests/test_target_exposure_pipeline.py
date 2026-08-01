@@ -384,10 +384,6 @@ class ExposureAllocationTests(unittest.TestCase):
             target("GOOD", weight=4),
             target("ZERO", weight=0),
             target("NEGATIVE", weight=-1),
-            target("NAN_WEIGHT", weight=math.nan),
-            target("INF_WEIGHT", weight=math.inf),
-            target("NAN_SCORE", score=math.nan),
-            target("INF_SCORE", score=math.inf),
         )
 
         admitted, diagnostic = allocate_exposure(raw, policy())
@@ -395,7 +391,7 @@ class ExposureAllocationTests(unittest.TestCase):
         self.assertEqual([item.symbol for item in admitted], ["GOOD"])
         self.assertEqual(
             [item["reason"] for item in diagnostic.rejections],
-            ["INVALID_TARGET"] * 6,
+            ["INVALID_TARGET"] * 2,
         )
         for value in (
             diagnostic.gross_exposure_pct,
@@ -409,14 +405,25 @@ class ExposureAllocationTests(unittest.TestCase):
                 if isinstance(value, float):
                     self.assertTrue(math.isfinite(value))
 
-    def test_overflowing_target_numbers_are_safely_rejected(self):
-        admitted, diagnostic = allocate_exposure(
-            (target("HUGE", weight=10**10000),),
-            policy(),
-        )
+        for field_name in ("target_weight_pct", "signal_score"):
+            for value in (math.nan, math.inf, -math.inf):
+                values = {
+                    "symbol": "BAD",
+                    "side": PositionSide.LONG,
+                    "target_weight_pct": 1.0,
+                    "signal_score": 0.9,
+                    "model_id": "model-v1",
+                    "thesis_id": "thesis-bad",
+                }
+                values[field_name] = value
+                with self.subTest(field=field_name, value=value), self.assertRaises(
+                    ValueError
+                ):
+                    TargetPosition(**values)
 
-        self.assertEqual(admitted, ())
-        self.assertEqual(diagnostic.rejections[0]["reason"], "INVALID_TARGET")
+    def test_overflowing_target_numbers_are_safely_rejected(self):
+        with self.assertRaises(ValueError):
+            target("HUGE", weight=10**10000)
 
     def test_zero_position_limit_returns_empty_with_clear_diagnostics(self):
         admitted, diagnostic = allocate_exposure(
@@ -525,6 +532,50 @@ class ExposureAllocationTests(unittest.TestCase):
                     {"reason": "INVALID", "value": MutableEnum.VALUE},
                 )
             )
+
+    def test_diagnostic_normalizes_negative_zero_metrics(self):
+        diagnostic = ExposureDiagnostic(
+            gross_exposure_pct=-0.0,
+            net_exposure_pct=-0.0,
+            long_exposure_pct=-0.0,
+            short_exposure_pct=-0.0,
+        )
+
+        for value in (
+            diagnostic.gross_exposure_pct,
+            diagnostic.net_exposure_pct,
+            diagnostic.long_exposure_pct,
+            diagnostic.short_exposure_pct,
+        ):
+            self.assertEqual(math.copysign(1.0, value), 1.0)
+
+    def test_negative_zero_policy_caps_emit_only_positive_zero(self):
+        admitted, diagnostic = allocate_exposure(
+            (target("LONG", weight=5.0),),
+            ExposurePolicy(
+                mode="LONG_SHORT",
+                max_long_position_pct=-0.0,
+                max_net_exposure_pct=-0.0,
+            ),
+        )
+
+        self.assertEqual(admitted, ())
+        cap = next(
+            item
+            for item in diagnostic.rejections
+            if item["reason"] == "POSITION_CAP"
+        )
+        self.assertEqual(
+            math.copysign(1.0, cap["adjusted_weight_pct"]),
+            1.0,
+        )
+        for value in (
+            diagnostic.gross_exposure_pct,
+            diagnostic.net_exposure_pct,
+            diagnostic.long_exposure_pct,
+            diagnostic.short_exposure_pct,
+        ):
+            self.assertEqual(math.copysign(1.0, value), 1.0)
 
 
 class TargetExposureStageTests(unittest.TestCase):
@@ -851,6 +902,225 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             diagnostic.rejections[0]["nested"],
             DeepImmutableEnum.VALUE,
         )
+
+    def test_target_position_rejects_wrong_scalar_and_enum_types(self):
+        values = {
+            "symbol": "AAPL",
+            "side": PositionSide.LONG,
+            "target_weight_pct": 10.0,
+            "signal_score": 0.9,
+            "model_id": "model-v1",
+            "thesis_id": "thesis-1",
+        }
+        for field_name, invalid in (
+            ("symbol", []),
+            ("side", "LONG"),
+            ("target_weight_pct", []),
+            ("signal_score", []),
+            ("model_id", []),
+            ("thesis_id", []),
+        ):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
+                TargetPosition(**{**values, field_name: invalid})
+
+    def test_signal_candidate_rejects_wrong_scalar_enum_and_mapping_types(self):
+        values = {
+            "symbol": "AAPL",
+            "side": PositionSide.LONG,
+            "score": 0.9,
+            "requested_weight_pct": 10.0,
+            "model_id": "model-v1",
+            "thesis_id": "thesis-1",
+            "facts": {},
+        }
+        for field_name, invalid in (
+            ("symbol", []),
+            ("side", "LONG"),
+            ("score", []),
+            ("requested_weight_pct", []),
+            ("model_id", []),
+            ("thesis_id", []),
+            ("facts", []),
+        ):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
+                SignalCandidate(**{**values, field_name: invalid})
+        for field_name in ("score", "requested_weight_pct"):
+            for invalid in (math.nan, math.inf, -math.inf):
+                with self.subTest(
+                    field=field_name, value=invalid
+                ), self.assertRaises(ValueError):
+                    SignalCandidate(**{**values, field_name: invalid})
+
+    def test_order_intent_rejects_wrong_field_types(self):
+        values = {
+            "id": "intent-1",
+            "symbol": "AAPL",
+            "position_side": PositionSide.LONG,
+            "order_side": OrderSide.BUY,
+            "position_effect": PositionEffect.OPEN,
+            "quantity": 1,
+            "reason": "target",
+            "created_snapshot_id": "market-1",
+        }
+        for field_name, invalid in (
+            ("id", []),
+            ("symbol", []),
+            ("position_side", "LONG"),
+            ("order_side", "BUY"),
+            ("position_effect", "OPEN"),
+            ("quantity", True),
+            ("reason", []),
+            ("created_snapshot_id", []),
+        ):
+            error = ValueError if field_name == "quantity" else TypeError
+            with self.subTest(field=field_name), self.assertRaises(error):
+                OrderIntent(**{**values, field_name: invalid})
+
+    def test_market_snapshot_rejects_wrong_field_types(self):
+        values = {
+            "id": "market-1",
+            "occurred_at": datetime.now(timezone.utc),
+            "quotes": {},
+        }
+        for field_name, invalid in (
+            ("id", []),
+            ("occurred_at", "2026-08-01"),
+            ("quotes", []),
+        ):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
+                MarketSnapshot(**{**values, field_name: invalid})
+
+    def test_execution_fill_rejects_wrong_or_nonfinite_fields(self):
+        values = {
+            "intent_id": "intent-1",
+            "symbol": "AAPL",
+            "quantity": 1,
+            "price": 100.0,
+            "fees": 1.0,
+            "status": "FILLED",
+        }
+        for field_name, invalid in (
+            ("intent_id", []),
+            ("symbol", []),
+            ("quantity", True),
+            ("price", []),
+            ("fees", []),
+            ("status", []),
+        ):
+            error = ValueError if field_name == "quantity" else TypeError
+            with self.subTest(field=field_name), self.assertRaises(error):
+                ExecutionFill(**{**values, field_name: invalid})
+        for field_name in ("price", "fees"):
+            for invalid in (math.nan, math.inf, -math.inf):
+                with self.subTest(
+                    field=field_name, value=invalid
+                ), self.assertRaises(ValueError):
+                    ExecutionFill(**{**values, field_name: invalid})
+
+    def test_portfolio_event_rejects_wrong_field_types(self):
+        values = {
+            "id": "event-1",
+            "type": "FILL",
+            "occurred_at": datetime.now(timezone.utc),
+            "data": {},
+        }
+        for field_name, invalid in (
+            ("id", []),
+            ("type", []),
+            ("occurred_at", "2026-08-01"),
+            ("data", []),
+        ):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
+                PortfolioEvent(**{**values, field_name: invalid})
+
+    def test_decision_batch_copies_external_sequences_before_identity_deepcopy(self):
+        now = datetime.now(timezone.utc)
+        intent = OrderIntent(
+            id="intent-1",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=1,
+            reason="target",
+            created_snapshot_id="market-1",
+        )
+        fill = ExecutionFill(
+            intent_id="intent-1",
+            symbol="AAPL",
+            quantity=1,
+            price=100.0,
+            fees=1.0,
+            status="FILLED",
+        )
+        event = PortfolioEvent(
+            id="event-1",
+            type="FILL",
+            occurred_at=now,
+            data={},
+        )
+        diagnostic = {"code": "SAFE", "items": [1]}
+        stage_fact = {"kind": "test", "items": [1]}
+        output = StageOutput(
+            stage="test",
+            component_version="1",
+            facts=(stage_fact,),
+        )
+        intents = [intent]
+        fills = [fill]
+        events = [event]
+        diagnostics = [diagnostic]
+        stage_outputs = [output]
+
+        decision = DecisionBatch(
+            run_key="run-1",
+            strategy_id="strategy-1",
+            strategy_revision=1,
+            portfolio_snapshot_id="portfolio-1",
+            market_snapshot_id="market-1",
+            intents=intents,
+            fills=fills,
+            events=events,
+            diagnostics=diagnostics,
+            stage_outputs=stage_outputs,
+        )
+        intents.clear()
+        fills.clear()
+        events.clear()
+        diagnostics.clear()
+        stage_outputs.clear()
+        diagnostic["items"].append(2)
+        stage_fact["items"].append(2)
+
+        self.assertEqual(decision.intents, (intent,))
+        self.assertEqual(decision.fills, (fill,))
+        self.assertEqual(decision.events, (event,))
+        self.assertEqual(decision.diagnostics[0]["items"], (1,))
+        self.assertEqual(decision.stage_outputs[0].facts[0]["items"], (1,))
+        self.assertIs(deepcopy(decision), decision)
+
+    def test_decision_batch_rejects_wrong_scalar_and_collection_items(self):
+        values = {
+            "run_key": "run-1",
+            "strategy_id": "strategy-1",
+            "strategy_revision": 1,
+            "portfolio_snapshot_id": "portfolio-1",
+            "market_snapshot_id": "market-1",
+        }
+        for field_name, invalid in (
+            ("run_key", []),
+            ("strategy_id", []),
+            ("strategy_revision", True),
+            ("portfolio_snapshot_id", []),
+            ("market_snapshot_id", []),
+            ("intents", ["bad"]),
+            ("fills", ["bad"]),
+            ("events", ["bad"]),
+            ("diagnostics", ["bad"]),
+            ("stage_outputs", ["bad"]),
+        ):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
+                DecisionBatch(**{**values, field_name: invalid})
 
 
 if __name__ == "__main__":
