@@ -643,6 +643,7 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
         "fills": [],
         "execution_progress": [],
         "risk_facts": [],
+        "revision_transitions": [],
         "events": [],
         "committed_batches": committed_batches,
     }

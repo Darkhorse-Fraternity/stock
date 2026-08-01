@@ -25,6 +25,7 @@ from .contracts import (
     OrderSide,
     PortfolioEvent,
     PortfolioLedgerView,
+    RevisionTransition,
     PositionEffect,
     PositionRiskUpdate,
     PositionSettlementUpdate,
@@ -62,6 +63,7 @@ _ACCOUNT_FIELDS = _ACCOUNT_SNAPSHOT_FIELDS | frozenset(
         "fills",
         "execution_progress",
         "risk_facts",
+        "revision_transitions",
         "events",
         "committed_batches",
     }
@@ -76,6 +78,18 @@ _RISK_FACT_FIELDS = frozenset(
         "market_snapshot_id",
         "occurred_at",
         "update",
+    }
+)
+_REVISION_TRANSITION_FIELDS = frozenset(
+    {
+        "transition_id",
+        "strategy_id",
+        "from_revision",
+        "to_revision",
+        "source_snapshot_id",
+        "result_snapshot_id",
+        "occurred_at",
+        "cancelled_intent_ids",
     }
 )
 
@@ -106,6 +120,18 @@ class _RiskFact:
     market_snapshot_id: str
     occurred_at: datetime
     update: PositionRiskUpdate
+
+
+@dataclass(frozen=True)
+class _RevisionTransitionFact:
+    transition_id: str
+    strategy_id: str
+    from_revision: int
+    to_revision: int
+    source_snapshot_id: str
+    result_snapshot_id: str
+    occurred_at: datetime
+    cancelled_intent_ids: tuple[str, ...]
 
 
 def _require_mapping(value: object, label: str) -> Mapping[str, Any]:
@@ -591,6 +617,119 @@ def _risk_fact_from_json(value: object) -> _RiskFact:
     return fact
 
 
+def _revision_transition_result_snapshot_id(
+    transition: RevisionTransition,
+    cancelled_intent_ids: tuple[str, ...],
+) -> str:
+    material = json.dumps(
+        {
+            "transition_id": transition.id,
+            "strategy_id": transition.strategy_id,
+            "from_revision": transition.from_revision,
+            "to_revision": transition.to_revision,
+            "source_snapshot_id": transition.expected_snapshot_id,
+            "occurred_at": transition.occurred_at.isoformat(),
+            "cancelled_intent_ids": list(cancelled_intent_ids),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "revision-snapshot-" + hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+def _revision_transition_fact_to_json(
+    fact: _RevisionTransitionFact,
+) -> dict[str, Any]:
+    return {
+        "transition_id": fact.transition_id,
+        "strategy_id": fact.strategy_id,
+        "from_revision": fact.from_revision,
+        "to_revision": fact.to_revision,
+        "source_snapshot_id": fact.source_snapshot_id,
+        "result_snapshot_id": fact.result_snapshot_id,
+        "occurred_at": fact.occurred_at.isoformat(),
+        "cancelled_intent_ids": list(fact.cancelled_intent_ids),
+    }
+
+
+def _revision_transition_fact_from_json(
+    value: object,
+) -> _RevisionTransitionFact:
+    item = _require_mapping(value, "revision transition fact")
+    _require_keys(
+        item,
+        _REVISION_TRANSITION_FIELDS,
+        "revision transition fact",
+    )
+    cancelled = _require_list(
+        item["cancelled_intent_ids"],
+        "revision transition cancelled_intent_ids",
+    )
+    if any(type(intent_id) is not str or not intent_id for intent_id in cancelled):
+        raise LedgerSchemaError(
+            "revision transition cancelled intent IDs must be non-empty strings"
+        )
+    if cancelled != sorted(cancelled) or len(set(cancelled)) != len(cancelled):
+        raise LedgerSchemaError(
+            "revision transition cancelled intent IDs must be unique and sorted"
+        )
+    try:
+        request = RevisionTransition(
+            id=item["transition_id"],
+            strategy_id=item["strategy_id"],
+            expected_snapshot_id=item["source_snapshot_id"],
+            from_revision=item["from_revision"],
+            to_revision=item["to_revision"],
+            occurred_at=_iso_datetime(
+                item["occurred_at"],
+                "revision transition occurred_at",
+            ),
+        )
+        result_snapshot_id = item["result_snapshot_id"]
+        if type(result_snapshot_id) is not str or not result_snapshot_id:
+            raise LedgerSchemaError(
+                "revision transition result_snapshot_id must be non-empty"
+            )
+        cancelled_ids = tuple(cancelled)
+        if result_snapshot_id != _revision_transition_result_snapshot_id(
+            request,
+            cancelled_ids,
+        ):
+            raise LedgerSchemaError(
+                "revision transition result snapshot does not match canonical content"
+            )
+        return _RevisionTransitionFact(
+            transition_id=request.id,
+            strategy_id=request.strategy_id,
+            from_revision=request.from_revision,
+            to_revision=request.to_revision,
+            source_snapshot_id=request.expected_snapshot_id,
+            result_snapshot_id=result_snapshot_id,
+            occurred_at=request.occurred_at,
+            cancelled_intent_ids=cancelled_ids,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, LedgerSchemaError):
+            raise
+        raise LedgerSchemaError("invalid revision transition fact") from exc
+
+
+def _transition_matches_request(
+    fact: _RevisionTransitionFact,
+    transition: RevisionTransition,
+) -> bool:
+    return (
+        fact.transition_id == transition.id
+        and fact.strategy_id == transition.strategy_id
+        and fact.from_revision == transition.from_revision
+        and fact.to_revision == transition.to_revision
+        and fact.source_snapshot_id == transition.expected_snapshot_id
+    )
+
+
 def _progress_fill_to_json(fill: ExecutionProgressFill) -> dict[str, Any]:
     return {
         "id": fill.id,
@@ -806,6 +945,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             "fills",
             "execution_progress",
             "risk_facts",
+            "revision_transitions",
             "events",
             "committed_batches",
         ):
@@ -865,6 +1005,48 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 _validate_event(event)
             except LedgerError as exc:
                 raise LedgerSchemaError(f"invalid persisted event: {exc}") from exc
+        revision_transitions = [
+            _revision_transition_fact_from_json(raw)
+            for raw in item["revision_transitions"]
+        ]
+        transition_ids = [fact.transition_id for fact in revision_transitions]
+        if len(set(transition_ids)) != len(transition_ids):
+            raise LedgerSchemaError(
+                "account.revision_transitions contains duplicate IDs"
+            )
+        for previous, current in zip(
+            revision_transitions,
+            revision_transitions[1:],
+        ):
+            if current.from_revision != previous.to_revision:
+                raise LedgerSchemaError(
+                    "revision transition facts must form one revision chain"
+                )
+        if revision_transitions:
+            if revision_transitions[-1].to_revision != decoded.strategy_revision:
+                raise LedgerSchemaError(
+                    "account revision does not match transition fact chain"
+                )
+            if any(
+                fact.strategy_id != strategy_id for fact in revision_transitions
+            ):
+                raise LedgerSchemaError(
+                    "revision transition strategy differs from account"
+                )
+        transition_events = [
+            event for event in events if event.type == "REVISION_TRANSITIONED"
+        ]
+        if len(transition_events) != len(revision_transitions) or any(
+            event != _derived_revision_transition_event(fact)
+            for event, fact in zip(
+                transition_events,
+                revision_transitions,
+                strict=True,
+            )
+        ):
+            raise LedgerSchemaError(
+                "persisted revision transition events and facts must be one-to-one"
+            )
         risk_facts = [_risk_fact_from_json(raw) for raw in item["risk_facts"]]
         risk_fact_ids = [fact.fact_id for fact in risk_facts]
         if len(set(risk_fact_ids)) != len(risk_fact_ids):
@@ -1707,6 +1889,41 @@ def _validate_event(event: PortfolioEvent) -> None:
             raise LedgerError("ACCOUNT_OPENED strategy_revision must be an integer")
         _require_event_number(event, "available_cash")
         return
+    if event.type == "REVISION_TRANSITIONED":
+        _require_event_fields(
+            event,
+            frozenset(
+                {
+                    "transition_id",
+                    "strategy_id",
+                    "from_revision",
+                    "to_revision",
+                    "source_snapshot_id",
+                    "result_snapshot_id",
+                    "cancelled_intent_ids",
+                }
+            ),
+        )
+        for field_name in (
+            "transition_id",
+            "strategy_id",
+            "source_snapshot_id",
+            "result_snapshot_id",
+        ):
+            _require_event_string(event, field_name)
+        for field_name in ("from_revision", "to_revision"):
+            if type(event.data[field_name]) is not int:
+                raise LedgerError(
+                    f"REVISION_TRANSITIONED {field_name} must be an integer"
+                )
+        cancelled = event.data["cancelled_intent_ids"]
+        if type(cancelled) not in {tuple, list} or any(
+            type(item) is not str or not item for item in cancelled
+        ):
+            raise LedgerError(
+                "REVISION_TRANSITIONED cancelled_intent_ids must be strings"
+            )
+        return
     if event.type in {"ORDER_FILLED", "ORDER_PARTIAL"}:
         _validate_fill_event(event)
         return
@@ -1774,6 +1991,26 @@ def _derived_risk_event(fact: _RiskFact) -> PortfolioEvent:
             "trough_price": fact.update.trough_price,
             "trailing_active": fact.update.trailing_active,
             "position_mode": fact.update.position_mode,
+        },
+    )
+
+
+def _derived_revision_transition_event(
+    fact: _RevisionTransitionFact,
+) -> PortfolioEvent:
+    return PortfolioEvent(
+        id="revision-transition-event-"
+        + hashlib.sha256(fact.transition_id.encode("utf-8")).hexdigest()[:24],
+        type="REVISION_TRANSITIONED",
+        occurred_at=fact.occurred_at,
+        data={
+            "transition_id": fact.transition_id,
+            "strategy_id": fact.strategy_id,
+            "from_revision": fact.from_revision,
+            "to_revision": fact.to_revision,
+            "source_snapshot_id": fact.source_snapshot_id,
+            "result_snapshot_id": fact.result_snapshot_id,
+            "cancelled_intent_ids": fact.cancelled_intent_ids,
         },
     )
 
@@ -1883,6 +2120,7 @@ class JsonLedgerStore:
             "fills": [],
             "execution_progress": [],
             "risk_facts": [],
+            "revision_transitions": [],
             "events": [_event_to_json(opened)],
             "committed_batches": [],
         }
@@ -1903,6 +2141,120 @@ class JsonLedgerStore:
             validate_ledger_payload(next_store)
             _atomic_write(self.path, next_store)
             return account
+
+    def transition_revision(
+        self,
+        transition: RevisionTransition,
+    ) -> AccountSnapshot:
+        """Atomically advance one account revision and cancel all old intents."""
+
+        if type(transition) is not RevisionTransition:
+            raise TypeError("transition must be RevisionTransition")
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
+            store = _read_store(self.path)
+            try:
+                persisted = _require_mapping(
+                    store["accounts"][transition.strategy_id],
+                    "account",
+                )
+            except KeyError as exc:
+                raise KeyError(
+                    f"portfolio account not found: {transition.strategy_id}"
+                ) from exc
+            account = decode_account_snapshot(persisted)
+            raw_facts = _require_list(
+                persisted["revision_transitions"],
+                "account.revision_transitions",
+            )
+            facts = tuple(
+                _revision_transition_fact_from_json(raw) for raw in raw_facts
+            )
+            existing = next(
+                (
+                    fact
+                    for fact in facts
+                    if fact.transition_id == transition.id
+                ),
+                None,
+            )
+            if existing is not None:
+                if not _transition_matches_request(existing, transition):
+                    raise LedgerError(
+                        "revision transition ID collision with different content"
+                    )
+                if account.strategy_revision != existing.to_revision:
+                    raise LedgerError(
+                        "revision transition is historical, not the current account state"
+                    )
+                return account
+            if account.strategy_id != transition.strategy_id:
+                raise LedgerError("revision transition strategy differs from account")
+            if account.strategy_revision != transition.from_revision:
+                raise StalePortfolioSnapshotError(
+                    "revision transition source revision is stale"
+                )
+            if account.snapshot_id != transition.expected_snapshot_id:
+                raise StalePortfolioSnapshotError(
+                    "revision transition source snapshot is stale"
+                )
+            open_intents = tuple(
+                _intent_from_json(raw)
+                for raw in _require_list(
+                    persisted["open_intents"],
+                    "account.open_intents",
+                )
+            )
+            cancelled_intent_ids = tuple(
+                sorted(intent.id for intent in open_intents)
+            )
+            result_snapshot_id = _revision_transition_result_snapshot_id(
+                transition,
+                cancelled_intent_ids,
+            )
+            fact = _RevisionTransitionFact(
+                transition_id=transition.id,
+                strategy_id=transition.strategy_id,
+                from_revision=transition.from_revision,
+                to_revision=transition.to_revision,
+                source_snapshot_id=transition.expected_snapshot_id,
+                result_snapshot_id=result_snapshot_id,
+                occurred_at=transition.occurred_at,
+                cancelled_intent_ids=cancelled_intent_ids,
+            )
+            transitioned = replace(
+                account,
+                strategy_revision=transition.to_revision,
+                occurred_at=max(account.occurred_at, transition.occurred_at),
+                snapshot_id=result_snapshot_id,
+            )
+            existing_events = tuple(
+                _event_from_json(raw)
+                for raw in _require_list(persisted["events"], "account.events")
+            )
+            transitioned, events = _apply_events(
+                transitioned,
+                existing_events,
+                (_derived_revision_transition_event(fact),),
+            )
+            raw_account = {
+                **dict(persisted),
+                **encode_account_snapshot(transitioned),
+                "portfolio_snapshot_id": result_snapshot_id,
+                "open_intents": [],
+                "revision_transitions": [
+                    *raw_facts,
+                    _revision_transition_fact_to_json(fact),
+                ],
+                "events": [_event_to_json(event) for event in events],
+            }
+            next_store = {
+                "version": LEDGER_SCHEMA_VERSION,
+                "accounts": dict(store["accounts"]),
+            }
+            next_store["accounts"][transition.strategy_id] = raw_account
+            validate_ledger_payload(next_store)
+            _atomic_write(self.path, next_store)
+            return transitioned
 
     def load(self, strategy_id: str) -> AccountSnapshot:
         if type(strategy_id) is not str or not strategy_id:
@@ -2106,6 +2458,12 @@ class JsonLedgerStore:
                     *_require_list(persisted["risk_facts"], "account.risk_facts"),
                     *(_risk_fact_to_json(fact) for fact in new_risk_facts),
                 ],
+                "revision_transitions": list(
+                    _require_list(
+                        persisted["revision_transitions"],
+                        "account.revision_transitions",
+                    )
+                ),
                 "events": [_event_to_json(item) for item in merged_events],
                 "committed_batches": [
                     *committed,

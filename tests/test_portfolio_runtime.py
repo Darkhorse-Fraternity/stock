@@ -6,6 +6,17 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from stock_recommender.parameters import default_strategy_config
+from stock_recommender.portfolio_engine.contracts import (
+    AccrualLifecycle,
+    AccountSnapshot,
+    DecisionBatch,
+    OrderIntent,
+    OrderSide,
+    PositionEffect,
+    PositionSide,
+    PositionSnapshot,
+)
+from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
 from stock_recommender.portfolio_runtime import (
     EmptyEventCalendarProvider,
     FailClosedBorrowProvider,
@@ -164,6 +175,146 @@ class PortfolioRuntimeTests(unittest.TestCase):
         self.assertIn("持仓：0/7", report)
         self.assertIn("当前空仓", report)
         self.assertIn("https://stock.example/runtime-us", report)
+
+    def test_runtime_atomically_transitions_revision_and_cancels_old_intents(self):
+        adapter = Adapter()
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            engine, original = open_portfolio_runtime(
+                strategy(),
+                path=path,
+                adapter=adapter,
+                occurred_at=NOW,
+            )
+            old_intent = OrderIntent(
+                id="runtime-old-revision-intent",
+                symbol="AAPL",
+                position_side=PositionSide.LONG,
+                order_side=OrderSide.BUY,
+                position_effect=PositionEffect.OPEN,
+                quantity=1,
+                reason="OLD_REVISION",
+                created_snapshot_id="old-market",
+                created_market_at=NOW - timedelta(minutes=1),
+            )
+            committed = engine.commit(
+                DecisionBatch(
+                    run_key="runtime-r2-plan",
+                    strategy_id="runtime-us",
+                    strategy_revision=2,
+                    portfolio_snapshot_id=original.snapshot_id,
+                    market_snapshot_id="old-market",
+                    intents=(old_intent,),
+                )
+            )
+            revised = {**strategy(), "revision": 3}
+            _, transitioned = open_portfolio_runtime(
+                revised,
+                path=path,
+                adapter=adapter,
+                occurred_at=NOW + timedelta(minutes=1),
+            )
+
+            self.assertEqual(transitioned.strategy_revision, 3)
+            self.assertNotEqual(transitioned.snapshot_id, committed.snapshot_id)
+            self.assertEqual(transitioned.available_cash, committed.available_cash)
+            view = JsonLedgerStore(path).load_view("runtime-us")
+            self.assertEqual(view.open_intents, ())
+            self.assertEqual(view.execution_progress, ())
+            self.assertEqual(view.recent_events[-1].type, "REVISION_TRANSITIONED")
+            with self.assertRaisesRegex(ValueError, "newer|downgrade"):
+                open_portfolio_runtime(
+                    strategy(),
+                    path=path,
+                    adapter=adapter,
+                    occurred_at=NOW + timedelta(minutes=2),
+                )
+
+    def test_leveraged_revision_can_transition_to_long_only_and_keep_processing(self):
+        adapter = Adapter(
+            [
+                {
+                    "symbol": "AAPL",
+                    "price": 100.0,
+                    "open": 100.0,
+                    "high": 100.0,
+                    "low": 100.0,
+                    "volume": 1_000_000,
+                }
+            ]
+        )
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            store = JsonLedgerStore(path)
+            opened = store.create_account(
+                AccountSnapshot(
+                    id="account-runtime-us",
+                    strategy_id="runtime-us",
+                    strategy_revision=3,
+                    occurred_at=NOW,
+                    available_cash=0.0,
+                    margin_loan=200.0,
+                    financing_lifecycle=AccrualLifecycle(
+                        id="runtime-financing",
+                        started_on=NOW.date(),
+                    ),
+                    positions=(
+                        PositionSnapshot(
+                            symbol="AAPL",
+                            side=PositionSide.LONG,
+                            quantity=12,
+                            average_cost=100.0,
+                            current_price=100.0,
+                            sellable_quantity=12,
+                        ),
+                    ),
+                    snapshot_id="runtime-leveraged-r3",
+                )
+            )
+            old_increase = OrderIntent(
+                id="runtime-leveraged-old-increase",
+                symbol="AAPL",
+                position_side=PositionSide.LONG,
+                order_side=OrderSide.BUY,
+                position_effect=PositionEffect.INCREASE,
+                quantity=1,
+                reason="OLD_LEVERAGED_REVISION",
+                created_snapshot_id="runtime-old-market",
+                created_market_at=NOW,
+            )
+            store.commit(
+                DecisionBatch(
+                    run_key="runtime-leveraged-r3-plan",
+                    strategy_id="runtime-us",
+                    strategy_revision=3,
+                    portfolio_snapshot_id=opened.snapshot_id,
+                    market_snapshot_id="runtime-old-market",
+                    intents=(old_increase,),
+                )
+            )
+            revised = {**strategy(), "revision": 4}
+
+            engine, transitioned = open_portfolio_runtime(
+                revised,
+                path=path,
+                adapter=adapter,
+                occurred_at=NOW + timedelta(minutes=1),
+            )
+            batch, snapshot = process_portfolio_runtime(
+                revised,
+                engine=engine,
+                account=transitioned,
+                occurred_at=NOW + timedelta(minutes=2),
+            )
+            report = format_portfolio_snapshot(revised, snapshot)
+
+            self.assertEqual(transitioned.strategy_revision, 4)
+            self.assertEqual(transitioned.positions, opened.positions)
+            self.assertTrue(
+                all(fill.intent_id != old_increase.id for fill in batch.fills)
+            )
+            self.assertEqual(snapshot.account.strategy_revision, 4)
+            self.assertIn("AAPL", report)
 
 
 if __name__ == "__main__":

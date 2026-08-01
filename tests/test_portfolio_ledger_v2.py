@@ -13,6 +13,7 @@ from unittest.mock import patch
 from stock_recommender.pipeline import StageOutput
 from stock_recommender.portfolio_engine import atomic_io, execution
 from stock_recommender.portfolio_engine import ledger as ledger_module
+from stock_recommender.portfolio_engine import contracts as portfolio_contracts
 
 from stock_recommender.portfolio_engine.contracts import (
     AccrualLifecycle,
@@ -123,6 +124,28 @@ def create_account_from_process(path: str, result_queue: object) -> None:
         result_queue.put("OK")
 
 
+def transition_revision_from_process(
+    path: str,
+    expected_snapshot_id: str,
+    result_queue: object,
+) -> None:
+    try:
+        JsonLedgerStore(path).transition_revision(
+            portfolio_contracts.RevisionTransition(
+                id="multiprocess-r2-r3",
+                strategy_id="multiprocess-revision",
+                expected_snapshot_id=expected_snapshot_id,
+                from_revision=2,
+                to_revision=3,
+                occurred_at=NOW + timedelta(minutes=1),
+            )
+        )
+    except Exception as exc:
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("OK")
+
+
 class PortfolioLedgerV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
@@ -141,6 +164,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                             "fills": [],
                             "execution_progress": [],
                             "risk_facts": [],
+                            "revision_transitions": [],
                             "events": [],
                             "committed_batches": [],
                         }
@@ -149,6 +173,216 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def test_revision_transition_is_typed_atomic_idempotent_and_auditable(self):
+        path = self.path.parent / "revision-transition.json"
+        opened = AccountSnapshot(
+            id="account-revisioned",
+            strategy_id="revisioned",
+            strategy_revision=3,
+            occurred_at=NOW,
+            available_cash=900.0,
+            restricted_short_proceeds=100.0,
+            margin_loan=50.0,
+            positions=(
+                PositionSnapshot(
+                    symbol="S",
+                    side=PositionSide.SHORT,
+                    quantity=1,
+                    average_cost=100.0,
+                    current_price=100.0,
+                    borrow_lifecycle=AccrualLifecycle(
+                        id="borrow-s",
+                        started_on=NOW.date(),
+                    ),
+                ),
+            ),
+            financing_lifecycle=AccrualLifecycle(
+                id="financing-account-revisioned",
+                started_on=NOW.date(),
+            ),
+            snapshot_id="revision-snapshot-r3",
+        )
+        store = JsonLedgerStore(path)
+        store.create_account(opened)
+        old_intent = OrderIntent(
+            id="revision-old-increase",
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.INCREASE,
+            quantity=1,
+            reason="OLD_REVISION",
+            created_snapshot_id="old-market",
+            created_market_at=INTENT_CREATED_AT,
+        )
+        planned = store.commit(
+            DecisionBatch(
+                run_key="revision-r3-plan",
+                strategy_id="revisioned",
+                strategy_revision=3,
+                portfolio_snapshot_id=opened.snapshot_id,
+                market_snapshot_id="old-market",
+                intents=(old_intent,),
+            )
+        )
+        transition = portfolio_contracts.RevisionTransition(
+            id="revisioned-r3-r4",
+            strategy_id="revisioned",
+            expected_snapshot_id=planned.snapshot_id,
+            from_revision=3,
+            to_revision=4,
+            occurred_at=NOW + timedelta(minutes=1),
+        )
+
+        transitioned = store.transition_revision(transition)
+        repeated = store.transition_revision(transition)
+
+        self.assertEqual(repeated, transitioned)
+        self.assertEqual(transitioned.strategy_revision, 4)
+        self.assertNotEqual(transitioned.snapshot_id, planned.snapshot_id)
+        self.assertEqual(transitioned.available_cash, planned.available_cash)
+        self.assertEqual(
+            transitioned.restricted_short_proceeds,
+            planned.restricted_short_proceeds,
+        )
+        self.assertEqual(transitioned.positions, planned.positions)
+        self.assertEqual(transitioned.carry_accruals, planned.carry_accruals)
+        self.assertEqual(
+            transitioned.financing_lifecycle,
+            planned.financing_lifecycle,
+        )
+        view = store.load_view("revisioned")
+        self.assertEqual(view.open_intents, ())
+        self.assertEqual(view.execution_progress, ())
+        self.assertEqual(view.recent_events[-1].type, "REVISION_TRANSITIONED")
+        payload = json.loads(path.read_text(encoding="utf-8"))["accounts"][
+            "revisioned"
+        ]
+        self.assertEqual(len(payload["revision_transitions"]), 1)
+        self.assertEqual(
+            payload["revision_transitions"][0]["cancelled_intent_ids"],
+            [old_intent.id],
+        )
+        collision = replace(
+            transition,
+            expected_snapshot_id="different-source-snapshot",
+        )
+        with self.assertRaisesRegex(LedgerError, "collision|different"):
+            store.transition_revision(collision)
+
+    def test_revision_transition_rejects_downgrade_and_wrong_strategy(self):
+        transaction_type = portfolio_contracts.RevisionTransition
+        with self.assertRaisesRegex(ValueError, "increase|downgrade"):
+            transaction_type(
+                id="bad-downgrade",
+                strategy_id="strategy",
+                expected_snapshot_id="snapshot-0",
+                from_revision=3,
+                to_revision=2,
+                occurred_at=NOW,
+            )
+        store = JsonLedgerStore(self.path)
+        with self.assertRaisesRegex((KeyError, LedgerError), "other"):
+            store.transition_revision(
+                transaction_type(
+                    id="wrong-strategy",
+                    strategy_id="other",
+                    expected_snapshot_id="snapshot-0",
+                    from_revision=2,
+                    to_revision=3,
+                    occurred_at=NOW,
+                )
+            )
+
+    def test_revision_transition_is_multiprocess_safe_and_exactly_once(self):
+        path = self.path.parent / "multiprocess-revision.json"
+        opened = JsonLedgerStore(path).create_account(
+            AccountSnapshot(
+                id="account-multiprocess-revision",
+                strategy_id="multiprocess-revision",
+                strategy_revision=2,
+                occurred_at=NOW,
+                available_cash=10_000.0,
+                snapshot_id="multiprocess-revision-snapshot",
+            )
+        )
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=transition_revision_from_process,
+                args=(str(path), opened.snapshot_id, results),
+            )
+            for _ in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+
+        self.assertEqual(
+            sorted(results.get(timeout=2) for _ in processes),
+            ["OK", "OK"],
+        )
+        persisted = json.loads(path.read_text(encoding="utf-8"))["accounts"][
+            "multiprocess-revision"
+        ]
+        self.assertEqual(persisted["strategy_revision"], 3)
+        self.assertEqual(len(persisted["revision_transitions"]), 1)
+        self.assertEqual(
+            [
+                event["type"]
+                for event in persisted["events"]
+                if event["type"] == "REVISION_TRANSITIONED"
+            ],
+            ["REVISION_TRANSITIONED"],
+        )
+
+    def test_revision_transition_tampering_fails_closed(self):
+        path = self.path.parent / "tamper-revision.json"
+        store = JsonLedgerStore(path)
+        opened = store.create_account(
+            AccountSnapshot(
+                id="account-tamper-revision",
+                strategy_id="tamper-revision",
+                strategy_revision=2,
+                occurred_at=NOW,
+                available_cash=10_000.0,
+                snapshot_id="tamper-revision-snapshot",
+            )
+        )
+        store.transition_revision(
+            portfolio_contracts.RevisionTransition(
+                id="tamper-r2-r3",
+                strategy_id="tamper-revision",
+                expected_snapshot_id=opened.snapshot_id,
+                from_revision=2,
+                to_revision=3,
+                occurred_at=NOW + timedelta(minutes=1),
+            )
+        )
+        valid = json.loads(path.read_text(encoding="utf-8"))
+        mutations = (
+            lambda payload: payload["accounts"]["tamper-revision"][
+                "revision_transitions"
+            ][0].__setitem__("result_snapshot_id", "forged-snapshot"),
+            lambda payload: payload["accounts"]["tamper-revision"]["events"][-1][
+                "data"
+            ].__setitem__("to_revision", 4),
+        )
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                forged = json.loads(json.dumps(valid))
+                mutate(forged)
+                path.write_text(json.dumps(forged), encoding="utf-8")
+                before = path.read_bytes()
+                with self.assertRaises(LedgerSchemaError):
+                    store.load("tamper-revision")
+                self.assertEqual(path.read_bytes(), before)
 
     def _persist_two_risk_updates(self) -> tuple[Path, dict[str, object]]:
         path = self.path.parent / "risk-history.json"
@@ -473,6 +707,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             "fills",
             "execution_progress",
             "risk_facts",
+            "revision_transitions",
             "events",
             "committed_batches",
         )

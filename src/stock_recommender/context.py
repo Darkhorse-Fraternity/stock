@@ -633,6 +633,8 @@ def generate_agent_context(
     sector_filters: str | Iterable[object] | None = None,
     watchlist_fetcher: Callable | None = None,
     universe_provider: BoardUniverseProvider | Nasdaq100UniverseProvider | None = None,
+    portfolio_engine: PortfolioEngine | None = None,
+    portfolio_account: AccountSnapshot | None = None,
 ) -> str:
     current = strategy or load_strategy_config()
     selection_limit = int(current.get("validation", {}).get("top_n", 3))
@@ -652,6 +654,8 @@ def generate_agent_context(
         sector_filters=sector_filters,
         watchlist_fetcher=watchlist_fetcher,
         universe_provider=universe_provider,
+        portfolio_engine=portfolio_engine,
+        portfolio_account=portfolio_account,
     )
     if enable_tick:
         plan = enrich_recommendation_plan_with_ticks(

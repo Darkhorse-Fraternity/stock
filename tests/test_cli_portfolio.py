@@ -130,6 +130,27 @@ class PortfolioCliTests(unittest.TestCase):
         self.assertIs(save.call_args.args[1], plan)
         self.assertIs(save.call_args.kwargs["portfolio_engine"], engine)
 
+    def test_data_mode_opens_runtime_and_passes_engine_and_account(self):
+        environment = {
+            "STOCK_AGENT_MODE": "data",
+            "STOCK_AGENT_OUTPUT": "",
+            "STOCK_AGENT_SCHEDULE_GUARD": "0",
+        }
+        engine = object()
+        account = object()
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            cli, "load_strategy_config", return_value=self.strategy
+        ), patch.object(
+            cli, "open_portfolio_runtime", return_value=(engine, account)
+        ) as opened, patch.object(
+            cli, "generate_agent_context", return_value="context"
+        ) as generate, redirect_stdout(io.StringIO()):
+            cli.main()
+
+        opened.assert_called_once()
+        self.assertIs(generate.call_args.kwargs["portfolio_engine"], engine)
+        self.assertIs(generate.call_args.kwargs["portfolio_account"], account)
+
 
 if __name__ == "__main__":
     unittest.main()

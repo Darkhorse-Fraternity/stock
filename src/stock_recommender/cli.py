@@ -119,7 +119,7 @@ def main() -> None:
     portfolio_enabled = bool(strategy.get("id")) and bool(
         strategy.get("portfolio", {}).get("enabled", True)
     )
-    if portfolio_enabled and mode in {"report", "ai", "track", "risk"}:
+    if portfolio_enabled and mode in {"report", "ai", "track", "risk", "data"}:
         portfolio_engine, portfolio_account = open_portfolio_runtime(
             strategy,
             path=portfolio_path,

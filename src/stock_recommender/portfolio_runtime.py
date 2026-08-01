@@ -12,7 +12,12 @@ from typing import Any, Mapping
 from .markets import strategy_market
 from .portfolio_engine import PortfolioEngine, PortfolioSnapshot
 from .portfolio_engine.borrow import BorrowSnapshot
-from .portfolio_engine.contracts import AccountSnapshot, DecisionBatch, MarketSnapshot
+from .portfolio_engine.contracts import (
+    AccountSnapshot,
+    DecisionBatch,
+    MarketSnapshot,
+    RevisionTransition,
+)
 from .portfolio_engine.ledger import JsonLedgerStore
 from .us_data_providers import strategy_us_data_source
 
@@ -155,6 +160,9 @@ def open_portfolio_runtime(
     strategy_id = str(strategy.get("id") or "")
     if not strategy_id:
         raise ValueError("strategy.id is required for portfolio runtime")
+    revision = strategy.get("revision")
+    if type(revision) is not int or revision < 1:
+        raise ValueError("strategy.revision must be positive")
     ledger = JsonLedgerStore(path)
     try:
         account = ledger.load(strategy_id)
@@ -167,9 +175,6 @@ def open_portfolio_runtime(
         )
         if initial_cash is None or initial_cash <= 0:
             raise ValueError("strategy portfolio.initial_cash must be positive")
-        revision = strategy.get("revision")
-        if type(revision) is not int or revision < 1:
-            raise ValueError("strategy.revision must be positive")
         account = ledger.create_account(
             AccountSnapshot(
                 id=f"account-{strategy_id}",
@@ -178,6 +183,26 @@ def open_portfolio_runtime(
                 occurred_at=captured_at,
                 available_cash=initial_cash,
                 snapshot_id=f"bootstrap-{strategy_id}-r{revision}",
+            )
+        )
+    if account.strategy_revision > revision:
+        raise ValueError(
+            "ledger account uses a newer strategy revision; downgrade is forbidden"
+        )
+    if account.strategy_revision < revision:
+        source_revision = account.strategy_revision
+        transition_material = (
+            f"{strategy_id}|{account.snapshot_id}|{source_revision}|{revision}"
+        )
+        account = ledger.transition_revision(
+            RevisionTransition(
+                id="revision-transition-"
+                + hashlib.sha256(transition_material.encode("utf-8")).hexdigest()[:24],
+                strategy_id=strategy_id,
+                expected_snapshot_id=account.snapshot_id,
+                from_revision=source_revision,
+                to_revision=revision,
+                occurred_at=captured_at,
             )
         )
     engine = PortfolioEngine(

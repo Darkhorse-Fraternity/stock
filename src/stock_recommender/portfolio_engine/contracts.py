@@ -1484,6 +1484,34 @@ def _freeze_event_calendar(
 
 
 @dataclass(frozen=True)
+class RevisionTransition(_DeeplyImmutable):
+    """One explicit CAS transaction that advances a strategy revision."""
+
+    id: str
+    strategy_id: str
+    expected_snapshot_id: str
+    from_revision: int
+    to_revision: int
+    occurred_at: datetime
+
+    def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_string(self.strategy_id, "strategy_id")
+        _require_string(self.expected_snapshot_id, "expected_snapshot_id")
+        for value, field_name in (
+            (self.from_revision, "from_revision"),
+            (self.to_revision, "to_revision"),
+        ):
+            if type(value) is not int:
+                raise TypeError(f"{field_name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{field_name} must be positive")
+        if self.to_revision <= self.from_revision:
+            raise ValueError("revision transition must strictly increase; downgrade forbidden")
+        _require_datetime(self.occurred_at, "occurred_at")
+
+
+@dataclass(frozen=True)
 class PlanRequest(_DeeplyImmutable):
     run_key: str
     strategy: Mapping[str, Any]
@@ -1649,6 +1677,7 @@ _DEEPLY_IMMUTABLE_TYPES = (
     OrderExecutionProgress,
     PortfolioEvent,
     DecisionBatch,
+    RevisionTransition,
     PlanRequest,
     ProcessRequest,
     PortfolioSnapshot,
