@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
@@ -131,6 +132,40 @@ def parameter_applicable(parameter_id: object, market: object = CN_MARKET) -> bo
 def strategy_market(strategy: dict | None) -> str:
     state = (strategy or {}).get("parameters", {}).get("market", {})
     return normalize_market(state.get("value") if state.get("enabled", True) else CN_MARKET)
+
+
+def strict_strategy_market(strategy: Mapping[str, object]) -> str:
+    """Resolve one explicit strategy market without defaults or ambiguity."""
+
+    if not isinstance(strategy, Mapping):
+        raise TypeError("strategy must be a mapping")
+    values: list[str] = []
+    if "market" in strategy:
+        direct = strategy.get("market")
+        if type(direct) is not str or not direct.strip():
+            raise ValueError("strategy market must be explicitly cn or us")
+        values.append(direct.strip().casefold())
+
+    if "parameters" in strategy:
+        parameters = strategy.get("parameters")
+        if not isinstance(parameters, Mapping):
+            raise ValueError("strategy parameters must be a mapping")
+        if "market" in parameters:
+            market_parameter = parameters.get("market")
+            if not isinstance(market_parameter, Mapping):
+                raise ValueError("strategy parameters.market must be a mapping")
+            if "value" not in market_parameter:
+                raise ValueError("strategy parameters.market.value is required")
+            nested = market_parameter.get("value")
+            if type(nested) is not str or not nested.strip():
+                raise ValueError("strategy market must be explicitly cn or us")
+            values.append(nested.strip().casefold())
+
+    if not values or any(item not in MARKET_PROFILES for item in values):
+        raise ValueError("strategy market must be explicitly cn or us")
+    if len(set(values)) != 1:
+        raise ValueError("strategy market identities conflict")
+    return values[0]
 
 
 def strategy_universe(

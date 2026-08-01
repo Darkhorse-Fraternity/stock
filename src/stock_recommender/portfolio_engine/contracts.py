@@ -10,6 +10,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Mapping, TypeAlias
 
+from ..markets import strict_strategy_market
 from ..pipeline import StageOutput
 
 
@@ -1455,22 +1456,6 @@ def _freeze_analyzed_rows(
     return tuple(frozen)
 
 
-def _strategy_market_name(strategy: Mapping[str, Any]) -> str:
-    direct = strategy.get("market")
-    parameters = strategy.get("parameters")
-    nested = None
-    if isinstance(parameters, Mapping):
-        market_parameter = parameters.get("market")
-        if isinstance(market_parameter, Mapping):
-            nested = market_parameter.get("value")
-    values = [str(item).strip().lower() for item in (direct, nested) if item]
-    if not values or any(item not in {"cn", "us"} for item in values):
-        raise ValueError("strategy market must be explicitly cn or us")
-    if len(set(values)) != 1:
-        raise ValueError("strategy market identities conflict")
-    return values[0]
-
-
 def _freeze_event_calendar(
     calendar: object,
 ) -> Mapping[str, int | None]:
@@ -1540,7 +1525,7 @@ class PlanRequest(_DeeplyImmutable):
             raise ValueError("account must have an explicit snapshot_id")
         strategy = _deep_freeze(self.strategy)
         _require_v6_strategy_identity(strategy, self.account)
-        market_name = _strategy_market_name(strategy)
+        market_name = strict_strategy_market(strategy)
         _require_finite_graph(self.market.quotes, "market.quotes")
         rows = _freeze_analyzed_rows(self.analyzed_rows, market_name=market_name)
         calendar = _freeze_event_calendar(self.event_calendar)
@@ -1550,7 +1535,7 @@ class PlanRequest(_DeeplyImmutable):
 
     @property
     def market_name(self) -> str:
-        return _strategy_market_name(self.strategy)
+        return strict_strategy_market(self.strategy)
 
 
 @dataclass(frozen=True)
@@ -1582,14 +1567,14 @@ class ProcessRequest(_DeeplyImmutable):
             raise ValueError("account must have an explicit snapshot_id")
         strategy = _deep_freeze(self.strategy)
         _require_v6_strategy_identity(strategy, self.account)
-        _strategy_market_name(strategy)
+        strict_strategy_market(strategy)
         _require_finite_graph(self.market.quotes, "market.quotes")
         object.__setattr__(self, "strategy", strategy)
         object.__setattr__(self, "cost_multiplier", float(self.cost_multiplier))
 
     @property
     def market_name(self) -> str:
-        return _strategy_market_name(self.strategy)
+        return strict_strategy_market(self.strategy)
 
 
 @dataclass(frozen=True)

@@ -161,7 +161,13 @@ def high_apr_borrow_book() -> HistoricalBorrowBook:
     return HistoricalBorrowBook.from_raw(rows, history_complete=True)
 
 
-def replay(*, mode: str, multiplier: float, book: HistoricalBorrowBook):
+def replay(
+    *,
+    mode: str,
+    multiplier: float,
+    book: HistoricalBorrowBook,
+    strategy_value: dict | None = None,
+):
     registry = {
         "long-static-v1": StaticSignals(
             "long-static-v1", PositionSide.LONG, tuple(f"L{index}" for index in range(8))
@@ -171,7 +177,7 @@ def replay(*, mode: str, multiplier: float, book: HistoricalBorrowBook):
         ),
     }
     return replay_engine_frames(
-        strategy=long_short_strategy(),
+        strategy=strategy_value or long_short_strategy(),
         frames=frames(),
         borrow_book=book,
         signal_registry=registry,
@@ -314,6 +320,60 @@ def production_short_dataset(*, days: int = 100) -> dict:
 
 
 class LongShortBacktestTests(unittest.TestCase):
+    def test_top_level_us_market_uses_complete_us_borrow_history(self):
+        result = replay(
+            mode="backtest",
+            multiplier=1.0,
+            book=complete_borrow_book(),
+        )
+
+        self.assertFalse(result.metadata["borrow_cost_estimated"])
+        self.assertTrue(result.metadata["borrow_history_complete"])
+
+    def test_raw_high_apr_rejection_is_stable_across_cost_multipliers(self):
+        strategy_value = long_short_strategy()
+        strategy_value["short_policy"]["estimated_borrow_apr_pct"] = 5.0
+        results = tuple(
+            replay(
+                mode="backtest",
+                multiplier=multiplier,
+                book=high_apr_borrow_book(),
+                strategy_value=strategy_value,
+            )
+            for multiplier in (0.0, 1.0, 2.0)
+        )
+        baseline = results[1]
+
+        self.assertTrue(
+            any(
+                item[1] == "SHORT"
+                for frame in baseline.signal_fingerprints
+                for item in frame
+            )
+        )
+        for result in results:
+            self.assertFalse(result.metadata["borrow_cost_estimated"])
+            self.assertTrue(result.metadata["borrow_history_complete"])
+            self.assertEqual(result.signal_fingerprints, baseline.signal_fingerprints)
+            self.assertEqual(result.intent_fingerprints, baseline.intent_fingerprints)
+            self.assertEqual(result.fill_fingerprints, baseline.fill_fingerprints)
+            self.assertEqual(result.position_snapshots, baseline.position_snapshots)
+            self.assertFalse(
+                any(
+                    item[2] == "SHORT"
+                    for frame in result.intent_fingerprints
+                    for item in frame
+                )
+            )
+            self.assertFalse(
+                any(
+                    item[1] == "SHORT"
+                    for snapshot in result.position_snapshots
+                    for item in snapshot
+                )
+            )
+            self.assertEqual(result.metrics["borrow_cost"], 0.0)
+
     def test_production_walk_forward_opens_short_and_passes_data_gates(self):
         result = run_walk_forward_backtest(
             production_short_dataset(),

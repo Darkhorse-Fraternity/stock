@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+import stock_recommender.markets as markets
 from stock_recommender.context import (
     collect_recommendation_plan,
     enrich_recommendation_plan_with_ticks,
@@ -96,6 +97,42 @@ def signal_history(symbol: str) -> list[dict]:
 
 
 class UsMarketAdapterTests(unittest.TestCase):
+    def test_strict_strategy_market_accepts_direct_nested_and_consistent_identity(self):
+        self.assertTrue(hasattr(markets, "strict_strategy_market"))
+        resolve = markets.strict_strategy_market
+
+        self.assertEqual(resolve({"market": "us"}), "us")
+        self.assertEqual(
+            resolve({"parameters": {"market": {"value": "us"}}}),
+            "us",
+        )
+        self.assertEqual(
+            resolve(
+                {
+                    "market": "us",
+                    "parameters": {"market": {"value": "us"}},
+                }
+            ),
+            "us",
+        )
+
+    def test_strict_strategy_market_rejects_missing_conflicting_and_invalid_identity(self):
+        self.assertTrue(hasattr(markets, "strict_strategy_market"))
+        resolve = markets.strict_strategy_market
+
+        invalid = (
+            {},
+            {"market": "moon"},
+            {"market": ""},
+            {"market": "us", "parameters": {"market": {"value": "cn"}}},
+            {"parameters": None},
+            {"parameters": {"market": "us"}},
+            {"parameters": {"market": {"value": None}}},
+        )
+        for strategy in invalid:
+            with self.subTest(strategy=strategy), self.assertRaises(ValueError):
+                resolve(strategy)
+
     def test_registry_exposes_one_contract_for_both_markets(self):
         cn = get_market_adapter("cn")
         us = get_market_adapter("us")

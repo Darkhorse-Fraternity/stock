@@ -15,7 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from .market_regime import evaluate_market_regime, filter_absolute_momentum
-from .markets import market_date, market_profile, strategy_market
+from .markets import market_date, market_profile, strict_strategy_market
 from .portfolio_engine.borrow import AVAILABLE, BorrowSecurity, BorrowSnapshot
 from .portfolio_engine.contracts import (
     AccountSnapshot,
@@ -478,7 +478,7 @@ def replay_engine_frames(
                 estimated_borrow_apr_pct=number(
                     short_policy.get("estimated_borrow_apr_pct")
                 ),
-                market=strategy_market(replay_strategy),
+                market=strict_strategy_market(replay_strategy),
             )
             estimated_any = estimated_any or resolution.estimated
             history_complete = history_complete and resolution.history_complete
@@ -793,7 +793,7 @@ def replay_portfolio_fold(
         }
     multiplier = _finite_cost_multiplier(cost_multiplier)
     signal_strategy = _replay_strategy(strategy, 1.0)
-    profile = market_profile(strategy_market(signal_strategy))
+    profile = market_profile(strict_strategy_market(signal_strategy))
     date_index = {day: index for index, day in enumerate(all_dates)}
     snapshots = universe_snapshots or {}
     snapshot_days = tuple(snapshots)
