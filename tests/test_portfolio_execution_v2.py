@@ -715,6 +715,118 @@ class AccountExecutionTests(unittest.TestCase):
         self.assertEqual(second.fills[0].fees, 0.0)
         self.assertEqual(second.progress[0].commission_charged, 5.0)
 
+    def test_risk_full_close_resumes_for_long_and_short_across_many_partials(self):
+        policy = self._zero_cost_policy("us", participation=100.0)
+        for side in (PositionSide.LONG, PositionSide.SHORT):
+            with self.subTest(side=side):
+                original = account(
+                    cash=0.0,
+                    positions=(position("A", side, 10, 100.0),),
+                    restricted_short_proceeds=(
+                        1_000.0 if side is PositionSide.SHORT else 0.0
+                    ),
+                )
+                intent = risk_close(
+                    original.positions[0],
+                    snapshot_id="market-1",
+                    reason=(
+                        "LONG_STOP_LOSS"
+                        if side is PositionSide.LONG
+                        else "SHORT_STOP_LOSS"
+                    ),
+                )
+
+                current = original
+                progress = ()
+                observed_fills = []
+                for index, volume in enumerate((4, 2, 99), start=2):
+                    snapshot = self._market(
+                        f"market-{index}",
+                        NOW + timedelta(minutes=index * 5),
+                        "A",
+                        80.0,
+                        volume=volume,
+                    )
+                    result = execution.execute_intents(
+                        current,
+                        (intent,),
+                        snapshot,
+                        policy,
+                        prior_progress=progress,
+                    )
+                    self.assertEqual(result.diagnostics, ())
+                    observed_fills.append(result.fills[0].quantity)
+                    if index == 2:
+                        replay = execution.execute_intents(
+                            result.account,
+                            (intent,),
+                            snapshot,
+                            policy,
+                            prior_progress=result.progress,
+                        )
+                        self.assertEqual(replay.fills, ())
+                        self.assertEqual(
+                            replay.diagnostics[0].reason,
+                            "SAME_SNAPSHOT",
+                        )
+                        self.assertEqual(replay.account, result.account)
+                    current = result.account
+                    progress = result.progress
+
+                self.assertEqual(observed_fills, [4, 2, 4])
+                self.assertEqual(current.positions, ())
+                self.assertEqual(progress[0].filled_quantity, 10)
+                self.assertEqual(progress[0].status, "FILLED")
+
+    def test_tampered_partial_progress_cannot_relax_risk_intent_identity(self):
+        held = position("A", PositionSide.SHORT, 10, 100.0)
+        original = account(
+            cash=0.0,
+            positions=(held,),
+            restricted_short_proceeds=1_000.0,
+        )
+        intent = risk_close(
+            held,
+            snapshot_id="market-1",
+            reason="SHORT_STOP_LOSS",
+        )
+        policy = self._zero_cost_policy("us", participation=100.0)
+        first = execution.execute_intents(
+            original,
+            (intent,),
+            self._market(
+                "market-2",
+                NOW + timedelta(minutes=5),
+                "A",
+                80.0,
+                volume=4,
+            ),
+            policy,
+        )
+        progress = first.progress[0]
+        for label, updates in (
+            ("filled", {"filled_quantity": 3}),
+            ("intent_id", {"intent_id": "risk-forged"}),
+            ("symbol", {"symbol": "B"}),
+            ("direction", {"position_side": PositionSide.LONG}),
+            ("average_cost", {"position_average_cost": 101.0}),
+            ("overfill", {"filled_quantity": 11, "status": "FILLED"}),
+        ):
+            with self.subTest(label=label), self.assertRaises(ValueError):
+                execution.execute_intents(
+                    first.account,
+                    (intent,),
+                    self._market(
+                        "market-3",
+                        NOW + timedelta(minutes=10),
+                        "A",
+                        80.0,
+                        volume=6,
+                    ),
+                    policy,
+                    prior_progress=(replace(progress, **updates),),
+                )
+
     def test_forged_intent_is_locally_rejected_by_batch_execution(self):
         valid = execution.intent_for_delta(
             None, target("AAPL"), target_quantity=1, created_snapshot_id="market-1"
@@ -814,6 +926,9 @@ class AccountExecutionTests(unittest.TestCase):
     def test_execution_progress_is_contract_owned_and_decision_batch_safe(self):
         progress = execution.OrderExecutionProgress(
             intent_id="intent-1",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            last_snapshot_id="market-2",
             filled_quantity=1,
             filled_notional=100.0,
             commission_charged=0.0,

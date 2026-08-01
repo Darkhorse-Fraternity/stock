@@ -1007,19 +1007,31 @@ class ExecutionFill(_DeeplyImmutable):
 @dataclass(frozen=True)
 class OrderExecutionProgress(_DeeplyImmutable):
     intent_id: str
+    symbol: str
+    position_side: PositionSide
+    last_snapshot_id: str
     filled_quantity: int
     filled_notional: float
     commission_charged: float
     status: str
+    position_average_cost: float | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.intent_id, "intent_id")
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.position_side, PositionSide, "position_side")
+        _require_string(self.last_snapshot_id, "last_snapshot_id")
         _require_positive_quantity(self.filled_quantity)
         _require_nonnegative_finite_number(self.filled_notional, "filled_notional")
         _require_nonnegative_finite_number(
             self.commission_charged,
             "commission_charged",
         )
+        if self.position_average_cost is not None:
+            _require_positive_finite_number(
+                self.position_average_cost,
+                "position_average_cost",
+            )
         if self.status not in {"PARTIAL", "FILLED"}:
             raise ValueError("status must be PARTIAL or FILLED")
 

@@ -947,6 +947,34 @@ def _apply_position_sellability(
     return replace(after, positions=positions)
 
 
+def _account_for_position_projection(
+    account: AccountSnapshot,
+    intent: OrderIntent,
+    fill_quantity: int,
+) -> AccountSnapshot:
+    """Keep long sellability valid while a reduction projection changes quantity."""
+
+    if intent.position_side is not PositionSide.LONG or intent.increases_risk:
+        return account
+    held = next(
+        (item for item in account.positions if item.symbol == intent.symbol),
+        None,
+    )
+    if held is None or held.sellable_quantity is None:
+        return account
+    remaining = held.quantity - fill_quantity
+    if remaining <= 0 or held.sellable_quantity <= remaining:
+        return account
+    adjusted = replace(held, sellable_quantity=remaining)
+    return replace(
+        account,
+        positions=tuple(
+            adjusted if item.symbol == adjusted.symbol else item
+            for item in account.positions
+        ),
+    )
+
+
 def _fill_failure_reason(
     intent: OrderIntent,
     market: MarketSnapshot,
@@ -961,6 +989,62 @@ def _fill_failure_reason(
     if _quote_number(quote, "bar_volume", positive=True) is None:
         return "MARKET_DATA_INVALID"
     return "MARKET_DATA_INVALID"
+
+
+def _validate_prior_progress_binding(
+    intent: OrderIntent,
+    progress: OrderExecutionProgress,
+) -> None:
+    if progress.intent_id != intent.id:
+        raise ValueError("prior progress intent_id does not match intent")
+    if progress.symbol != intent.symbol:
+        raise ValueError("prior progress symbol does not match intent")
+    if progress.position_side is not intent.position_side:
+        raise ValueError("prior progress position side does not match intent")
+    if progress.filled_quantity > intent.quantity:
+        raise ValueError("prior progress exceeds intent quantity")
+    if progress.filled_quantity == intent.quantity:
+        if progress.status != "FILLED":
+            raise ValueError("completed prior progress must be FILLED")
+    elif progress.status != "PARTIAL":
+        raise ValueError("incomplete prior progress must be PARTIAL")
+
+
+def _identity_position_for_progress(
+    intent: OrderIntent,
+    current_position: PositionSnapshot | None,
+    progress: OrderExecutionProgress | None,
+) -> PositionSnapshot | None:
+    """Reconstruct the immutable risk identity without changing its remainder."""
+
+    if progress is None or not intent.id.startswith("risk-"):
+        return current_position
+    average_cost = progress.position_average_cost
+    if average_cost is None:
+        raise ValueError("risk prior progress is missing position average cost")
+    if current_position is None:
+        if (
+            progress.filled_quantity != intent.quantity
+            or progress.status != "FILLED"
+        ):
+            raise ValueError("risk prior progress has no remaining position")
+        return PositionSnapshot(
+            symbol=intent.symbol,
+            side=intent.position_side,
+            quantity=intent.quantity,
+            average_cost=average_cost,
+        )
+    if current_position.side is not intent.position_side:
+        raise ValueError("risk prior progress direction conflicts with position")
+    if current_position.average_cost != average_cost:
+        raise ValueError("risk prior progress average cost conflicts with position")
+    if current_position.quantity + progress.filled_quantity != intent.quantity:
+        raise ValueError("risk prior progress is inconsistent with remaining quantity")
+    return replace(
+        current_position,
+        quantity=intent.quantity,
+        average_cost=average_cost,
+    )
 
 
 def execute_intents(
@@ -996,12 +1080,25 @@ def execute_intents(
 
     current = _unlock_long_positions(account, market, policy)
     initial_by_symbol = {item.symbol: item for item in current.positions}
+    identity_position_by_id: dict[str, PositionSnapshot | None] = {}
+    valid_intent_ids: set[str] = set()
+    for item in resolved:
+        previous = progress_by_id.get(item.id)
+        if previous is not None:
+            _validate_prior_progress_binding(item, previous)
+        identity_position = _identity_position_for_progress(
+            item,
+            initial_by_symbol.get(item.symbol),
+            previous,
+        )
+        identity_position_by_id[item.id] = identity_position
+        if verify_intent_id(item, identity_position):
+            valid_intent_ids.add(item.id)
     closing_symbols = {
         item.symbol
         for item in resolved
         if item.position_effect is PositionEffect.CLOSE
-        and item.symbol in initial_by_symbol
-        and verify_intent_id(item, initial_by_symbol[item.symbol])
+        and item.id in valid_intent_ids
     }
     blocked_reversal_ids = {
         item.id
@@ -1011,7 +1108,7 @@ def execute_intents(
     fills: list[ExecutionFill] = []
     diagnostics: list[ExecutionDiagnostic] = []
     for original in resolved:
-        if not verify_intent_id(original, initial_by_symbol.get(original.symbol)):
+        if original.id not in valid_intent_ids:
             diagnostics.append(
                 ExecutionDiagnostic(
                     original.id,
@@ -1031,14 +1128,17 @@ def execute_intents(
             continue
         previous = progress_by_id.get(original.id)
         previously_filled = 0 if previous is None else previous.filled_quantity
-        if previously_filled > original.quantity:
-            raise ValueError("prior progress exceeds intent quantity")
         if previously_filled == original.quantity:
-            if previous is None or previous.status != "FILLED":
-                raise ValueError("completed prior progress must be FILLED")
             continue
-        if previous is not None and previous.status != "PARTIAL":
-            raise ValueError("incomplete prior progress must be PARTIAL")
+        if previous is not None and previous.last_snapshot_id == market.id:
+            diagnostics.append(
+                ExecutionDiagnostic(
+                    original.id,
+                    original.symbol,
+                    "SAME_SNAPSHOT",
+                )
+            )
+            continue
         remaining = original.quantity - previously_filled
         resume_effect = original.position_effect
         if previous is not None and resume_effect is PositionEffect.OPEN:
@@ -1095,9 +1195,14 @@ def execute_intents(
             quantity=fill.quantity,
         )
         before_fill = current
+        projection_account = _account_for_position_projection(
+            current,
+            applied_intent,
+            fill.quantity,
+        )
         try:
             current = project_account_for_intent(
-                current,
+                projection_account,
                 applied_intent,
                 {original.symbol: fill.price},
             )
@@ -1137,10 +1242,19 @@ def execute_intents(
         )
         progress_by_id[original.id] = OrderExecutionProgress(
             intent_id=original.id,
+            symbol=original.symbol,
+            position_side=original.position_side,
+            last_snapshot_id=market.id,
             filled_quantity=previously_filled + fill.quantity,
             filled_notional=cumulative_notional,
             commission_charged=float(cumulative_commission),
             status=fill.status,
+            position_average_cost=(
+                identity_position_by_id[original.id].average_cost
+                if original.id.startswith("risk-")
+                and identity_position_by_id[original.id] is not None
+                else None
+            ),
         )
     return ExecutionSimulationResult(
         current,
