@@ -404,8 +404,13 @@ def _intent_from_json(value: object) -> OrderIntent:
         raise LedgerSchemaError("invalid order intent") from exc
 
 
-def _fill_to_json(fill: ExecutionFill) -> dict[str, Any]:
+def _fill_to_json(
+    fill: ExecutionFill,
+    *,
+    progress_fill_id: str,
+) -> dict[str, Any]:
     return {
+        "progress_fill_id": progress_fill_id,
         "intent_id": fill.intent_id,
         "symbol": fill.symbol,
         "quantity": fill.quantity,
@@ -415,15 +420,28 @@ def _fill_to_json(fill: ExecutionFill) -> dict[str, Any]:
     }
 
 
-def _fill_from_json(value: object) -> ExecutionFill:
+def _fill_from_json(value: object) -> tuple[str, ExecutionFill]:
     item = _require_mapping(value, "fill")
     _require_keys(
         item,
-        frozenset({"intent_id", "symbol", "quantity", "price", "fees", "status"}),
+        frozenset(
+            {
+                "progress_fill_id",
+                "intent_id",
+                "symbol",
+                "quantity",
+                "price",
+                "fees",
+                "status",
+            }
+        ),
         "fill",
     )
     try:
-        return ExecutionFill(
+        progress_fill_id = item["progress_fill_id"]
+        if type(progress_fill_id) is not str or not progress_fill_id:
+            raise LedgerSchemaError("fill.progress_fill_id must be non-empty")
+        fill = ExecutionFill(
             intent_id=item["intent_id"],
             symbol=item["symbol"],
             quantity=item["quantity"],
@@ -431,6 +449,7 @@ def _fill_from_json(value: object) -> ExecutionFill:
             fees=item["fees"],
             status=item["status"],
         )
+        return progress_fill_id, fill
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LedgerSchemaError):
             raise
@@ -694,9 +713,14 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
         intents = [_intent_from_json(raw) for raw in item["open_intents"]]
         if len({intent.id for intent in intents}) != len(intents):
             raise LedgerSchemaError("account.open_intents contains duplicate IDs")
-        fills = [_fill_from_json(raw) for raw in item["fills"]]
+        persisted_fills = [_fill_from_json(raw) for raw in item["fills"]]
+        fill_ids = [progress_fill_id for progress_fill_id, _ in persisted_fills]
+        if len(set(fill_ids)) != len(fill_ids):
+            raise LedgerSchemaError("account.fills contains duplicate progress fill IDs")
+        fills = [fill for _, fill in persisted_fills]
         fill_keys = [
             (
+                progress_fill_id,
                 fill.intent_id,
                 fill.symbol,
                 fill.quantity,
@@ -704,7 +728,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 fill.fees,
                 fill.status,
             )
-            for fill in fills
+            for progress_fill_id, fill in persisted_fills
         ]
         if len(set(fill_keys)) != len(fill_keys):
             raise LedgerSchemaError("account.fills contains duplicate rows")
@@ -713,6 +737,26 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
         ]
         if len({entry.intent_id for entry in progress}) != len(progress):
             raise LedgerSchemaError("account.execution_progress contains duplicate intents")
+        progress_details = {
+            detail.id: detail
+            for entry in progress
+            for detail in entry.fills
+        }
+        if sum(len(entry.fills) for entry in progress) != len(progress_details):
+            raise LedgerSchemaError(
+                "account.execution_progress contains duplicate progress fill IDs"
+            )
+        if set(fill_ids) != set(progress_details):
+            raise LedgerSchemaError(
+                "account fills and execution progress must be globally one-to-one"
+            )
+        for progress_fill_id, fill in persisted_fills:
+            if _fill_summary_key(fill) != _progress_fill_summary_key(
+                progress_details[progress_fill_id]
+            ):
+                raise LedgerSchemaError(
+                    "persisted fill does not match its execution progress fill"
+                )
         events = [_event_from_json(raw) for raw in item["events"]]
         if len({event.id for event in events}) != len(events):
             raise LedgerSchemaError("account.events contains duplicate IDs")
@@ -948,38 +992,52 @@ def _validate_fill_summaries(
     fills: Iterable[ExecutionFill],
     progress: Iterable[OrderExecutionProgress],
     existing_progress: Mapping[str, OrderExecutionProgress],
-) -> None:
-    new_detail_keys: list[tuple[object, ...]] = []
+) -> tuple[tuple[str, ExecutionFill], ...]:
+    new_details: list[ExecutionProgressFill] = []
     for item in progress:
         prior = existing_progress.get(item.intent_id)
         prior_count = 0 if prior is None else len(prior.fills)
-        new_detail_keys.extend(
-            (
-                detail.intent_id,
-                detail.symbol,
-                detail.quantity,
-                detail.price,
-                detail.fees,
-                detail.status,
-            )
-            for detail in item.fills[prior_count:]
-        )
-    unmatched = list(new_detail_keys)
+        new_details.extend(item.fills[prior_count:])
+    unmatched = list(new_details)
+    paired: list[tuple[str, ExecutionFill]] = []
     for fill in fills:
-        key = (
-            fill.intent_id,
-            fill.symbol,
-            fill.quantity,
-            fill.price,
-            fill.fees,
-            fill.status,
+        match = next(
+            (
+                detail
+                for detail in unmatched
+                if _progress_fill_summary_key(detail) == _fill_summary_key(fill)
+            ),
+            None,
         )
-        try:
-            unmatched.remove(key)
-        except ValueError as exc:
-            raise LedgerError("execution fill summary does not match new progress") from exc
+        if match is None:
+            raise LedgerError("execution fill summary does not match new progress")
+        unmatched.remove(match)
+        paired.append((match.id, fill))
     if unmatched:
         raise LedgerError("new execution progress is missing an execution fill summary")
+    return tuple(paired)
+
+
+def _fill_summary_key(fill: ExecutionFill) -> tuple[object, ...]:
+    return (
+        fill.intent_id,
+        fill.symbol,
+        fill.quantity,
+        fill.price,
+        fill.fees,
+        fill.status,
+    )
+
+
+def _progress_fill_summary_key(fill: ExecutionProgressFill) -> tuple[object, ...]:
+    return (
+        fill.intent_id,
+        fill.symbol,
+        fill.quantity,
+        fill.price,
+        fill.fees,
+        fill.status,
+    )
 
 
 def _batch_fingerprint(
@@ -1271,6 +1329,58 @@ class JsonLedgerStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
 
+    def create_account(self, account: AccountSnapshot) -> AccountSnapshot:
+        """Create one fully explicit account, idempotently and under the store lock."""
+
+        if type(account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        if type(account.snapshot_id) is not str or not account.snapshot_id:
+            raise LedgerError("account creation requires an explicit snapshot_id")
+        _validate_account(account)
+        opened = PortfolioEvent(
+            id="account-opened-"
+            + hashlib.sha256(
+                (
+                    f"{account.id}|{account.strategy_id}|"
+                    f"{account.strategy_revision}|{account.snapshot_id}"
+                ).encode("utf-8")
+            ).hexdigest()[:24],
+            type="ACCOUNT_OPENED",
+            occurred_at=account.occurred_at,
+            data={
+                "account_id": account.id,
+                "strategy_id": account.strategy_id,
+                "strategy_revision": account.strategy_revision,
+                "portfolio_snapshot_id": account.snapshot_id,
+                "available_cash": account.available_cash,
+            },
+        )
+        expected = {
+            **encode_account_snapshot(account),
+            "open_intents": [],
+            "fills": [],
+            "execution_progress": [],
+            "events": [_event_to_json(opened)],
+            "committed_batches": [],
+        }
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
+            store = _read_store(self.path)
+            existing = store["accounts"].get(account.strategy_id)
+            if existing is not None:
+                if existing != expected:
+                    raise LedgerError(
+                        "account creation collision with different persistent content"
+                    )
+                return decode_account_snapshot(existing)
+            next_store = {
+                "version": LEDGER_SCHEMA_VERSION,
+                "accounts": dict(store["accounts"]),
+            }
+            next_store["accounts"][account.strategy_id] = expected
+            validate_ledger_payload(next_store)
+            _atomic_write(self.path, next_store)
+            return account
+
     def load(self, strategy_id: str) -> AccountSnapshot:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
@@ -1359,7 +1469,11 @@ class JsonLedgerStore:
             }
             if fills and not progress:
                 raise LedgerError("execution fills require canonical execution progress")
-            _validate_fill_summaries(fills, progress, stored_progress)
+            paired_fills = _validate_fill_summaries(
+                fills,
+                progress,
+                stored_progress,
+            )
             current, merged_progress = _apply_progress(
                 account, intents_by_id, stored_progress, progress
             )
@@ -1392,9 +1506,12 @@ class JsonLedgerStore:
                     for item in sorted(intents_by_id.values(), key=lambda value: value.id)
                     if item.id not in completed_ids
                 ],
-                "fills": _merge_json_rows(
+                "fills": _merge_fill_rows(
                     _require_list(persisted["fills"], "account.fills"),
-                    [_fill_to_json(item) for item in fills],
+                    [
+                        _fill_to_json(fill, progress_fill_id=progress_fill_id)
+                        for progress_fill_id, fill in paired_fills
+                    ],
                 ),
                 "execution_progress": [
                     _progress_to_json(item)
@@ -1425,19 +1542,27 @@ class JsonLedgerStore:
             return current
 
 
-def _merge_json_rows(existing: list[Any], new_rows: list[dict[str, Any]]) -> list[Any]:
+def _merge_fill_rows(existing: list[Any], new_rows: list[dict[str, Any]]) -> list[Any]:
     result = list(existing)
-    fingerprints = {
-        json.dumps(item, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-        for item in result
-    }
+    by_id: dict[str, Any] = {}
+    for item in result:
+        if not isinstance(item, Mapping):
+            raise LedgerError("persisted fill must be an object")
+        progress_fill_id = item.get("progress_fill_id")
+        if type(progress_fill_id) is not str or not progress_fill_id:
+            raise LedgerError("persisted fill lacks progress_fill_id")
+        if progress_fill_id in by_id:
+            raise LedgerError("persisted fills contain duplicate progress_fill_id")
+        by_id[progress_fill_id] = item
     for item in new_rows:
-        fingerprint = json.dumps(
-            item, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        )
-        if fingerprint not in fingerprints:
-            result.append(item)
-            fingerprints.add(fingerprint)
+        progress_fill_id = item["progress_fill_id"]
+        previous = by_id.get(progress_fill_id)
+        if previous is not None:
+            if previous != item:
+                raise LedgerError("conflicting persisted progress_fill_id")
+            continue
+        result.append(item)
+        by_id[progress_fill_id] = item
     return result
 
 

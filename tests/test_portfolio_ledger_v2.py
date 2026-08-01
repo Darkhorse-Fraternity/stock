@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import threading
 import unittest
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -95,6 +96,23 @@ def commit_from_process(path: str, run_key: str, result_queue: object) -> None:
         result_queue.put("OK")
 
 
+def create_account_from_process(path: str, result_queue: object) -> None:
+    bootstrap = AccountSnapshot(
+        id="account-bootstrap",
+        strategy_id="bootstrap",
+        strategy_revision=1,
+        occurred_at=NOW,
+        available_cash=10_000.0,
+        snapshot_id="bootstrap-snapshot-0",
+    )
+    try:
+        JsonLedgerStore(path).create_account(bootstrap)
+    except Exception as exc:
+        result_queue.put(type(exc).__name__)
+    else:
+        result_queue.put("OK")
+
+
 class PortfolioLedgerV2Tests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
@@ -131,6 +149,85 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
         self.assertEqual(repeated, first)
         self.assertEqual(store.load("strategy"), first)
         self.assertEqual(store.list_accounts(), (first,))
+
+    def test_create_account_is_atomic_idempotent_and_records_opening_event(self):
+        path = self.path.parent / "bootstrap.json"
+        bootstrap = AccountSnapshot(
+            id="account-bootstrap",
+            strategy_id="bootstrap",
+            strategy_revision=1,
+            occurred_at=NOW,
+            available_cash=10_000.0,
+            snapshot_id="bootstrap-snapshot-0",
+        )
+        store = JsonLedgerStore(path)
+
+        created = store.create_account(bootstrap)
+        first_bytes = path.read_bytes()
+        repeated = store.create_account(bootstrap)
+
+        self.assertEqual(created, bootstrap)
+        self.assertEqual(repeated, bootstrap)
+        self.assertEqual(path.read_bytes(), first_bytes)
+        persisted = json.loads(path.read_text(encoding="utf-8"))["accounts"][
+            "bootstrap"
+        ]
+        self.assertEqual(len(persisted["events"]), 1)
+        opened = persisted["events"][0]
+        self.assertEqual(opened["type"], "ACCOUNT_OPENED")
+        self.assertEqual(
+            opened["data"],
+            {
+                "account_id": bootstrap.id,
+                "strategy_id": bootstrap.strategy_id,
+                "strategy_revision": bootstrap.strategy_revision,
+                "portfolio_snapshot_id": bootstrap.snapshot_id,
+                "available_cash": bootstrap.available_cash,
+            },
+        )
+
+        with self.assertRaisesRegex(LedgerError, "collision|different"):
+            store.create_account(replace(bootstrap, available_cash=9_999.0))
+        self.assertEqual(path.read_bytes(), first_bytes)
+
+    def test_create_account_requires_explicit_snapshot_without_creating_target(self):
+        path = self.path.parent / "missing-snapshot.json"
+        bootstrap = AccountSnapshot(
+            id="account-bootstrap",
+            strategy_id="bootstrap",
+            strategy_revision=1,
+            occurred_at=NOW,
+            available_cash=10_000.0,
+        )
+
+        with self.assertRaisesRegex(LedgerError, "snapshot"):
+            JsonLedgerStore(path).create_account(bootstrap)
+
+        self.assertFalse(path.exists())
+
+    def test_concurrent_processes_create_one_account_without_truncation(self):
+        path = self.path.parent / "concurrent-bootstrap.json"
+        context = multiprocessing.get_context("spawn")
+        results = context.Queue()
+        processes = [
+            context.Process(
+                target=create_account_from_process,
+                args=(str(path), results),
+            )
+            for _ in range(2)
+        ]
+
+        for process in processes:
+            process.start()
+        for process in processes:
+            process.join(timeout=10)
+            self.assertFalse(process.is_alive())
+            self.assertEqual(process.exitcode, 0)
+
+        self.assertEqual(sorted(results.get(timeout=2) for _ in processes), ["OK", "OK"])
+        accounts = JsonLedgerStore(path).list_accounts()
+        self.assertEqual(len(accounts), 1)
+        self.assertEqual(accounts[0].strategy_id, "bootstrap")
 
     def test_different_run_rejects_stale_snapshot(self):
         store = JsonLedgerStore(self.path)
@@ -816,6 +913,92 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
         )
         self.assertEqual(second.positions[0].quantity, 4)
         self.assertEqual(second.available_cash, 600.0)
+
+    def test_identical_fill_summaries_use_progress_fill_identity_across_snapshots(self):
+        intent = OrderIntent(
+            id="intent-identical-fills",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=3,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+
+        def detail(snapshot: str, occurred_at: datetime) -> ExecutionProgressFill:
+            values = {
+                "intent_id": intent.id,
+                "symbol": intent.symbol,
+                "position_side": intent.position_side,
+                "order_side": intent.order_side,
+                "snapshot_id": snapshot,
+                "occurred_at": occurred_at,
+                "quantity": 1,
+                "price": 100.0,
+                "fees": 0.0,
+                "commission": 0.0,
+                "status": "PARTIAL",
+            }
+            return ExecutionProgressFill(
+                id=stable_execution_progress_fill_id(**values), **values
+            )
+
+        first_detail = detail("market-1", NOW)
+        first_progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            3,
+            "policy-1",
+            (first_detail,),
+        )
+        summary = ExecutionFill(intent.id, "AAPL", 1, 100.0, 0.0, "PARTIAL")
+        store = JsonLedgerStore(self.path)
+        first = store.commit(
+            DecisionBatch(
+                run_key="identical-fill-1",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                intents=(intent,),
+                fills=(summary,),
+                execution_progress=(first_progress,),
+            )
+        )
+        second_detail = detail("market-2", NOW + timedelta(minutes=5))
+        second_progress = replace(
+            first_progress,
+            fills=(first_detail, second_detail),
+        )
+        store.commit(
+            DecisionBatch(
+                run_key="identical-fill-2",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id=first.snapshot_id,
+                market_snapshot_id="market-2",
+                intents=(intent,),
+                fills=(summary,),
+                execution_progress=(second_progress,),
+            )
+        )
+
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        persisted = payload["accounts"]["strategy"]
+        self.assertEqual(len(persisted["fills"]), 2)
+        self.assertEqual(
+            {item["progress_fill_id"] for item in persisted["fills"]},
+            {first_detail.id, second_detail.id},
+        )
+        self.assertEqual(store.load("strategy").positions[0].quantity, 2)
+
+        persisted["fills"].pop()
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaisesRegex(LedgerSchemaError, "fill.*progress|one-to-one"):
+            store.load("strategy")
 
     def test_carry_record_is_accounted_once_and_requires_matching_event_type(self):
         financed = AccountSnapshot(
