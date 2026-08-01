@@ -225,6 +225,29 @@ def _require_finite_number(value: object, field_name: str) -> None:
         raise ValueError(f"{field_name} must be finite")
 
 
+def _require_positive_finite_number(value: object, field_name: str) -> None:
+    _require_finite_number(value, field_name)
+    if value <= 0:  # type: ignore[operator]
+        raise ValueError(f"{field_name} must be positive")
+
+
+def _require_nonnegative_finite_number(value: object, field_name: str) -> None:
+    _require_finite_number(value, field_name)
+    if value < 0:  # type: ignore[operator]
+        raise ValueError(f"{field_name} must be nonnegative")
+
+
+def _require_derived_metric(value: object, field_name: str) -> None:
+    if type(value) not in (int, float):
+        raise TypeError(f"{field_name} must be an int or float")
+    try:
+        number = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must not be NaN") from exc
+    if math.isnan(number):
+        raise ValueError(f"{field_name} must not be NaN")
+
+
 def _require_integer(value: object, field_name: str) -> None:
     if type(value) is not int:
         raise TypeError(f"{field_name} must be an integer")
@@ -308,6 +331,175 @@ class _DeeplyImmutable:
     def __deepcopy__(self, memo: dict[int, object]) -> _DeeplyImmutable:
         memo[id(self)] = self
         return self
+
+
+@dataclass(frozen=True)
+class PositionSnapshot(_DeeplyImmutable):
+    symbol: str
+    side: PositionSide
+    quantity: int
+    average_cost: float
+    current_price: float | None = None
+    market_value: float | None = None
+    unrealized_pnl: float | None = None
+
+    def __post_init__(self) -> None:
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.side, PositionSide, "side")
+        _require_positive_quantity(self.quantity)
+        _require_positive_finite_number(self.average_cost, "average_cost")
+        if self.current_price is not None:
+            _require_positive_finite_number(self.current_price, "current_price")
+        if self.market_value is not None:
+            _require_positive_finite_number(self.market_value, "market_value")
+        if self.unrealized_pnl is not None:
+            _require_finite_number(self.unrealized_pnl, "unrealized_pnl")
+            if self.unrealized_pnl == 0:
+                object.__setattr__(self, "unrealized_pnl", 0.0)
+
+
+@dataclass(frozen=True)
+class AccountSnapshot(_DeeplyImmutable):
+    id: str
+    strategy_id: str
+    strategy_revision: int
+    occurred_at: datetime
+    available_cash: float
+    restricted_short_proceeds: float = 0.0
+    margin_loan: float = 0.0
+    accrued_financing_cost: float = 0.0
+    accrued_borrow_cost: float = 0.0
+    positions: tuple[PositionSnapshot, ...] = ()
+
+    def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_string(self.strategy_id, "strategy_id")
+        _require_integer(self.strategy_revision, "strategy_revision")
+        _require_datetime(self.occurred_at, "occurred_at")
+        _require_finite_number(self.available_cash, "available_cash")
+        _require_nonnegative_finite_number(
+            self.restricted_short_proceeds,
+            "restricted_short_proceeds",
+        )
+        _require_nonnegative_finite_number(self.margin_loan, "margin_loan")
+        _require_nonnegative_finite_number(
+            self.accrued_financing_cost,
+            "accrued_financing_cost",
+        )
+        _require_nonnegative_finite_number(
+            self.accrued_borrow_cost,
+            "accrued_borrow_cost",
+        )
+        positions = _typed_tuple(self.positions, PositionSnapshot, "positions")
+        seen_symbols: set[str] = set()
+        for position in positions:
+            if position.symbol in seen_symbols:
+                raise ValueError(
+                    "positions must not contain duplicate or opposite-side "
+                    f"symbol: {position.symbol}"
+                )
+            seen_symbols.add(position.symbol)
+        object.__setattr__(self, "positions", positions)
+
+
+@dataclass(frozen=True)
+class PortfolioMetrics(_DeeplyImmutable):
+    available_cash: float
+    restricted_short_proceeds: float
+    margin_loan: float
+    accrued_financing_cost: float
+    accrued_borrow_cost: float
+    long_market_value: float
+    short_liability: float
+    equity: float
+    long_exposure_pct: float
+    short_exposure_pct: float
+    gross_exposure_pct: float
+    net_exposure_pct: float
+    margin_rate_pct: float
+
+    def __post_init__(self) -> None:
+        _require_finite_number(self.available_cash, "available_cash")
+        for field_name in (
+            "restricted_short_proceeds",
+            "margin_loan",
+            "accrued_financing_cost",
+            "accrued_borrow_cost",
+            "long_market_value",
+            "short_liability",
+        ):
+            _require_nonnegative_finite_number(
+                getattr(self, field_name),
+                field_name,
+            )
+        _require_finite_number(self.equity, "equity")
+        for field_name in (
+            "long_exposure_pct",
+            "short_exposure_pct",
+            "gross_exposure_pct",
+            "net_exposure_pct",
+            "margin_rate_pct",
+        ):
+            _require_derived_metric(getattr(self, field_name), field_name)
+
+        gross_value = self.long_market_value + self.short_liability
+        _require_finite_number(gross_value, "gross_market_value")
+        exposure_values = (
+            self.long_exposure_pct,
+            self.short_exposure_pct,
+            self.gross_exposure_pct,
+            self.net_exposure_pct,
+        )
+        if gross_value == 0:
+            if any(value != 0 for value in exposure_values):
+                raise ValueError("exposures must be zero when there are no positions")
+            if self.margin_rate_pct != math.inf:
+                raise ValueError(
+                    "margin_rate_pct must be positive infinity with no positions"
+                )
+        elif self.equity == 0:
+            net_value = self.long_market_value - self.short_liability
+            expected_exposures = (
+                math.inf if self.long_market_value > 0 else 0.0,
+                math.inf if self.short_liability > 0 else 0.0,
+                math.inf,
+                (
+                    math.inf
+                    if net_value > 0
+                    else -math.inf
+                    if net_value < 0
+                    else 0.0
+                ),
+            )
+            if exposure_values != expected_exposures:
+                raise ValueError("zero-equity exposures have invalid infinity signs")
+            if self.margin_rate_pct != 0:
+                raise ValueError("margin_rate_pct must be zero at zero equity")
+        elif any(
+            math.isinf(float(value))
+            for value in (*exposure_values, self.margin_rate_pct)
+        ):
+            raise ValueError("infinite metrics require no positions or zero equity")
+
+        for field_name in self.__dataclass_fields__:
+            if getattr(self, field_name) == 0:
+                object.__setattr__(self, field_name, 0.0)
+
+
+@dataclass(frozen=True)
+class ValuationResult(_DeeplyImmutable):
+    account: AccountSnapshot
+    metrics: PortfolioMetrics
+
+    def __post_init__(self) -> None:
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        if type(self.metrics) is not PortfolioMetrics:
+            raise TypeError("metrics must be PortfolioMetrics")
+
+    @property
+    def positions(self) -> tuple[PositionSnapshot, ...]:
+        return self.account.positions
 
 
 @dataclass(frozen=True)
@@ -484,6 +676,10 @@ class DecisionBatch(_DeeplyImmutable):
 
 
 _DEEPLY_IMMUTABLE_TYPES = (
+    PositionSnapshot,
+    AccountSnapshot,
+    PortfolioMetrics,
+    ValuationResult,
     SignalCandidate,
     TargetPosition,
     OrderIntent,
