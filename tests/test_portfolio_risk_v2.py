@@ -2,7 +2,7 @@ import hashlib
 import math
 import unittest
 from copy import deepcopy
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timezone
 
 from stock_recommender.pipeline import PipelineContractError, PipelineRunner, StageInput
@@ -34,6 +34,7 @@ from stock_recommender.portfolio_engine.risk import (
     evaluate_squeeze,
     plan_forced_deleveraging,
 )
+from stock_recommender.portfolio_engine import risk as risk_module
 from stock_recommender.portfolio_engine.valuation import value_account
 
 
@@ -571,6 +572,26 @@ class PortfolioDrawdownRiskTests(unittest.TestCase):
             with self.subTest(peak=peak), self.assertRaises(RiskError):
                 evaluate_portfolio_drawdown(self.metrics(100.0), peak)
 
+    def test_drawdown_diagnostic_is_recursively_frozen_and_defensive(self):
+        source = {"nested": {"items": [{"code": "ORIGINAL"}]}}
+        result = risk_module.PortfolioDrawdownResult(
+            state=NORMAL,
+            drawdown_pct=0.0,
+            equity=100.0,
+            peak_equity=100.0,
+            diagnostic=source,
+        )
+
+        source["nested"]["items"][0]["code"] = "MUTATED"
+
+        self.assertEqual(
+            result.diagnostic["nested"]["items"][0]["code"],
+            "ORIGINAL",
+        )
+        self.assertIs(deepcopy(result), result)
+        with self.assertRaises(TypeError):
+            result.diagnostic["nested"]["items"][0]["code"] = "FORGED"
+
 
 class ForcedDeleveragingTests(unittest.TestCase):
     def test_margin_call_returns_only_risk_reducing_full_closes(self):
@@ -747,8 +768,67 @@ class ForcedDeleveragingTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(stressed, original)
 
+    def test_forced_diagnostics_are_recursively_frozen_and_defensive(self):
+        source = [{"code": "X", "details": {"symbols": ["A"]}}]
+        result = risk_module.ForcedDeleveragingResult(
+            state=NORMAL,
+            diagnostics=source,
+        )
+
+        source[0]["details"]["symbols"].append("B")
+
+        self.assertEqual(
+            result.diagnostics[0]["details"]["symbols"],
+            ("A",),
+        )
+        self.assertIs(deepcopy(result), result)
+        with self.assertRaises(AttributeError):
+            result.diagnostics[0]["details"]["symbols"].append("FORGED")
+
 
 class PortfolioRiskStageTests(unittest.TestCase):
+    def test_insolvent_stage_suppresses_all_position_risk_intents(self):
+        cases = (
+            (
+                account(
+                    position(symbol="L", current=None, quantity=1),
+                    loan=100.0,
+                ),
+                {"L": 90.0},
+            ),
+            (
+                account(
+                    position(
+                        symbol="S",
+                        side=PositionSide.SHORT,
+                        current=None,
+                        quantity=1,
+                    ),
+                    restricted=100.0,
+                ),
+                {"S": 110.0},
+            ),
+        )
+
+        for snapshot, prices in cases:
+            with self.subTest(side=snapshot.positions[0].side):
+                output = PortfolioRiskStage(
+                    snapshot,
+                    prices,
+                    peak_equity=100.0,
+                ).evaluate(stage_input())
+                facts = {fact["kind"]: fact for fact in output.facts}
+
+                self.assertEqual(facts["risk_intents"]["items"], ())
+                self.assertEqual(
+                    facts["risk_diagnostic"]["drawdown_state"],
+                    INSOLVENT_HALT,
+                )
+                self.assertEqual(
+                    facts["risk_diagnostic"]["margin_state"],
+                    INSOLVENT_HALT,
+                )
+
     def test_stage_merges_borrow_and_squeeze_modes_and_emits_plain_facts(self):
         short = position(
             symbol="S",
@@ -776,6 +856,60 @@ class PortfolioRiskStageTests(unittest.TestCase):
         self.assertIn("risk_intents", facts)
         self.assertIn("risk_diagnostic", facts)
         self.assertTrue(all(type(fact) is dict for fact in output.facts))
+
+    def test_typed_position_update_can_be_replayed_into_next_risk_round(self):
+        original = account(
+            position(symbol="L", current=None, quantity=1),
+            cash=100.0,
+        )
+        first_output = PortfolioRiskStage(
+            original,
+            {"L": 110.0},
+            peak_equity=210.0,
+        ).evaluate(stage_input())
+        first_facts = {fact["kind"]: fact for fact in first_output.facts}
+
+        self.assertIn("position_risk_updates", first_facts)
+        update = first_facts["position_risk_updates"]["items"][0]
+        self.assertIsInstance(update, risk_module.PositionRiskUpdate)
+        self.assertEqual(update.symbol, "L")
+        self.assertEqual(update.peak_price, 110.0)
+        self.assertTrue(update.trailing_active)
+        self.assertFalse(original.positions[0].trailing_active)
+        with self.assertRaises(FrozenInstanceError):
+            update.trailing_active = False
+
+        replayed = replace(
+            original.positions[0],
+            peak_price=update.peak_price,
+            trough_price=update.trough_price,
+            trailing_active=update.trailing_active,
+            position_mode=update.position_mode,
+        )
+        second_account = replace(original, positions=(replayed,))
+        second_output = PortfolioRiskStage(
+            second_account,
+            {"L": 104.5},
+            peak_equity=210.0,
+        ).evaluate(stage_input())
+        second_facts = {fact["kind"]: fact for fact in second_output.facts}
+
+        self.assertEqual(
+            second_facts["risk_intents"]["items"][0].reason,
+            "LONG_TRAILING_STOP",
+        )
+        diagnostic_item = next(
+            item
+            for item in second_facts["risk_diagnostic"]["items"]
+            if item.get("code") == "POSITION_RISK"
+        )
+        for field_name in (
+            "peak_price",
+            "trough_price",
+            "trailing_active",
+            "position_mode",
+        ):
+            self.assertNotIn(field_name, diagnostic_item)
 
     def test_stage_accepts_missing_position_modes_and_rejects_duplicates(self):
         stage = PortfolioRiskStage(account(cash=100.0), {}, peak_equity=100.0)

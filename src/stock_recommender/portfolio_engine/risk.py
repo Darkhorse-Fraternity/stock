@@ -21,6 +21,7 @@ from .contracts import (
     PositionEffect,
     PositionSide,
     PositionSnapshot,
+    freeze_immutable,
 )
 from .margin import project_account_for_intent
 from .valuation import ValuationError, value_account
@@ -307,6 +308,46 @@ class PositionRiskResult(_ImmutableRiskValue):
 
 
 @dataclass(frozen=True)
+class PositionRiskUpdate(_ImmutableRiskValue):
+    symbol: str
+    side: PositionSide
+    peak_price: float | None
+    trough_price: float | None
+    trailing_active: bool
+    position_mode: str
+
+    def __post_init__(self) -> None:
+        if type(self.symbol) is not str or not self.symbol:
+            raise ValueError("symbol must be a non-empty string")
+        if type(self.side) is not PositionSide:
+            raise TypeError("side must be PositionSide")
+        for field_name in ("peak_price", "trough_price"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(
+                    self,
+                    field_name,
+                    _positive_number(value, field_name),
+                )
+        if type(self.trailing_active) is not bool:
+            raise TypeError("trailing_active must be a bool")
+        _validate_position_mode(self.position_mode)
+
+    @classmethod
+    def from_position(cls, position: PositionSnapshot) -> PositionRiskUpdate:
+        if type(position) is not PositionSnapshot:
+            raise TypeError("position must be PositionSnapshot")
+        return cls(
+            symbol=position.symbol,
+            side=position.side,
+            peak_price=position.peak_price,
+            trough_price=position.trough_price,
+            trailing_active=position.trailing_active,
+            position_mode=position.position_mode,
+        )
+
+
+@dataclass(frozen=True)
 class PortfolioDrawdownResult(_ImmutableRiskValue):
     state: str
     drawdown_pct: float
@@ -321,7 +362,7 @@ class PortfolioDrawdownResult(_ImmutableRiskValue):
             _finite_number(getattr(self, field_name), field_name)
         if not isinstance(self.diagnostic, Mapping):
             raise TypeError("diagnostic must be a mapping")
-        object.__setattr__(self, "diagnostic", MappingProxyType(dict(self.diagnostic)))
+        object.__setattr__(self, "diagnostic", freeze_immutable(self.diagnostic))
 
 
 @dataclass(frozen=True)
@@ -393,7 +434,7 @@ class ForcedDeleveragingResult(_ImmutableRiskValue):
         object.__setattr__(
             self,
             "diagnostics",
-            tuple(MappingProxyType(dict(item)) for item in diagnostics),
+            tuple(freeze_immutable(item) for item in diagnostics),
         )
         object.__setattr__(self, "missing_price_symbols", missing)
 
@@ -1051,6 +1092,7 @@ class PortfolioRiskStage:
             modes[symbol] = _merge_mode(modes.get(symbol, NORMAL), mode)
 
         position_intents: list[OrderIntent] = []
+        position_updates: list[PositionRiskUpdate] = []
         diagnostics: list[dict[str, object]] = []
         for held in sorted(self._account.positions, key=lambda item: item.symbol):
             mode = _merge_mode(
@@ -1060,6 +1102,11 @@ class PortfolioRiskStage:
             price = _market_price(self._raw_prices, held.symbol)
             if price is None:
                 modes[held.symbol] = mode
+                position_updates.append(
+                    PositionRiskUpdate.from_position(
+                        replace(held, position_mode=mode)
+                    )
+                )
                 diagnostics.append(
                     {"code": "MISSING_PRICE", "symbol": held.symbol}
                 )
@@ -1085,10 +1132,20 @@ class PortfolioRiskStage:
                     }
                 )
                 modes[held.symbol] = mode
+                position_updates.append(
+                    PositionRiskUpdate.from_position(
+                        replace(held, position_mode=mode)
+                    )
+                )
                 continue
             mode = _merge_mode(mode, squeeze.position_mode)
             modes[held.symbol] = mode
             position_intents.extend(position_result.intents)
+            position_updates.append(
+                PositionRiskUpdate.from_position(
+                    replace(squeeze.updated_position, position_mode=mode)
+                )
+            )
             diagnostics.append(
                 {
                     "code": "POSITION_RISK",
@@ -1098,10 +1155,6 @@ class PortfolioRiskStage:
                         if position_result.decisions
                         else squeeze.reason
                     ),
-                    "position_mode": mode,
-                    "peak_price": position_result.updated_position.peak_price,
-                    "trough_price": position_result.updated_position.trough_price,
-                    "trailing_active": position_result.updated_position.trailing_active,
                 }
             )
 
@@ -1129,9 +1182,12 @@ class PortfolioRiskStage:
         )
 
         exited_symbols = {item.symbol for item in position_intents}
-        combined = tuple(position_intents) + tuple(
-            item for item in forced.intents if item.symbol not in exited_symbols
-        )
+        if INSOLVENT_HALT in {drawdown.state, forced.state}:
+            combined: tuple[OrderIntent, ...] = ()
+        else:
+            combined = tuple(position_intents) + tuple(
+                item for item in forced.intents if item.symbol not in exited_symbols
+            )
         return StageOutput(
             stage=self.name,
             component_version=self.component_version,
@@ -1142,6 +1198,10 @@ class PortfolioRiskStage:
                     "items": tuple(diagnostics),
                     "drawdown_state": drawdown.state,
                     "margin_state": forced.state,
+                },
+                {
+                    "kind": "position_risk_updates",
+                    "items": tuple(position_updates),
                 },
                 {"kind": "position_modes", "items": dict(sorted(modes.items()))},
             ),
@@ -1164,6 +1224,7 @@ __all__ = (
     "PortfolioRiskStage",
     "PositionRiskPolicies",
     "PositionRiskResult",
+    "PositionRiskUpdate",
     "REDUCE_ONLY",
     "RiskDecision",
     "RiskError",

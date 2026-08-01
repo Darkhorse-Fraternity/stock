@@ -66,6 +66,12 @@ def _deep_freeze(value: Any) -> Any:
     return _deep_freeze_value(value, set())
 
 
+def freeze_immutable(value: Any) -> Any:
+    """Defensively copy a supported plain value into an immutable graph."""
+
+    return _deep_freeze(value)
+
+
 def _assert_deeply_immutable_enum_value(member: Enum) -> None:
     """Reject Enum members whose original value graph contains mutable data."""
 
