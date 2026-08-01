@@ -6,19 +6,15 @@ import hashlib
 import json
 import math
 import os
+import stat
 import threading
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-
-try:  # Linux deployment and macOS development hosts both provide fcntl.
-    import fcntl
-except ImportError:  # pragma: no cover - unsupported deployment platform
-    fcntl = None
 
 from .config import (
     default_exposure_policy,
@@ -29,7 +25,12 @@ from .config import (
     normalize_short_policy,
     validate_strategy_policies,
 )
-from .atomic_io import OriginalFile, atomic_replace_many, fsync_directory
+from .atomic_io import (
+    OriginalFile,
+    atomic_replace_many,
+    fsync_directory,
+    transaction_guard,
+)
 from .contracts import AccountSnapshot, PositionSide, PositionSnapshot
 from .ledger import (
     LEDGER_SCHEMA_VERSION,
@@ -167,9 +168,20 @@ def _parse_json(raw: bytes, path: Path) -> dict[str, Any]:
 
 def _read_bytes(path: Path) -> bytes:
     try:
-        return path.read_bytes()
+        metadata = os.lstat(path)
     except FileNotFoundError as exc:
         raise MigrationError(f"migration source does not exist: {path}") from exc
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect migration source {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise MigrationError(f"migration source must be a regular non-symlink file: {path}")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as handle:
+            return handle.read()
     except OSError as exc:
         raise MigrationError(f"cannot read migration source {path}: {exc}") from exc
 
@@ -549,25 +561,8 @@ def _prepare_portfolio(path: Path, raw: bytes, now: datetime) -> _PreparedMigrat
 
 
 @contextmanager
-def _file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        if fcntl is None:  # pragma: no cover - guarded deployment invariant
-            raise RuntimeError("portfolio migration requires fcntl process locking")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
-@contextmanager
 def _locked_paths(paths: Iterable[Path]):
-    unique = sorted({path.resolve() for path in paths}, key=str)
-    with _MIGRATION_LOCK, ExitStack() as stack:
-        for path in unique:
-            stack.enter_context(_file_lock(path))
+    with _MIGRATION_LOCK, transaction_guard(paths):
         yield
 
 
@@ -584,12 +579,37 @@ def _backup_path(path: Path, stamp: str) -> Path:
 def _write_backup(path: Path, raw: bytes, stamp: str) -> Path:
     backup = _backup_path(path, stamp)
     try:
-        with backup.open("xb") as handle:
+        source_metadata = os.lstat(path)
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect migration source {path}: {exc}") from exc
+    if stat.S_ISLNK(source_metadata.st_mode) or not stat.S_ISREG(source_metadata.st_mode):
+        raise MigrationError(f"migration source must be a regular non-symlink file: {path}")
+    source_mode = stat.S_IMODE(source_metadata.st_mode)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(backup, flags, source_mode)
+        os.fchmod(descriptor, source_mode)
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
     except FileExistsError:
-        if backup.read_bytes() != raw:
+        try:
+            backup_metadata = os.lstat(backup)
+        except OSError as exc:
+            raise MigrationError(f"cannot inspect migration backup {backup}: {exc}") from exc
+        if stat.S_ISLNK(backup_metadata.st_mode) or not stat.S_ISREG(
+            backup_metadata.st_mode
+        ):
+            raise MigrationError(
+                f"migration backup must be a regular non-symlink file: {backup}"
+            )
+        backup_mode = stat.S_IMODE(backup_metadata.st_mode)
+        if backup_mode & ~source_mode:
+            raise MigrationError(f"migration backup permissions are too broad: {backup}")
+        if _read_bytes(backup) != raw:
             raise MigrationError(f"timestamped backup already exists with other data: {backup}")
     except OSError as exc:
         raise MigrationError(f"cannot create migration backup {backup}: {exc}") from exc
@@ -617,6 +637,11 @@ def _apply_prepared(
                 item.report.path: OriginalFile(True, originals[item.report.path])
                 for item in changed
             },
+            recovery_backups={
+                item.report.path: backups[item.report.path]
+                for item in changed
+            },
+            durable=True,
         )
     except BaseException as exc:
         raise MigrationError(f"atomic migration failed: {exc}") from exc

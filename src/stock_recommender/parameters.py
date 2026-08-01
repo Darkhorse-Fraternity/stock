@@ -26,6 +26,7 @@ from .portfolio_engine.config import (
     normalize_short_policy,
     validate_strategy_policies,
 )
+from .portfolio_engine.atomic_io import transaction_guard
 from .us_data_providers import (
     strategy_us_data_source,
     us_market_data_status,
@@ -750,22 +751,24 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
 
 def load_strategy_store(path: str | Path | None = None) -> dict:
     config_path = Path(path) if path is not None else strategy_config_path()
-    try:
-        payload = json.loads(config_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        return default_strategy_store()
-    except json.JSONDecodeError as exc:
-        raise StrategyLifecycleError(f"策略配置 JSON 无法解析: {exc.msg}") from exc
+    with transaction_guard((config_path,)):
+        try:
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return default_strategy_store()
+        except json.JSONDecodeError as exc:
+            raise StrategyLifecycleError(f"策略配置 JSON 无法解析: {exc.msg}") from exc
     return _normalize_strategy_store(payload)
 
 
 def save_strategy_store(store: dict, path: str | Path | None = None) -> dict:
     config_path = Path(path) if path is not None else strategy_config_path()
-    normalized = _normalize_strategy_store(store)
-    config_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = config_path.with_suffix(config_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(config_path)
+    with transaction_guard((config_path,)):
+        normalized = _normalize_strategy_store(store)
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(config_path)
     return normalized
 
 

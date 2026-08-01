@@ -6,17 +6,11 @@ import hashlib
 import json
 import math
 import threading
-from contextlib import contextmanager
 from dataclasses import fields, is_dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
-
-try:  # Linux deployment and macOS development hosts both provide fcntl.
-    import fcntl
-except ImportError:  # pragma: no cover - unsupported deployment platform
-    fcntl = None
 
 from .contracts import (
     AccrualLifecycle,
@@ -35,7 +29,7 @@ from .contracts import (
     PositionSide,
     PositionSnapshot,
 )
-from .atomic_io import atomic_replace_bytes
+from .atomic_io import atomic_replace_bytes, transaction_guard
 from .margin import project_account_for_intent
 from .valuation import value_account
 
@@ -792,20 +786,6 @@ def _read_store(path: Path) -> dict[str, Any]:
     return validate_ledger_payload(payload)
 
 
-@contextmanager
-def _exclusive_file_lock(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    with lock_path.open("a+", encoding="utf-8") as handle:
-        if fcntl is None:  # pragma: no cover - guarded deployment invariant
-            raise RuntimeError("JsonLedgerStore requires fcntl process locking")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
     encoded = (
         json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
@@ -1294,7 +1274,7 @@ class JsonLedgerStore:
     def load(self, strategy_id: str) -> AccountSnapshot:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
-        with _PROCESS_LOCK, _exclusive_file_lock(self.path):
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
             store = _read_store(self.path)
             try:
                 payload = store["accounts"][strategy_id]
@@ -1303,7 +1283,7 @@ class JsonLedgerStore:
             return decode_account_snapshot(payload)
 
     def list_accounts(self) -> tuple[AccountSnapshot, ...]:
-        with _PROCESS_LOCK, _exclusive_file_lock(self.path):
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
             store = _read_store(self.path)
             return tuple(
                 decode_account_snapshot(store["accounts"][strategy_id])
@@ -1313,7 +1293,7 @@ class JsonLedgerStore:
     def commit(self, batch: DecisionBatch) -> AccountSnapshot:
         if type(batch) is not DecisionBatch:
             raise TypeError("batch must be DecisionBatch")
-        with _PROCESS_LOCK, _exclusive_file_lock(self.path):
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
             store = _read_store(self.path)
             try:
                 persisted = _require_mapping(

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+import os
+import stat
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -13,7 +16,7 @@ from stock_recommender.portfolio_engine.config import (
     default_margin_policy,
     default_short_policy,
 )
-from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
+from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerSchemaError
 from stock_recommender.portfolio_engine.migration import (
     MigrationError,
     migrate_portfolio_store,
@@ -21,9 +24,86 @@ from stock_recommender.portfolio_engine.migration import (
     migrate_strategy_store,
 )
 from stock_recommender.portfolio_migration_cli import main as migration_main
+from stock_recommender.parameters import (
+    StrategyLifecycleError,
+    load_strategy_store,
+)
 
 
 FIXED_NOW = datetime(2026, 8, 1, 12, 34, 56, tzinfo=timezone.utc)
+
+
+def crash_combined_migration_after_first_replace(
+    strategy_path: str,
+    portfolio_path: str,
+) -> None:
+    from stock_recommender.portfolio_engine import atomic_io
+
+    actual_replace = atomic_io.replace_path
+    calls = 0
+
+    def replace_then_crash(source: Path, target: Path) -> None:
+        nonlocal calls
+        actual_replace(source, target)
+        calls += 1
+        if calls == 1:
+            os._exit(86)
+
+    with patch.object(atomic_io, "replace_path", side_effect=replace_then_crash):
+        migrate_stores(
+            strategy_path,
+            portfolio_path,
+            apply=True,
+            now=FIXED_NOW,
+        )
+
+
+def crash_atomic_replace_with_missing_original(root: str) -> None:
+    from stock_recommender.portfolio_engine import atomic_io
+
+    directory = Path(root)
+    missing = directory / "first" / "missing.json"
+    existing = directory / "second" / "existing.json"
+    backup = directory / "second" / "existing.backup"
+    actual_replace = atomic_io.replace_path
+    calls = 0
+
+    def replace_then_crash(source: Path, target: Path) -> None:
+        nonlocal calls
+        actual_replace(source, target)
+        calls += 1
+        if calls == 1:
+            os._exit(87)
+
+    with patch.object(atomic_io, "replace_path", side_effect=replace_then_crash):
+        atomic_io.atomic_replace_many(
+            {missing: b"new missing", existing: b"new existing"},
+            originals={
+                missing: atomic_io.OriginalFile(False, None),
+                existing: atomic_io.OriginalFile(True, b"old existing"),
+            },
+            recovery_backups={missing: None, existing: backup},
+            durable=True,
+        )
+
+
+def crash_combined_migration_after_commit_marker(
+    strategy_path: str,
+    portfolio_path: str,
+) -> None:
+    from stock_recommender.portfolio_engine import atomic_io
+
+    def crash_before_cleanup(paths: object) -> None:
+        del paths
+        os._exit(88)
+
+    with patch.object(atomic_io, "_remove_paths", side_effect=crash_before_cleanup):
+        migrate_stores(
+            strategy_path,
+            portfolio_path,
+            apply=True,
+            now=FIXED_NOW,
+        )
 
 
 def v1_long_only_store() -> dict:
@@ -397,6 +477,139 @@ class PortfolioMigrationTests(unittest.TestCase):
         self.assertEqual(self.strategy_path.read_bytes(), strategy_before)
         self.assertEqual(self.portfolio_path.read_bytes(), portfolio_before)
         self.assertEqual(tuple(self.strategy_path.parent.glob(".*.tmp")), ())
+
+    def test_runtime_loaders_recover_crash_after_first_participant_replace(self) -> None:
+        triggers = ("strategy", "portfolio")
+        for trigger in triggers:
+            with self.subTest(trigger=trigger):
+                root = Path(self.temporary.name) / trigger
+                strategy_path = root / "strategy" / "strategy_config.json"
+                portfolio_path = root / "portfolio" / "strategy_portfolios.json"
+                strategy_path.parent.mkdir(parents=True)
+                portfolio_path.parent.mkdir(parents=True)
+                self._write_json(strategy_path, v5_strategy_store())
+                self._write_json(portfolio_path, v1_long_only_store())
+                strategy_before = strategy_path.read_bytes()
+                portfolio_before = portfolio_path.read_bytes()
+                process = multiprocessing.get_context("spawn").Process(
+                    target=crash_combined_migration_after_first_replace,
+                    args=(str(strategy_path), str(portfolio_path)),
+                )
+
+                process.start()
+                process.join(timeout=10)
+
+                self.assertFalse(process.is_alive())
+                self.assertEqual(process.exitcode, 86)
+                if trigger == "strategy":
+                    with self.assertRaises(StrategyLifecycleError):
+                        load_strategy_store(strategy_path)
+                    with self.assertRaises(StrategyLifecycleError):
+                        load_strategy_store(strategy_path)
+                else:
+                    with self.assertRaises(LedgerSchemaError):
+                        JsonLedgerStore(portfolio_path).list_accounts()
+                    with self.assertRaises(LedgerSchemaError):
+                        JsonLedgerStore(portfolio_path).list_accounts()
+                self.assertEqual(strategy_path.read_bytes(), strategy_before)
+                self.assertEqual(portfolio_path.read_bytes(), portfolio_before)
+                self.assertEqual(tuple(root.rglob(".stock-portfolio-txn-*")), ())
+                self.assertEqual(tuple(root.rglob(".*.tmp")), ())
+
+    def test_commit_marker_recovery_finishes_new_generation(self) -> None:
+        root = Path(self.temporary.name) / "committed-crash"
+        strategy_path = root / "strategy" / "strategy_config.json"
+        portfolio_path = root / "portfolio" / "strategy_portfolios.json"
+        strategy_path.parent.mkdir(parents=True)
+        portfolio_path.parent.mkdir(parents=True)
+        self._write_json(strategy_path, v5_strategy_store())
+        self._write_json(portfolio_path, v1_long_only_store())
+        process = multiprocessing.get_context("spawn").Process(
+            target=crash_combined_migration_after_commit_marker,
+            args=(str(strategy_path), str(portfolio_path)),
+        )
+
+        process.start()
+        process.join(timeout=10)
+
+        self.assertEqual(process.exitcode, 88)
+        self.assertEqual(load_strategy_store(strategy_path)["version"], 6)
+        self.assertEqual(
+            JsonLedgerStore(portfolio_path).list_accounts()[0].strategy_id,
+            "tech",
+        )
+        self.assertEqual(tuple(root.rglob(".stock-portfolio-txn-*")), ())
+        self.assertEqual(tuple(root.rglob(".*.tmp")), ())
+
+    def test_durable_recovery_restores_nonexistent_original_across_directories(self) -> None:
+        from stock_recommender.portfolio_engine import atomic_io
+
+        root = Path(self.temporary.name) / "missing-original"
+        (root / "first").mkdir(parents=True)
+        (root / "second").mkdir(parents=True)
+        existing = root / "second" / "existing.json"
+        backup = root / "second" / "existing.backup"
+        existing.write_bytes(b"old existing")
+        backup.write_bytes(b"old existing")
+        process = multiprocessing.get_context("spawn").Process(
+            target=crash_atomic_replace_with_missing_original,
+            args=(str(root),),
+        )
+
+        process.start()
+        process.join(timeout=10)
+
+        self.assertEqual(process.exitcode, 87)
+        atomic_io.recover_pending_transactions(root / "first" / "missing.json")
+        atomic_io.recover_pending_transactions(existing)
+        self.assertFalse((root / "first" / "missing.json").exists())
+        self.assertEqual(existing.read_bytes(), b"old existing")
+        self.assertEqual(tuple(root.rglob(".stock-portfolio-txn-*")), ())
+        self.assertEqual(tuple(root.rglob(".*.tmp")), ())
+
+    def test_backup_copies_source_permissions_under_permissive_umask(self) -> None:
+        self._write_json(self.portfolio_path, v1_long_only_store())
+        self.portfolio_path.chmod(0o600)
+        previous_umask = os.umask(0o022)
+        try:
+            report = migrate_portfolio_store(
+                self.portfolio_path,
+                apply=True,
+                now=FIXED_NOW,
+            )
+        finally:
+            os.umask(previous_umask)
+
+        self.assertIsNotNone(report.backup_path)
+        self.assertEqual(
+            stat.S_IMODE(report.backup_path.stat().st_mode),
+            0o600,
+        )
+
+    def test_symlink_source_and_backup_are_rejected_without_writing(self) -> None:
+        real_source = self.portfolio_path.with_name("real-portfolio.json")
+        self._write_json(real_source, v1_long_only_store())
+        self.portfolio_path.symlink_to(real_source)
+        source_before = real_source.read_bytes()
+
+        with self.assertRaises(MigrationError):
+            migrate_portfolio_store(self.portfolio_path, apply=True, now=FIXED_NOW)
+        self.assertEqual(real_source.read_bytes(), source_before)
+
+        self.portfolio_path.unlink()
+        self._write_json(self.portfolio_path, v1_long_only_store())
+        backup = self.portfolio_path.with_name(
+            self.portfolio_path.name + ".bak.20260801T123456000000Z"
+        )
+        victim = self.portfolio_path.with_name("backup-victim")
+        victim.write_bytes(b"do not follow")
+        backup.symlink_to(victim)
+        before = self.portfolio_path.read_bytes()
+
+        with self.assertRaises(MigrationError):
+            migrate_portfolio_store(self.portfolio_path, apply=True, now=FIXED_NOW)
+        self.assertEqual(self.portfolio_path.read_bytes(), before)
+        self.assertEqual(victim.read_bytes(), b"do not follow")
 
     def test_current_schema_rerun_is_explicit_and_does_not_write(self) -> None:
         self._write_json(self.strategy_path, v5_strategy_store())
