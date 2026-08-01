@@ -22,7 +22,11 @@ from .parameters import (
     strategy_config_path,
     transition_strategy_stage,
 )
-from .portfolio_backtest import normalize_universe_snapshots, replay_portfolio_fold
+from .portfolio_backtest import (
+    HistoricalBorrowBook,
+    normalize_universe_snapshots,
+    replay_portfolio_fold,
+)
 from .signal_engine import (
     SIGNAL_MODEL_ID,
     extract_signal_features,
@@ -220,6 +224,16 @@ def evaluate_approval_gate(metrics: dict, validation: dict, metadata: dict) -> d
     add("execution_parity", bool(metadata.get("execution_parity_complete")), bool(metadata.get("execution_parity_complete")), True, "回测复用线上组合执行 Pipeline")
     add("execution_data", bool(metadata.get("execution_data_complete")), bool(metadata.get("execution_data_complete")), True, "历史成交量、涨跌停与执行时点数据完整")
     add("corporate_actions", bool(metadata.get("corporate_actions_complete")), bool(metadata.get("corporate_actions_complete")), True, "分红送转等公司行动处理完整")
+    exposure_mode = str(metadata.get("exposure_mode") or "LONG_ONLY")
+    borrow_history_required = exposure_mode == "LONG_SHORT"
+    borrow_history_complete = bool(metadata.get("borrow_history_complete"))
+    add(
+        "borrow_history",
+        (not borrow_history_required) or borrow_history_complete,
+        borrow_history_complete,
+        True if borrow_history_required else "LONG_SHORT only",
+        "做空策略历史借券可用性覆盖完整",
+    )
     return {"passed": all(item["passed"] for item in checks), "checks": checks, "evaluated_at": _timestamp()}
 
 
@@ -373,6 +387,11 @@ def _run_signal_event_backtest(dataset: dict, strategy: dict) -> dict:
 
 def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
     validation = strategy["validation"]
+    source_metadata = deepcopy(dataset.get("metadata") or {})
+    borrow_book = HistoricalBorrowBook.from_raw(
+        dataset.get("borrow_history") or {},
+        history_complete=bool(source_metadata.get("borrow_history_complete")),
+    )
     panel = {str(symbol): _normalize_history(rows) for symbol, rows in (dataset.get("panel") or {}).items()}
     panel = {symbol: rows for symbol, rows in panel.items() if rows}
     if not panel:
@@ -427,6 +446,7 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
             minimum_history=minimum_history,
             top_n=top_n,
             cost_multiplier=1.0,
+            borrow_book=borrow_book,
             execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
         )
         stressed = replay_portfolio_fold(
@@ -439,6 +459,7 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
             minimum_history=minimum_history,
             top_n=top_n,
             cost_multiplier=2.0,
+            borrow_book=borrow_book,
             execution_price_mode=str(dataset.get("metadata", {}).get("execution_price_mode") or "daily_open_close_proxy"),
         )
         if not normal["days"]:
@@ -496,9 +517,29 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
         "closed_trades": sum(result["closed_trades"] for result in normal_results),
         "maximum_positions_observed": max(day["positions"] for day in normal_days),
         "parameter_trials": parameter_trials,
+        "transaction_fees": round(
+            sum(result["cost_metrics"]["transaction_fees"] for result in normal_results),
+            8,
+        ),
+        "financing_cost": round(
+            sum(result["cost_metrics"]["financing_cost"] for result in normal_results),
+            8,
+        ),
+        "borrow_cost": round(
+            sum(result["cost_metrics"]["borrow_cost"] for result in normal_results),
+            8,
+        ),
+        "stressed_financing_cost": round(
+            sum(result["cost_metrics"]["financing_cost"] for result in stressed_results),
+            8,
+        ),
+        "stressed_borrow_cost": round(
+            sum(result["cost_metrics"]["borrow_cost"] for result in stressed_results),
+            8,
+        ),
     }
 
-    metadata = deepcopy(dataset.get("metadata") or {})
+    metadata = source_metadata
     metadata["dataset_contract_version"] = BACKTEST_DATASET_CONTRACT_VERSION
     metadata["signal_model"] = SIGNAL_MODEL_ID
     metadata["point_in_time_complete"] = bool(metadata.get("point_in_time_complete")) and all(
@@ -519,6 +560,38 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
     metadata["execution_data_complete"] = bool(metadata.get("execution_data_complete")) and all(
         result["execution_data_coverage_complete"] for result in normal_results
     )
+    engine_metadata = [result["metadata"] for result in normal_results]
+    borrow_apr_summaries = [item["borrow_apr_pct"] for item in engine_metadata]
+    metadata.update(
+        {
+            "exposure_mode": str(
+                strategy.get("exposure_policy", {}).get("mode") or "LONG_ONLY"
+            ),
+            "financing_apr_pct": engine_metadata[0]["financing_apr_pct"],
+            "borrow_apr_pct": {
+                "minimum": min(item["minimum"] for item in borrow_apr_summaries),
+                "maximum": max(item["maximum"] for item in borrow_apr_summaries),
+                "average": statistics.fmean(
+                    item["average"] for item in borrow_apr_summaries
+                ),
+            },
+            "cost_multiplier": 1.0,
+            "borrow_cost_estimated": any(
+                bool(item["borrow_cost_estimated"]) for item in engine_metadata
+            ),
+            "borrow_history_complete": all(
+                bool(item["borrow_history_complete"]) for item in engine_metadata
+            ),
+            "portfolio_engine_version": engine_metadata[0][
+                "portfolio_engine_version"
+            ],
+            "ledger_schema_version": engine_metadata[0]["ledger_schema_version"],
+            "strategy_schema_version": engine_metadata[0][
+                "strategy_schema_version"
+            ],
+            "policy_revision": engine_metadata[0]["policy_revision"],
+        }
+    )
     approval_gate = evaluate_approval_gate(metrics, validation, metadata)
     return {
         "status": "succeeded",
@@ -531,8 +604,8 @@ def run_walk_forward_backtest(dataset: dict, strategy: dict) -> dict:
             "data_cutoff": "previous_trading_day_close",
             "entry": "signal_day_open_with_t_plus_one",
             "exit": "shared_portfolio_pipeline",
-            "valuation": "daily_liquidation_nav",
-            "cost_model": "commission_stamp_transfer_slippage",
+            "valuation": "mark_to_market_nav",
+            "cost_model": "commission_stamp_transfer_slippage_financing_borrow",
             "stress_cost_multiplier": 2.0,
         },
         "metadata": {**metadata, "signal_contract": signal_contract(strategy)},

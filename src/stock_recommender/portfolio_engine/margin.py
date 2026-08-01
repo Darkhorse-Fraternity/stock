@@ -19,6 +19,7 @@ from .contracts import (
     PositionSide,
     PositionSnapshot,
 )
+from .money import canonical_amount, decimal_amount
 from .valuation import value_account
 
 
@@ -414,12 +415,17 @@ def _updated_positions(
     else:
         if existing is None:
             raise RuntimeError("validated REDUCE intent lost its existing position")
+        quantity = existing.quantity - intent.quantity
+        sellable_quantity = existing.sellable_quantity
+        if sellable_quantity is not None:
+            sellable_quantity = min(sellable_quantity, quantity)
         positions[positions.index(existing)] = replace(
             existing,
-            quantity=existing.quantity - intent.quantity,
+            quantity=quantity,
             current_price=(None if price is not None else existing.current_price),
+            sellable_quantity=sellable_quantity,
         )
-    return tuple(positions)
+    return tuple(sorted(positions, key=lambda item: item.symbol))
 
 
 def _project_position_quantities_for_intent(
@@ -441,21 +447,27 @@ def _short_cover_balances(
     account: AccountSnapshot,
     existing: PositionSnapshot,
     closed_quantity: int,
-    cover_cost: float,
-) -> tuple[float, float, float]:
+    cover_cost: Decimal,
+) -> tuple[Decimal, Decimal, Decimal]:
     """Release original short-sale basis and settle the cover difference."""
 
-    released_proceeds = float(
-        Decimal(str(existing.average_cost)) * closed_quantity
+    released_proceeds = (
+        decimal_amount(existing.average_cost, "average_cost") * closed_quantity
     )
-    if not math.isfinite(released_proceeds):
+    try:
+        released_float = float(released_proceeds)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("released short proceeds must be finite") from exc
+    if not math.isfinite(released_float):
         raise ValueError("released short proceeds must be finite")
-
-    restricted = float(account.restricted_short_proceeds)
+    restricted = decimal_amount(
+        account.restricted_short_proceeds,
+        "restricted_short_proceeds",
+    )
     if released_proceeds > restricted:
         if math.isclose(
-            released_proceeds,
-            restricted,
+            float(released_proceeds),
+            float(restricted),
             rel_tol=1e-12,
             abs_tol=1e-9,
         ):
@@ -464,16 +476,16 @@ def _short_cover_balances(
             raise ValueError(
                 "restricted_short_proceeds is below the short basis to release"
             )
-    restricted = max(0.0, restricted - released_proceeds)
+    restricted = max(Decimal(0), restricted - released_proceeds)
 
-    available_cash = float(account.available_cash)
-    margin_loan = float(account.margin_loan)
-    settlement = released_proceeds - cover_cost
+    available_cash = decimal_amount(account.available_cash, "available_cash")
+    margin_loan = decimal_amount(account.margin_loan, "margin_loan")
+    settlement = released_proceeds - decimal_amount(cover_cost, "cover_cost")
     if settlement >= 0:
         available_cash += settlement
     else:
         loss = -settlement
-        cash_used = min(max(0.0, available_cash), loss)
+        cash_used = min(max(Decimal(0), available_cash), loss)
         available_cash -= cash_used
         margin_loan += loss - cash_used
     return available_cash, restricted, margin_loan
@@ -494,17 +506,18 @@ def project_account_for_intent(
         if intent.increases_risk:
             raise
         return _project_position_quantities_for_intent(account, intent)
-    notional = float(Decimal(str(price)) * intent.quantity)
-    if not math.isfinite(notional):
-        raise ValueError("intent notional must be finite")
+    notional = decimal_amount(price, "price") * intent.quantity
 
-    available_cash = float(account.available_cash)
-    restricted = float(account.restricted_short_proceeds)
-    margin_loan = float(account.margin_loan)
+    available_cash = decimal_amount(account.available_cash, "available_cash")
+    restricted = decimal_amount(
+        account.restricted_short_proceeds,
+        "restricted_short_proceeds",
+    )
+    margin_loan = decimal_amount(account.margin_loan, "margin_loan")
     increasing = intent.increases_risk
     if intent.position_side is PositionSide.LONG:
         if increasing:
-            cash_used = min(max(0.0, available_cash), notional)
+            cash_used = min(max(Decimal(0), available_cash), notional)
             available_cash -= cash_used
             margin_loan += notional - cash_used
         else:
@@ -525,9 +538,12 @@ def project_account_for_intent(
 
     return replace(
         account,
-        available_cash=available_cash,
-        restricted_short_proceeds=restricted,
-        margin_loan=margin_loan,
+        available_cash=canonical_amount(available_cash, "available_cash"),
+        restricted_short_proceeds=canonical_amount(
+            restricted,
+            "restricted_short_proceeds",
+        ),
+        margin_loan=canonical_amount(margin_loan, "margin_loan"),
         positions=_updated_positions(account, intent, existing, price),
     )
 

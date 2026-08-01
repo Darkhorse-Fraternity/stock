@@ -34,6 +34,7 @@ from .contracts import (
     verify_order_intent_id,
 )
 from .margin import IntentSemanticsError, project_account_for_intent
+from .money import charge_cash_or_margin
 
 
 def _finite_nonnegative(value: object, field_name: str) -> float:
@@ -1001,14 +1002,11 @@ def _capped_for_t_plus_one(
 
 
 def _charge_fee(account: AccountSnapshot, fees: float) -> AccountSnapshot:
-    amount = Decimal(str(_finite_nonnegative(fees, "fees")))
-    cash = Decimal(str(account.available_cash))
-    loan = Decimal(str(account.margin_loan))
-    available = max(Decimal(0), cash)
-    cash_used = min(available, amount)
-    cash -= cash_used
-    loan += amount - cash_used
-    return replace(account, available_cash=float(cash), margin_loan=float(loan))
+    return charge_cash_or_margin(
+        account,
+        _finite_nonnegative(fees, "fees"),
+        field_name="fees",
+    )
 
 
 def _apply_position_sellability(
@@ -1509,7 +1507,11 @@ def execute_intents(
         current,
         tuple(fills),
         tuple(diagnostics),
-        tuple(sorted(progress_by_id.values(), key=lambda item: item.intent_id)),
+        tuple(
+            progress_by_id[item.id]
+            for item in resolved
+            if item.id in progress_by_id
+        ),
         tuple(
             PositionSettlementUpdate.from_position(held)
             for held in sorted(current.positions, key=lambda item: item.symbol)

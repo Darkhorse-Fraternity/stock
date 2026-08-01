@@ -36,6 +36,7 @@ from stock_recommender.portfolio_engine.contracts import (
     stable_execution_progress_fill_id,
 )
 from stock_recommender.portfolio_engine.ledger import (
+    InMemoryLedgerStore,
     JsonLedgerStore,
     LedgerError,
     LedgerSchemaError,
@@ -174,6 +175,36 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def test_execution_and_ledger_share_exact_decimal_fee_transition(self):
+        source = account(cash=999_999.8364)
+
+        execution_account = execution._charge_fee(source, 0.1636)
+        replayed_account = ledger_module._charge_fee(source, 0.1636)
+
+        self.assertEqual(execution_account, replayed_account)
+        self.assertEqual(execution_account.available_cash, 999_999.6728)
+
+    def test_in_memory_store_reuses_canonical_commit_and_validates_at_boundary(self):
+        store = InMemoryLedgerStore(self.path.parent / "memory-ledger.lock")
+        opened = replace(
+            account(strategy_id="memory"),
+            snapshot_id="memory-snapshot-0",
+        )
+        store.create_account(opened)
+
+        committed = store.commit(
+            batch(
+                strategy_id="memory",
+                snapshot_id=opened.snapshot_id,
+                events=(cash_event("memory-cash", -10.0),),
+            )
+        )
+
+        self.assertIs(InMemoryLedgerStore.commit, JsonLedgerStore.commit)
+        self.assertEqual(store.load("memory"), committed)
+        self.assertEqual(committed.available_cash, 990.0)
+        store.validate_integrity()
 
     def test_revision_transition_is_typed_atomic_idempotent_and_auditable(self):
         path = self.path.parent / "revision-transition.json"

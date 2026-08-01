@@ -85,6 +85,9 @@ class FactorRankLongAdapter:
                 row = dict(raw)
             except (TypeError, ValueError):
                 continue
+            selected_for_long = row.get("selected_for_long", True)
+            if type(selected_for_long) is not bool or not selected_for_long:
+                continue
             symbol = str(row.get("symbol") or "").strip()
             score = _finite_number(row.get("score", row.get("signal_score")))
             requested_weight = _finite_number(

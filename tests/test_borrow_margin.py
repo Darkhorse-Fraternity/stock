@@ -944,6 +944,64 @@ class MarginBehaviorTests(unittest.TestCase):
                         getattr(original, field_name),
                     )
 
+    def test_reduction_clamps_long_sellability_and_leaves_short_state_absent(self):
+        long_position = position(quantity=10)
+        long_position = replace(
+            long_position,
+            sellable_quantity=8,
+            sellable_on=NOW.date(),
+        )
+        long_reduction = intent(
+            position_effect=PositionEffect.REDUCE,
+            order_side=OrderSide.SELL,
+            quantity=6,
+        )
+        short_position = position("S", PositionSide.SHORT, quantity=10)
+        short_reduction = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.REDUCE,
+            quantity=6,
+        )
+
+        reduced_long = margin.project_account_for_intent(
+            account(cash=0.0, positions=(long_position,)),
+            long_reduction,
+            {},
+        ).positions[0]
+        reduced_short = margin.project_account_for_intent(
+            account(
+                cash=0.0,
+                positions=(short_position,),
+                restricted_short_proceeds=10.0,
+            ),
+            short_reduction,
+            {},
+        ).positions[0]
+
+        self.assertEqual(reduced_long.quantity, 4)
+        self.assertEqual(reduced_long.sellable_quantity, 4)
+        self.assertIsNone(reduced_short.sellable_quantity)
+        self.assertIsNone(reduced_short.sellable_on)
+
+    def test_projected_positions_are_canonicalized_by_symbol(self):
+        source = account(cash=100.0)
+        opened_z = margin.project_account_for_intent(
+            source,
+            intent("Z", quantity=1),
+            {"Z": 1.0},
+        )
+        opened_a = margin.project_account_for_intent(
+            opened_z,
+            intent("A", quantity=1),
+            {"A": 1.0},
+        )
+
+        self.assertEqual(
+            [held.symbol for held in opened_a.positions],
+            ["A", "Z"],
+        )
+
     def test_valuation_overflow_is_not_mislabeled_as_missing_market_data(self):
         huge_position = position(quantity=10**308)
         original = account(cash=1.0, positions=(huge_position,))

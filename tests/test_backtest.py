@@ -130,6 +130,64 @@ class BacktestTests(unittest.TestCase):
         self.assertLessEqual(result["metrics"]["maximum_positions_observed"], 10)
         self.assertGreater(result["metrics"]["maximum_drawdown_pct"], -100)
 
+    def test_long_short_result_exposes_engine_costs_and_borrow_readiness(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        strategy["id"] = "strategy-long-short"
+        strategy["market"] = "us"
+        strategy["parameters"]["market"]["value"] = "us"
+        strategy["exposure_policy"]["mode"] = "LONG_SHORT"
+
+        result = run_walk_forward_backtest(synthetic_dataset(), strategy)
+        metadata = result["metadata"]
+        check = next(
+            item
+            for item in result["approval_gate"]["checks"]
+            if item["id"] == "borrow_history"
+        )
+
+        self.assertEqual(metadata["exposure_mode"], "LONG_SHORT")
+        self.assertEqual(metadata["cost_multiplier"], 1.0)
+        self.assertIn("financing_apr_pct", metadata)
+        self.assertIn("borrow_apr_pct", metadata)
+        self.assertTrue(metadata["borrow_cost_estimated"])
+        self.assertFalse(metadata["borrow_history_complete"])
+        self.assertIn("financing_cost", result["metrics"])
+        self.assertIn("borrow_cost", result["metrics"])
+        self.assertEqual(result["execution"]["valuation"], "mark_to_market_nav")
+        self.assertFalse(check["passed"])
+
+    def test_complete_historical_borrow_satisfies_long_short_check(self):
+        strategy = compact_validation(load_strategy_config(path=Path("/missing")))
+        strategy["id"] = "strategy-long-short-complete"
+        strategy["market"] = "us"
+        strategy["parameters"]["market"]["value"] = "us"
+        strategy["exposure_policy"]["mode"] = "LONG_SHORT"
+        dataset = synthetic_dataset()
+        dataset["metadata"]["borrow_history_complete"] = True
+        dataset["borrow_history"] = {
+            row["date"]: {
+                symbol: {
+                    "shortable": True,
+                    "easy_to_borrow": True,
+                    "available_quantity": 1_000_000,
+                    "borrow_apr_pct": 8.0,
+                }
+                for symbol in dataset["panel"]
+            }
+            for row in dataset["benchmark"]
+        }
+
+        result = run_walk_forward_backtest(dataset, strategy)
+        check = next(
+            item
+            for item in result["approval_gate"]["checks"]
+            if item["id"] == "borrow_history"
+        )
+
+        self.assertTrue(result["metadata"]["borrow_history_complete"])
+        self.assertFalse(result["metadata"]["borrow_cost_estimated"])
+        self.assertTrue(check["passed"])
+
     def test_current_constituent_dataset_cannot_pass_live_gate(self):
         strategy = compact_validation(load_strategy_config(path=Path("/missing")))
         result = run_walk_forward_backtest(synthetic_dataset(point_in_time=False), strategy)
@@ -251,7 +309,8 @@ class BacktestTests(unittest.TestCase):
                 data_loader=lambda _: synthetic_dataset(),
             )
             completed = None
-            for _ in range(100):
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
                 completed = get_backtest(queued["id"], path=results_path)
                 if completed and completed["status"] in {"succeeded", "failed"}:
                     break

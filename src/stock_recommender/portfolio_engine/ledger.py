@@ -42,6 +42,7 @@ from .contracts import (
 )
 from .atomic_io import atomic_replace_bytes, transaction_guard
 from .margin import project_account_for_intent
+from .money import charge_cash_or_margin
 from .valuation import value_account
 
 
@@ -1586,10 +1587,7 @@ def _batch_fingerprint(
 
 
 def _charge_fee(account: AccountSnapshot, amount: float) -> AccountSnapshot:
-    cash = account.available_cash
-    loan = account.margin_loan
-    used = min(max(0.0, cash), amount)
-    return replace(account, available_cash=cash - used, margin_loan=loan + amount - used)
+    return charge_cash_or_margin(account, amount, field_name="fees")
 
 
 def _touch_position_after_fill(
@@ -2177,6 +2175,15 @@ class JsonLedgerStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
 
+    def _read_store_payload(self) -> dict[str, Any]:
+        return _read_store(self.path)
+
+    def _validate_store_for_write(self, payload: Mapping[str, Any]) -> None:
+        validate_ledger_payload(payload)
+
+    def _write_store_payload(self, payload: Mapping[str, Any]) -> None:
+        _atomic_write(self.path, payload)
+
     def create_account(self, account: AccountSnapshot) -> AccountSnapshot:
         """Create one fully explicit account, idempotently and under the store lock."""
 
@@ -2215,7 +2222,7 @@ class JsonLedgerStore:
             "run_results": [],
         }
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             existing = store["accounts"].get(account.strategy_id)
             if existing is not None:
                 if existing != expected:
@@ -2228,8 +2235,8 @@ class JsonLedgerStore:
                 "accounts": dict(store["accounts"]),
             }
             next_store["accounts"][account.strategy_id] = expected
-            validate_ledger_payload(next_store)
-            _atomic_write(self.path, next_store)
+            self._validate_store_for_write(next_store)
+            self._write_store_payload(next_store)
             return account
 
     def transition_revision(
@@ -2241,7 +2248,7 @@ class JsonLedgerStore:
         if type(transition) is not RevisionTransition:
             raise TypeError("transition must be RevisionTransition")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             try:
                 persisted = _require_mapping(
                     store["accounts"][transition.strategy_id],
@@ -2342,15 +2349,15 @@ class JsonLedgerStore:
                 "accounts": dict(store["accounts"]),
             }
             next_store["accounts"][transition.strategy_id] = raw_account
-            validate_ledger_payload(next_store)
-            _atomic_write(self.path, next_store)
+            self._validate_store_for_write(next_store)
+            self._write_store_payload(next_store)
             return transitioned
 
     def load(self, strategy_id: str) -> AccountSnapshot:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             try:
                 payload = store["accounts"][strategy_id]
             except KeyError as exc:
@@ -2363,7 +2370,7 @@ class JsonLedgerStore:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             try:
                 payload = _require_mapping(
                     store["accounts"][strategy_id],
@@ -2403,7 +2410,7 @@ class JsonLedgerStore:
 
     def list_accounts(self) -> tuple[AccountSnapshot, ...]:
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             return tuple(
                 decode_account_snapshot(store["accounts"][strategy_id])
                 for strategy_id in sorted(store["accounts"])
@@ -2425,7 +2432,7 @@ class JsonLedgerStore:
             if type(value) is not str or not value:
                 raise ValueError(f"{field_name} must be a non-empty string")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             try:
                 persisted = _require_mapping(
                     store["accounts"][strategy_id],
@@ -2471,7 +2478,7 @@ class JsonLedgerStore:
         if type(batch) is not DecisionBatch:
             raise TypeError("batch must be DecisionBatch")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = _read_store(self.path)
+            store = self._read_store_payload()
             try:
                 persisted = _require_mapping(
                     store["accounts"][batch.strategy_id], "account"
@@ -2648,9 +2655,41 @@ class JsonLedgerStore:
                 "accounts": dict(store["accounts"]),
             }
             next_store["accounts"][batch.strategy_id] = raw_account
-            validate_ledger_payload(next_store)
-            _atomic_write(self.path, next_store)
+            self._validate_store_for_write(next_store)
+            self._write_store_payload(next_store)
             return current
+
+
+class InMemoryLedgerStore(JsonLedgerStore):
+    """Ephemeral adapter that reuses the canonical ledger transaction logic.
+
+    Each batch still passes the same typed fact, replay, idempotency, and account
+    checks as ``JsonLedgerStore``.  Whole-history validation is deferred until
+    ``validate_integrity`` so long simulations do not re-hash every prior batch
+    on every frame.
+    """
+
+    def __init__(self, lock_path: str | Path):
+        super().__init__(lock_path)
+        self._payload: dict[str, Any] = {
+            "version": LEDGER_SCHEMA_VERSION,
+            "accounts": {},
+        }
+
+    def _read_store_payload(self) -> dict[str, Any]:
+        return self._payload
+
+    def _validate_store_for_write(self, payload: Mapping[str, Any]) -> None:
+        if payload.get("version") != LEDGER_SCHEMA_VERSION:
+            raise LedgerError("in-memory ledger version is invalid")
+        if type(payload.get("accounts")) is not dict:
+            raise LedgerError("in-memory ledger accounts must be a dict")
+
+    def _write_store_payload(self, payload: Mapping[str, Any]) -> None:
+        self._payload = dict(payload)
+
+    def validate_integrity(self) -> None:
+        validate_ledger_payload(self._payload)
 
 
 def _merge_fill_rows(existing: list[Any], new_rows: list[dict[str, Any]]) -> list[Any]:
