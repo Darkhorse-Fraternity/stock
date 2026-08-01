@@ -5,12 +5,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-import os
-import tempfile
 import threading
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from datetime import date, datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -36,6 +35,7 @@ from .contracts import (
     PositionSide,
     PositionSnapshot,
 )
+from .atomic_io import atomic_replace_bytes
 from .margin import project_account_for_intent
 from .valuation import value_account
 
@@ -60,6 +60,27 @@ _INFORMATIONAL_EVENT_TYPES = frozenset(
         "FINANCING_COST_ACCRUED",
         "BORROW_COST_ACCRUED",
     }
+)
+_ACCOUNT_SNAPSHOT_FIELDS = frozenset(
+    {
+        "id",
+        "strategy_id",
+        "strategy_revision",
+        "occurred_at",
+        "available_cash",
+        "reserved_cash",
+        "restricted_short_proceeds",
+        "margin_loan",
+        "accrued_financing_cost",
+        "accrued_borrow_cost",
+        "positions",
+        "carry_accruals",
+        "financing_lifecycle",
+        "portfolio_snapshot_id",
+    }
+)
+_ACCOUNT_FIELDS = _ACCOUNT_SNAPSHOT_FIELDS | frozenset(
+    {"open_intents", "fills", "execution_progress", "events", "committed_batches"}
 )
 
 
@@ -89,6 +110,25 @@ def _require_list(value: object, label: str) -> list[Any]:
     if not isinstance(value, list):
         raise LedgerSchemaError(f"{label} must be an array")
     return value
+
+
+def _require_keys(
+    value: Mapping[str, Any],
+    expected: frozenset[str],
+    label: str,
+    *,
+    exact: bool = True,
+) -> None:
+    actual = set(value)
+    missing = expected - actual
+    extra = actual - expected if exact else set()
+    if missing or extra:
+        details = []
+        if missing:
+            details.append("missing " + ", ".join(sorted(missing)))
+        if extra:
+            details.append("unexpected " + ", ".join(sorted(map(str, extra))))
+        raise LedgerSchemaError(f"{label} fields are invalid: {'; '.join(details)}")
 
 
 def _iso_datetime(value: object, label: str) -> datetime:
@@ -129,6 +169,7 @@ def _lifecycle_from_json(value: object, label: str) -> AccrualLifecycle | None:
     if value is None:
         return None
     item = _require_mapping(value, label)
+    _require_keys(item, frozenset({"id", "started_on"}), label)
     try:
         return AccrualLifecycle(
             id=item["id"],
@@ -161,8 +202,28 @@ def _position_to_json(position: PositionSnapshot) -> dict[str, Any]:
 
 def _position_from_json(symbol: str, value: object) -> PositionSnapshot:
     item = _require_mapping(value, f"position[{symbol}]")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "symbol",
+                "side",
+                "quantity",
+                "average_cost",
+                "current_price",
+                "peak_price",
+                "trough_price",
+                "trailing_active",
+                "position_mode",
+                "sellable_quantity",
+                "sellable_on",
+                "borrow_lifecycle",
+            }
+        ),
+        f"position[{symbol}]",
+    )
     try:
-        embedded_symbol = item.get("symbol", symbol)
+        embedded_symbol = item["symbol"]
         if embedded_symbol != symbol:
             raise LedgerSchemaError("position key and symbol differ")
         return PositionSnapshot(
@@ -170,19 +231,19 @@ def _position_from_json(symbol: str, value: object) -> PositionSnapshot:
             side=_enum(PositionSide, item["side"], "position.side"),
             quantity=item["quantity"],
             average_cost=item["average_cost"],
-            current_price=item.get("current_price"),
-            peak_price=item.get("peak_price"),
-            trough_price=item.get("trough_price"),
-            trailing_active=item.get("trailing_active", False),
-            position_mode=item.get("position_mode", "NORMAL"),
-            sellable_quantity=item.get("sellable_quantity"),
+            current_price=item["current_price"],
+            peak_price=item["peak_price"],
+            trough_price=item["trough_price"],
+            trailing_active=item["trailing_active"],
+            position_mode=item["position_mode"],
+            sellable_quantity=item["sellable_quantity"],
             sellable_on=(
                 None
-                if item.get("sellable_on") is None
+                if item["sellable_on"] is None
                 else _iso_date(item["sellable_on"], "position.sellable_on")
             ),
             borrow_lifecycle=_lifecycle_from_json(
-                item.get("borrow_lifecycle"), "position.borrow_lifecycle"
+                item["borrow_lifecycle"], "position.borrow_lifecycle"
             ),
         )
     except (KeyError, TypeError, ValueError) as exc:
@@ -205,6 +266,21 @@ def _carry_to_json(record: CarryAccrualRecord) -> dict[str, Any]:
 
 def _carry_from_json(value: object) -> CarryAccrualRecord:
     item = _require_mapping(value, "carry_accrual")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "account_id",
+                "cost_type",
+                "accrual_date",
+                "elapsed_days",
+                "amount",
+                "lifecycle_id",
+                "symbol",
+            }
+        ),
+        "carry_accrual",
+    )
     try:
         return CarryAccrualRecord(
             account_id=item["account_id"],
@@ -213,7 +289,7 @@ def _carry_from_json(value: object) -> CarryAccrualRecord:
             elapsed_days=item["elapsed_days"],
             amount=item["amount"],
             lifecycle_id=item["lifecycle_id"],
-            symbol=item.get("symbol"),
+            symbol=item["symbol"],
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LedgerSchemaError):
@@ -251,10 +327,9 @@ def decode_account_snapshot(value: object) -> AccountSnapshot:
     """Deserialize and validate one schema-v2 account payload."""
 
     item = _require_mapping(value, "account")
-    positions_payload = _require_mapping(item.get("positions"), "account.positions")
-    accrual_payload = _require_list(
-        item.get("carry_accruals", []), "account.carry_accruals"
-    )
+    _require_keys(item, _ACCOUNT_SNAPSHOT_FIELDS, "account", exact=False)
+    positions_payload = _require_mapping(item["positions"], "account.positions")
+    accrual_payload = _require_list(item["carry_accruals"], "account.carry_accruals")
     try:
         account = AccountSnapshot(
             id=item["id"],
@@ -262,20 +337,20 @@ def decode_account_snapshot(value: object) -> AccountSnapshot:
             strategy_revision=item["strategy_revision"],
             occurred_at=_iso_datetime(item["occurred_at"], "account.occurred_at"),
             available_cash=item["available_cash"],
-            reserved_cash=item.get("reserved_cash", 0.0),
-            restricted_short_proceeds=item.get("restricted_short_proceeds", 0.0),
-            margin_loan=item.get("margin_loan", 0.0),
-            accrued_financing_cost=item.get("accrued_financing_cost", 0.0),
-            accrued_borrow_cost=item.get("accrued_borrow_cost", 0.0),
+            reserved_cash=item["reserved_cash"],
+            restricted_short_proceeds=item["restricted_short_proceeds"],
+            margin_loan=item["margin_loan"],
+            accrued_financing_cost=item["accrued_financing_cost"],
+            accrued_borrow_cost=item["accrued_borrow_cost"],
             positions=tuple(
                 _position_from_json(symbol, positions_payload[symbol])
                 for symbol in sorted(positions_payload)
             ),
             carry_accruals=tuple(_carry_from_json(raw) for raw in accrual_payload),
             financing_lifecycle=_lifecycle_from_json(
-                item.get("financing_lifecycle"), "account.financing_lifecycle"
+                item["financing_lifecycle"], "account.financing_lifecycle"
             ),
-            snapshot_id=item.get("portfolio_snapshot_id", item["id"]),
+            snapshot_id=item["portfolio_snapshot_id"],
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LedgerSchemaError):
@@ -300,6 +375,22 @@ def _intent_to_json(intent: OrderIntent) -> dict[str, Any]:
 
 def _intent_from_json(value: object) -> OrderIntent:
     item = _require_mapping(value, "intent")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "id",
+                "symbol",
+                "position_side",
+                "order_side",
+                "position_effect",
+                "quantity",
+                "reason",
+                "created_snapshot_id",
+            }
+        ),
+        "intent",
+    )
     try:
         return OrderIntent(
             id=item["id"],
@@ -332,6 +423,11 @@ def _fill_to_json(fill: ExecutionFill) -> dict[str, Any]:
 
 def _fill_from_json(value: object) -> ExecutionFill:
     item = _require_mapping(value, "fill")
+    _require_keys(
+        item,
+        frozenset({"intent_id", "symbol", "quantity", "price", "fees", "status"}),
+        "fill",
+    )
     try:
         return ExecutionFill(
             intent_id=item["intent_id"],
@@ -358,6 +454,7 @@ def _event_to_json(event: PortfolioEvent) -> dict[str, Any]:
 
 def _event_from_json(value: object) -> PortfolioEvent:
     item = _require_mapping(value, "event")
+    _require_keys(item, frozenset({"id", "type", "occurred_at", "data"}), "event")
     try:
         return PortfolioEvent(
             id=item["id"],
@@ -401,6 +498,26 @@ def _progress_fill_to_json(fill: ExecutionProgressFill) -> dict[str, Any]:
 
 def _progress_fill_from_json(value: object) -> ExecutionProgressFill:
     item = _require_mapping(value, "execution_progress.fill")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "id",
+                "intent_id",
+                "symbol",
+                "position_side",
+                "order_side",
+                "snapshot_id",
+                "occurred_at",
+                "quantity",
+                "price",
+                "fees",
+                "commission",
+                "status",
+            }
+        ),
+        "execution_progress.fill",
+    )
     try:
         return ExecutionProgressFill(
             id=item["id"],
@@ -437,7 +554,23 @@ def _progress_to_json(progress: OrderExecutionProgress) -> dict[str, Any]:
 
 def _progress_from_json(value: object) -> OrderExecutionProgress:
     item = _require_mapping(value, "execution_progress")
-    fills = _require_list(item.get("fills"), "execution_progress.fills")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "intent_id",
+                "symbol",
+                "position_side",
+                "order_side",
+                "intent_quantity",
+                "execution_policy_fingerprint",
+                "fills",
+                "position_average_cost",
+            }
+        ),
+        "execution_progress",
+    )
+    fills = _require_list(item["fills"], "execution_progress.fills")
     try:
         return OrderExecutionProgress(
             intent_id=item["intent_id"],
@@ -447,7 +580,7 @@ def _progress_from_json(value: object) -> OrderExecutionProgress:
             intent_quantity=item["intent_quantity"],
             execution_policy_fingerprint=item["execution_policy_fingerprint"],
             fills=tuple(_progress_fill_from_json(raw) for raw in fills),
-            position_average_cost=item.get("position_average_cost"),
+            position_average_cost=item["position_average_cost"],
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LedgerSchemaError):
@@ -457,7 +590,12 @@ def _progress_from_json(value: object) -> OrderExecutionProgress:
 
 def _json_plain(value: Any) -> Any:
     if isinstance(value, Mapping):
-        return {str(key): _json_plain(item) for key, item in value.items()}
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise LedgerError("JSON object keys must be strings")
+            result[key] = _json_plain(item)
+        return result
     if isinstance(value, (tuple, list)):
         return [_json_plain(item) for item in value]
     if isinstance(value, (PositionSide, OrderSide, PositionEffect, CarryCostType)):
@@ -469,6 +607,52 @@ def _json_plain(value: Any) -> Any:
             raise LedgerError("non-finite JSON number")
         return value
     raise LedgerError(f"unsupported JSON value: {type(value).__name__}")
+
+
+def _fingerprint_plain(value: Any) -> Any:
+    """Encode immutable domain values without dropping observable fields."""
+
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            "__type__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "fields": {
+                field.name: _fingerprint_plain(getattr(value, field.name))
+                for field in fields(value)
+            },
+        }
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise LedgerError("observable mapping keys must be strings")
+            result[key] = _fingerprint_plain(item)
+        return result
+    if isinstance(value, (tuple, list)):
+        return [_fingerprint_plain(item) for item in value]
+    if isinstance(value, frozenset):
+        encoded = [_fingerprint_plain(item) for item in value]
+        return sorted(
+            encoded,
+            key=lambda item: json.dumps(
+                item, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ),
+        )
+    if isinstance(value, Enum):
+        return {
+            "__enum__": f"{type(value).__module__}.{type(value).__qualname__}",
+            "value": _fingerprint_plain(value.value),
+        }
+    if isinstance(value, datetime):
+        return {"__datetime__": value.isoformat()}
+    if isinstance(value, date):
+        return {"__date__": value.isoformat()}
+    if isinstance(value, bytes):
+        return {"__bytes__": value.hex()}
+    if value is None or type(value) in {bool, int, float, str}:
+        if type(value) is float and not math.isfinite(value):
+            raise LedgerError("non-finite observable number")
+        return value
+    raise LedgerError(f"unsupported observable value: {type(value).__name__}")
 
 
 def _validate_account(account: AccountSnapshot) -> None:
@@ -489,6 +673,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
 
     if not isinstance(payload, dict):
         raise LedgerSchemaError("ledger root must be an object")
+    _require_keys(payload, frozenset({"version", "accounts"}), "ledger root")
     if payload.get("version") != LEDGER_SCHEMA_VERSION:
         raise LedgerSchemaError(
             f"ledger schema version must be {LEDGER_SCHEMA_VERSION}; migration required"
@@ -500,6 +685,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
         if type(strategy_id) is not str or not strategy_id:
             raise LedgerSchemaError("account strategy ID must be a non-empty string")
         item = _require_mapping(raw_account, f"accounts[{strategy_id}]")
+        _require_keys(item, _ACCOUNT_FIELDS, f"accounts[{strategy_id}]")
         decoded = decode_account_snapshot(item)
         if decoded.strategy_id != strategy_id:
             raise LedgerSchemaError("account key does not match strategy_id")
@@ -510,11 +696,11 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             "events",
             "committed_batches",
         ):
-            _require_list(item.get(key, []), f"account.{key}")
-        intents = [_intent_from_json(raw) for raw in item.get("open_intents", [])]
+            _require_list(item[key], f"account.{key}")
+        intents = [_intent_from_json(raw) for raw in item["open_intents"]]
         if len({intent.id for intent in intents}) != len(intents):
             raise LedgerSchemaError("account.open_intents contains duplicate IDs")
-        fills = [_fill_from_json(raw) for raw in item.get("fills", [])]
+        fills = [_fill_from_json(raw) for raw in item["fills"]]
         fill_keys = [
             (
                 fill.intent_id,
@@ -529,11 +715,11 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
         if len(set(fill_keys)) != len(fill_keys):
             raise LedgerSchemaError("account.fills contains duplicate rows")
         progress = [
-            _progress_from_json(raw) for raw in item.get("execution_progress", [])
+            _progress_from_json(raw) for raw in item["execution_progress"]
         ]
         if len({entry.intent_id for entry in progress}) != len(progress):
             raise LedgerSchemaError("account.execution_progress contains duplicate intents")
-        events = [_event_from_json(raw) for raw in item.get("events", [])]
+        events = [_event_from_json(raw) for raw in item["events"]]
         if len({event.id for event in events}) != len(events):
             raise LedgerSchemaError("account.events contains duplicate IDs")
         for event in events:
@@ -541,10 +727,25 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 _validate_event(event)
             except LedgerError as exc:
                 raise LedgerSchemaError(f"invalid persisted event: {exc}") from exc
-        committed = item.get("committed_batches", [])
+        committed = item["committed_batches"]
         run_keys: set[str] = set()
         for index, raw_batch in enumerate(committed):
             batch = _require_mapping(raw_batch, f"committed_batches[{index}]")
+            _require_keys(
+                batch,
+                frozenset(
+                    {
+                        "run_key",
+                        "strategy_id",
+                        "strategy_revision",
+                        "source_snapshot_id",
+                        "result_snapshot_id",
+                        "market_snapshot_id",
+                        "fingerprint",
+                    }
+                ),
+                f"committed_batches[{index}]",
+            )
             run_key = batch.get("run_key")
             if type(run_key) is not str or not run_key:
                 raise LedgerSchemaError("committed batch run_key must be non-empty")
@@ -552,6 +753,20 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 raise LedgerSchemaError("account.committed_batches contains duplicate run keys")
             if batch.get("strategy_id") != strategy_id:
                 raise LedgerSchemaError("committed batch strategy_id differs from account")
+            if type(batch["strategy_revision"]) is not int:
+                raise LedgerSchemaError("committed batch strategy_revision must be an integer")
+            for field_name in ("source_snapshot_id", "result_snapshot_id"):
+                if type(batch[field_name]) is not str or not batch[field_name]:
+                    raise LedgerSchemaError(
+                        f"committed batch {field_name} must be non-empty"
+                    )
+            if batch["market_snapshot_id"] is not None and (
+                type(batch["market_snapshot_id"]) is not str
+                or not batch["market_snapshot_id"]
+            ):
+                raise LedgerSchemaError(
+                    "committed batch market_snapshot_id must be non-empty or null"
+                )
             if type(batch.get("fingerprint")) is not str or not batch["fingerprint"]:
                 raise LedgerSchemaError("committed batch fingerprint must be non-empty")
             run_keys.add(run_key)
@@ -566,7 +781,12 @@ def _read_store(path: Path) -> dict[str, Any]:
     except OSError as exc:
         raise LedgerSchemaError(f"cannot read ledger: {exc}") from exc
     try:
-        payload = json.loads(raw)
+        payload = json.loads(
+            raw,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                LedgerSchemaError(f"nonstandard JSON number: {token}")
+            ),
+        )
     except json.JSONDecodeError as exc:
         raise LedgerSchemaError(f"ledger JSON cannot be parsed: {exc.msg}") from exc
     return validate_ledger_payload(payload)
@@ -587,29 +807,10 @@ def _exclusive_file_lock(path: Path):
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
+    encoded = (
+        json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    ).encode("utf-8")
+    atomic_replace_bytes(path, encoded)
 
 
 def _stable_snapshot_id(batch: DecisionBatch) -> str:
@@ -797,6 +998,8 @@ def _validate_fill_summaries(
             unmatched.remove(key)
         except ValueError as exc:
             raise LedgerError("execution fill summary does not match new progress") from exc
+    if unmatched:
+        raise LedgerError("new execution progress is missing an execution fill summary")
 
 
 def _batch_fingerprint(
@@ -811,17 +1014,15 @@ def _batch_fingerprint(
 ) -> str:
     intents, fills, progress, updates, accruals = facts
     material = {
-        "run_key": batch.run_key,
-        "strategy_id": batch.strategy_id,
-        "strategy_revision": batch.strategy_revision,
-        "portfolio_snapshot_id": batch.portfolio_snapshot_id,
-        "market_snapshot_id": batch.market_snapshot_id,
-        "intents": [_intent_to_json(item) for item in intents],
-        "fills": [_fill_to_json(item) for item in fills],
-        "events": [_event_to_json(item) for item in batch.events],
-        "execution_progress": [_progress_to_json(item) for item in progress],
-        "position_risk_updates": [_risk_update_to_json(item) for item in updates],
-        "carry_accruals": [_carry_to_json(item) for item in accruals],
+        "batch": _fingerprint_plain(batch),
+        "canonical_facts": {
+            "intents": [_fingerprint_plain(item) for item in intents],
+            "fills": [_fingerprint_plain(item) for item in fills],
+            "execution_progress": [_fingerprint_plain(item) for item in progress],
+            "position_risk_updates": [_fingerprint_plain(item) for item in updates],
+            "carry_accruals": [_fingerprint_plain(item) for item in accruals],
+            "execution_account": _fingerprint_plain(_execution_account_fact(batch)),
+        },
     }
     encoded = json.dumps(
         material,
@@ -1045,6 +1246,7 @@ def _validate_carry_event_pairs(
 
 
 def _validate_event(event: PortfolioEvent) -> None:
+    _json_plain(event.data)
     if event.type == "CASH_ADJUSTED":
         if set(event.data) != {"amount"}:
             raise LedgerError("CASH_ADJUSTED data must contain only amount")
@@ -1123,7 +1325,7 @@ class JsonLedgerStore:
                 ) from exc
             account = decode_account_snapshot(persisted)
             committed = _require_list(
-                persisted.get("committed_batches", []), "account.committed_batches"
+                persisted["committed_batches"], "account.committed_batches"
             )
             canonical_facts = _canonical_batch_facts(batch)
             fingerprint = _batch_fingerprint(batch, canonical_facts)
@@ -1141,7 +1343,7 @@ class JsonLedgerStore:
                 if existing_batch.get("fingerprint") != fingerprint:
                     raise LedgerError("run_key was already committed with different facts")
                 return account
-            expected_snapshot = persisted.get("portfolio_snapshot_id", account.snapshot_id or account.id)
+            expected_snapshot = persisted["portfolio_snapshot_id"]
             if batch.portfolio_snapshot_id != expected_snapshot:
                 raise StalePortfolioSnapshotError(
                     f"stale portfolio snapshot: expected {expected_snapshot}, "
@@ -1155,7 +1357,7 @@ class JsonLedgerStore:
             existing_intents = tuple(
                 _intent_from_json(raw)
                 for raw in _require_list(
-                    persisted.get("open_intents", []), "account.open_intents"
+                    persisted["open_intents"], "account.open_intents"
                 )
             )
             intents_by_id = {item.id: item for item in existing_intents}
@@ -1170,7 +1372,7 @@ class JsonLedgerStore:
                 for item in (
                     _progress_from_json(raw)
                     for raw in _require_list(
-                        persisted.get("execution_progress", []),
+                        persisted["execution_progress"],
                         "account.execution_progress",
                     )
                 )
@@ -1190,7 +1392,7 @@ class JsonLedgerStore:
             current = _apply_carry(current, accruals)
             existing_events = tuple(
                 _event_from_json(raw)
-                for raw in _require_list(persisted.get("events", []), "account.events")
+                for raw in _require_list(persisted["events"], "account.events")
             )
             current, merged_events = _apply_events(
                 current, existing_events, batch.events
@@ -1211,7 +1413,7 @@ class JsonLedgerStore:
                     if item.id not in completed_ids
                 ],
                 "fills": _merge_json_rows(
-                    _require_list(persisted.get("fills", []), "account.fills"),
+                    _require_list(persisted["fills"], "account.fills"),
                     [_fill_to_json(item) for item in fills],
                 ),
                 "execution_progress": [

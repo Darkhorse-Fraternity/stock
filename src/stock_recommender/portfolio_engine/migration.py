@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import os
-import tempfile
 import threading
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
@@ -30,6 +29,7 @@ from .config import (
     normalize_short_policy,
     validate_strategy_policies,
 )
+from .atomic_io import OriginalFile, atomic_replace_many, fsync_directory
 from .contracts import AccountSnapshot, PositionSide, PositionSnapshot
 from .ledger import (
     LEDGER_SCHEMA_VERSION,
@@ -484,13 +484,6 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
         "execution_progress": [],
         "events": [],
         "committed_batches": committed_batches,
-        "legacy_orders": deepcopy(orders),
-        "legacy_events": deepcopy(
-            _list(account.get("events", []), "account.events")
-        ),
-        "legacy_nav_history": deepcopy(
-            _list(account.get("nav_history", []), "account.nav_history")
-        ),
     }
     decoded = decode_account_snapshot(result)
     prices = {
@@ -510,11 +503,6 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
         raise MigrationError(
             f"NAV parity failed for {strategy_id}: before={source_nav}, after={post_nav}"
         )
-    result["migration_nav"] = {
-        "source": source_nav,
-        "migrated": post_nav,
-        "quantum": str(quantum),
-    }
     return result
 
 
@@ -593,14 +581,6 @@ def _backup_path(path: Path, stamp: str) -> Path:
     return path.with_name(path.name + f".bak.{stamp}")
 
 
-def _fsync_directory(path: Path) -> None:
-    descriptor = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-
-
 def _write_backup(path: Path, raw: bytes, stamp: str) -> Path:
     backup = _backup_path(path, stamp)
     try:
@@ -613,45 +593,8 @@ def _write_backup(path: Path, raw: bytes, stamp: str) -> Path:
             raise MigrationError(f"timestamped backup already exists with other data: {backup}")
     except OSError as exc:
         raise MigrationError(f"cannot create migration backup {backup}: {exc}") from exc
-    _fsync_directory(path.parent)
+    fsync_directory(path.parent)
     return backup
-
-
-def _write_temporary(path: Path, encoded: bytes) -> Path:
-    descriptor, name = tempfile.mkstemp(
-        prefix=f".{path.name}.migration.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(encoded)
-            handle.flush()
-            os.fsync(handle.fileno())
-    except BaseException:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    return temporary
-
-
-def _replace_path(source: Path, target: Path) -> None:
-    """Replacement seam kept narrow for deterministic failure-injection tests."""
-
-    os.replace(source, target)
-
-
-def _restore_original(path: Path, raw: bytes) -> None:
-    temporary = _write_temporary(path, raw)
-    try:
-        os.replace(temporary, path)
-        _fsync_directory(path.parent)
-    finally:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
 
 
 def _apply_prepared(
@@ -664,41 +607,19 @@ def _apply_prepared(
         return tuple(item.report for item in prepared)
     stamp = _timestamp(now)
     backups: dict[Path, Path] = {}
-    temporaries: dict[Path, Path] = {}
-    replacement_started = False
     try:
         for item in prepared:
             path = item.report.path
             backups[path] = _write_backup(path, originals[path], stamp)
-        for item in changed:
-            temporaries[item.report.path] = _write_temporary(
-                item.report.path, item.encoded
-            )
-        replacement_started = True
-        for item in changed:
-            path = item.report.path
-            _replace_path(temporaries[path], path)
-        for parent in {item.report.path.parent for item in changed}:
-            _fsync_directory(parent)
+        atomic_replace_many(
+            {item.report.path: item.encoded for item in changed},
+            originals={
+                item.report.path: OriginalFile(True, originals[item.report.path])
+                for item in changed
+            },
+        )
     except BaseException as exc:
-        rollback_errors: list[str] = []
-        if replacement_started:
-            for item in changed:
-                path = item.report.path
-                try:
-                    _restore_original(path, originals[path])
-                except BaseException as rollback_exc:  # pragma: no cover - catastrophic I/O
-                    rollback_errors.append(f"{path}: {rollback_exc}")
-        details = ""
-        if rollback_errors:
-            details = "; rollback errors: " + "; ".join(rollback_errors)
-        raise MigrationError(f"atomic migration failed: {exc}{details}") from exc
-    finally:
-        for temporary in temporaries.values():
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+        raise MigrationError(f"atomic migration failed: {exc}") from exc
     reports = []
     for item in prepared:
         report = item.report

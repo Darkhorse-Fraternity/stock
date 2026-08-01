@@ -10,7 +10,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from stock_recommender.pipeline import StageOutput
-from stock_recommender.portfolio_engine import execution
+from stock_recommender.portfolio_engine import atomic_io, execution
+from stock_recommender.portfolio_engine import ledger as ledger_module
 
 from stock_recommender.portfolio_engine.contracts import (
     AccrualLifecycle,
@@ -162,8 +163,9 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
     def test_atomic_replace_failure_preserves_original_bytes(self):
         before = self.path.read_bytes()
 
-        with patch(
-            "stock_recommender.portfolio_engine.ledger.os.replace",
+        with patch.object(
+            atomic_io,
+            "replace_path",
             side_effect=OSError("injected replace failure"),
         ):
             with self.assertRaises(OSError):
@@ -172,6 +174,57 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 )
 
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_directory_fsync_failure_rolls_back_original_and_cleans_temps(self):
+        before = self.path.read_bytes()
+        real_fsync = atomic_io.os.fsync
+        call_count = 0
+
+        def fail_first_directory_fsync(file_descriptor: int) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("injected directory fsync failure")
+            real_fsync(file_descriptor)
+
+        with patch.object(
+            atomic_io.os,
+            "fsync",
+            side_effect=fail_first_directory_fsync,
+        ):
+            with self.assertRaises(OSError):
+                JsonLedgerStore(self.path).commit(
+                    batch(events=(cash_event("cash-fsync", -10.0),))
+                )
+
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual(tuple(self.path.parent.glob(f".{self.path.name}.*")), ())
+
+    def test_directory_fsync_failure_restores_nonexistent_target(self):
+        missing_path = self.path.parent / "missing-ledger.json"
+        real_fsync = atomic_io.os.fsync
+        call_count = 0
+
+        def fail_first_directory_fsync(file_descriptor: int) -> None:
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise OSError("injected directory fsync failure")
+            real_fsync(file_descriptor)
+
+        with patch.object(
+            atomic_io.os,
+            "fsync",
+            side_effect=fail_first_directory_fsync,
+        ):
+            with self.assertRaises(OSError):
+                ledger_module._atomic_write(
+                    missing_path,
+                    {"version": 2, "accounts": {}},
+                )
+
+        self.assertFalse(missing_path.exists())
+        self.assertEqual(tuple(missing_path.parent.glob(f".{missing_path.name}.*")), ())
 
     def test_persisted_duplicate_intents_and_unknown_events_are_rejected(self):
         intent = {
@@ -205,6 +258,129 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 self.path.write_text(json.dumps(payload), encoding="utf-8")
                 with self.assertRaises(LedgerSchemaError):
                     JsonLedgerStore(self.path).load("strategy")
+
+    def test_schema_v2_requires_exact_root_account_and_position_fields(self):
+        original = json.loads(self.path.read_text(encoding="utf-8"))
+        required_account_fields = (
+            "reserved_cash",
+            "restricted_short_proceeds",
+            "margin_loan",
+            "accrued_financing_cost",
+            "accrued_borrow_cost",
+            "positions",
+            "carry_accruals",
+            "financing_lifecycle",
+            "portfolio_snapshot_id",
+            "open_intents",
+            "fills",
+            "execution_progress",
+            "events",
+            "committed_batches",
+        )
+        for field_name in required_account_fields:
+            with self.subTest(missing=field_name):
+                payload = json.loads(json.dumps(original))
+                del payload["accounts"]["strategy"][field_name]
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(LedgerSchemaError):
+                    JsonLedgerStore(self.path).load("strategy")
+
+        for target in ("root", "account"):
+            with self.subTest(extra=target):
+                payload = json.loads(json.dumps(original))
+                if target == "root":
+                    payload["unexpected"] = True
+                else:
+                    payload["accounts"]["strategy"]["unexpected"] = True
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaises(LedgerSchemaError):
+                    JsonLedgerStore(self.path).load("strategy")
+
+        payload = json.loads(json.dumps(original))
+        payload["accounts"]["strategy"]["positions"] = [
+            {
+                "symbol": "AAPL",
+                "side": "LONG",
+                "quantity": 1,
+                "average_cost": 100.0,
+                "current_price": None,
+                "peak_price": None,
+                "trough_price": None,
+                "position_mode": "NORMAL",
+                "sellable_quantity": None,
+                "sellable_on": None,
+                "borrow_lifecycle": None,
+            }
+        ]
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        with self.assertRaises(LedgerSchemaError):
+            JsonLedgerStore(self.path).load("strategy")
+
+    def test_persisted_nonstandard_json_numbers_are_rejected(self):
+        original = json.loads(self.path.read_text(encoding="utf-8"))
+        for number in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(number=number):
+                payload = json.loads(json.dumps(original))
+                payload["accounts"]["strategy"]["events"] = [
+                    {
+                        "id": "pipeline-event",
+                        "type": "PIPELINE_COMPLETED",
+                        "occurred_at": NOW.isoformat(),
+                        "data": {"score": number},
+                    }
+                ]
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                before = self.path.read_bytes()
+                with self.assertRaises(LedgerSchemaError):
+                    JsonLedgerStore(self.path).load("strategy")
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_batch_observable_data_must_be_recursively_json_safe_and_finite(self):
+        invalid_batches = (
+            DecisionBatch(
+                run_key="event-nan",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                events=(
+                    PortfolioEvent(
+                        id="pipeline-nan",
+                        type="PIPELINE_COMPLETED",
+                        occurred_at=NOW,
+                        data={"nested": {"score": float("nan")}},
+                    ),
+                ),
+            ),
+            DecisionBatch(
+                run_key="diagnostic-inf",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                diagnostics=({"score": float("inf")},),
+            ),
+            DecisionBatch(
+                run_key="stage-inf",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                stage_outputs=(
+                    StageOutput(
+                        stage="audit",
+                        component_version="1.0.0",
+                        facts=({"kind": "audit", "score": float("-inf")},),
+                    ),
+                ),
+            ),
+        )
+        before = self.path.read_bytes()
+        for invalid in invalid_batches:
+            with self.subTest(run_key=invalid.run_key):
+                with self.assertRaises((LedgerError, ValueError)):
+                    JsonLedgerStore(self.path).commit(invalid)
+                self.assertEqual(self.path.read_bytes(), before)
 
     def test_runtime_rejects_v1_malformed_and_truncated_json(self):
         for raw in (
@@ -384,6 +560,16 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                     portfolio_snapshot_id="snapshot-0",
                     market_snapshot_id="market-1",
                     intents=(intent,),
+                    fills=(
+                        ExecutionFill(
+                            intent.id,
+                            "AAPL",
+                            1,
+                            100.0,
+                            0.0,
+                            "FILLED",
+                        ),
+                    ),
                     stage_outputs=(output,),
                 )
             )
@@ -500,6 +686,59 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
 
         self.assertEqual(self.path.read_bytes(), before)
 
+    def test_progress_fill_without_summary_is_rejected_without_writing(self):
+        intent = OrderIntent(
+            id="intent-missing-summary",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.OPEN,
+            quantity=1,
+            reason="TARGET",
+            created_snapshot_id="market-0",
+        )
+        fill_values = {
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "position_side": intent.position_side,
+            "order_side": intent.order_side,
+            "snapshot_id": "market-1",
+            "occurred_at": NOW,
+            "quantity": 1,
+            "price": 100.0,
+            "fees": 0.0,
+            "commission": 0.0,
+            "status": "FILLED",
+        }
+        detail = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**fill_values), **fill_values
+        )
+        progress = OrderExecutionProgress(
+            intent.id,
+            intent.symbol,
+            intent.position_side,
+            intent.order_side,
+            1,
+            "policy-1",
+            (detail,),
+        )
+        before = self.path.read_bytes()
+
+        with self.assertRaisesRegex(LedgerError, "fill summary"):
+            JsonLedgerStore(self.path).commit(
+                DecisionBatch(
+                    run_key="missing-fill-summary",
+                    strategy_id="strategy",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="snapshot-0",
+                    market_snapshot_id="market-1",
+                    intents=(intent,),
+                    execution_progress=(progress,),
+                )
+            )
+
+        self.assertEqual(self.path.read_bytes(), before)
+
     def test_append_only_partial_progress_replays_only_new_fill(self):
         intent = OrderIntent(
             id="intent-partial",
@@ -549,6 +788,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 portfolio_snapshot_id="snapshot-0",
                 market_snapshot_id="market-1",
                 intents=(intent,),
+                fills=(ExecutionFill(intent.id, "AAPL", 2, 100.0, 0.0, "PARTIAL"),),
                 execution_progress=(first_progress,),
             )
         )
@@ -570,6 +810,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                 portfolio_snapshot_id=first.snapshot_id,
                 market_snapshot_id="market-2",
                 intents=(intent,),
+                fills=(ExecutionFill(intent.id, "AAPL", 2, 100.0, 0.0, "FILLED"),),
                 execution_progress=(second_progress,),
             )
         )
@@ -641,6 +882,60 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             store.commit(batch(events=(cash_event("cash-forged", -20.0),)))
 
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_same_run_key_fingerprint_covers_stage_outputs_and_diagnostics(self):
+        store = JsonLedgerStore(self.path)
+        original = DecisionBatch(
+            run_key="observable-fingerprint",
+            strategy_id="strategy",
+            strategy_revision=2,
+            portfolio_snapshot_id="snapshot-0",
+            market_snapshot_id="market-1",
+            diagnostics=({"code": "BASE", "score": 1.0},),
+            stage_outputs=(
+                StageOutput(
+                    stage="audit",
+                    component_version="1.0.0",
+                    facts=({"kind": "noncanonical_audit", "value": 1},),
+                    diagnostics=({"code": "STAGE_BASE"},),
+                ),
+            ),
+        )
+        committed = store.commit(original)
+
+        self.assertEqual(store.commit(original), committed)
+        for changed in (
+            DecisionBatch(
+                run_key=original.run_key,
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                diagnostics=({"code": "CHANGED", "score": 1.0},),
+                stage_outputs=original.stage_outputs,
+            ),
+            DecisionBatch(
+                run_key=original.run_key,
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                diagnostics=original.diagnostics,
+                stage_outputs=(
+                    StageOutput(
+                        stage="audit",
+                        component_version="1.0.0",
+                        facts=({"kind": "noncanonical_audit", "value": 2},),
+                        diagnostics=({"code": "STAGE_BASE"},),
+                    ),
+                ),
+            ),
+        ):
+            with self.subTest(changed=changed):
+                before = self.path.read_bytes()
+                with self.assertRaisesRegex(ValueError, "run_key.*different"):
+                    store.commit(changed)
+                self.assertEqual(self.path.read_bytes(), before)
 
     def test_carry_record_and_event_must_be_one_to_one(self):
         financed = AccountSnapshot(

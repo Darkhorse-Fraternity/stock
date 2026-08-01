@@ -178,6 +178,31 @@ class PortfolioMigrationTests(unittest.TestCase):
         account = migrated["accounts"]["tech"]
 
         self.assertEqual(migrated["version"], 2)
+        self.assertEqual(set(migrated), {"version", "accounts"})
+        self.assertEqual(
+            set(account),
+            {
+                "id",
+                "strategy_id",
+                "strategy_revision",
+                "occurred_at",
+                "available_cash",
+                "reserved_cash",
+                "restricted_short_proceeds",
+                "margin_loan",
+                "accrued_financing_cost",
+                "accrued_borrow_cost",
+                "positions",
+                "carry_accruals",
+                "financing_lifecycle",
+                "portfolio_snapshot_id",
+                "open_intents",
+                "fills",
+                "execution_progress",
+                "events",
+                "committed_batches",
+            },
+        )
         self.assertEqual(account["positions"]["600001"]["side"], "LONG")
         self.assertEqual(account["positions"]["600001"]["quantity"], 10)
         self.assertEqual(account["available_cash"], 1_000.0)
@@ -314,9 +339,9 @@ class PortfolioMigrationTests(unittest.TestCase):
         self._write_json(self.portfolio_path, v1_long_only_store())
         strategy_before = self.strategy_path.read_bytes()
         portfolio_before = self.portfolio_path.read_bytes()
-        from stock_recommender.portfolio_engine import migration
+        from stock_recommender.portfolio_engine import atomic_io
 
-        actual_replace = migration._replace_path
+        actual_replace = atomic_io.replace_path
         calls = 0
 
         def fail_second(source: Path, target: Path) -> None:
@@ -326,7 +351,7 @@ class PortfolioMigrationTests(unittest.TestCase):
                 raise OSError("injected second replacement failure")
             actual_replace(source, target)
 
-        with patch.object(migration, "_replace_path", side_effect=fail_second):
+        with patch.object(atomic_io, "replace_path", side_effect=fail_second):
             with self.assertRaises(MigrationError):
                 migrate_stores(
                     self.strategy_path,
@@ -338,6 +363,40 @@ class PortfolioMigrationTests(unittest.TestCase):
         self.assertEqual(self.strategy_path.read_bytes(), strategy_before)
         self.assertEqual(self.portfolio_path.read_bytes(), portfolio_before)
         self.assertEqual(len(list(self.strategy_path.parent.glob("*.bak.*"))), 2)
+
+    def test_directory_fsync_failure_rolls_back_both_and_cleans_temps(self) -> None:
+        self._write_json(self.strategy_path, v5_strategy_store())
+        self._write_json(self.portfolio_path, v1_long_only_store())
+        strategy_before = self.strategy_path.read_bytes()
+        portfolio_before = self.portfolio_path.read_bytes()
+        from stock_recommender.portfolio_engine import atomic_io
+
+        actual_fsync_directory = atomic_io.fsync_directory
+        calls = 0
+
+        def fail_commit_fsync(directory: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("injected commit directory fsync failure")
+            actual_fsync_directory(directory)
+
+        with patch.object(
+            atomic_io,
+            "fsync_directory",
+            side_effect=fail_commit_fsync,
+        ):
+            with self.assertRaises(MigrationError):
+                migrate_stores(
+                    self.strategy_path,
+                    self.portfolio_path,
+                    apply=True,
+                    now=FIXED_NOW,
+                )
+
+        self.assertEqual(self.strategy_path.read_bytes(), strategy_before)
+        self.assertEqual(self.portfolio_path.read_bytes(), portfolio_before)
+        self.assertEqual(tuple(self.strategy_path.parent.glob(".*.tmp")), ())
 
     def test_current_schema_rerun_is_explicit_and_does_not_write(self) -> None:
         self._write_json(self.strategy_path, v5_strategy_store())

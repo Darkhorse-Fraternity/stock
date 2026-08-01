@@ -28,17 +28,13 @@ class ParameterCatalogTests(unittest.TestCase):
     def test_strategy_store_schema_version_is_six(self):
         self.assertEqual(STRATEGY_STORE_VERSION, 6)
 
-    def test_legacy_strategy_normalizes_to_explicit_long_only_policies(self):
-        strategy = normalize_strategy_config(
-            {"version": 5, "name": "旧策略", "parameters": {}}
-        )
+    def test_legacy_strategy_schema_is_rejected_by_runtime_normalizer(self):
+        with self.assertRaisesRegex(StrategyLifecycleError, "version=6|schema"):
+            normalize_strategy_config(
+                {"version": 5, "name": "旧策略", "parameters": {}}
+            )
 
-        self.assertEqual(strategy["version"], 6)
-        self.assertEqual(strategy["exposure_policy"]["mode"], "LONG_ONLY")
-        self.assertIn("margin_policy", strategy)
-        self.assertIn("short_policy", strategy)
-
-    def test_v5_store_loads_in_memory_as_v6_without_creating_revision(self):
+    def test_v5_store_is_rejected_by_runtime_without_touching_file(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "strategies.json"
             strategy = default_strategy_config()
@@ -62,71 +58,15 @@ class ParameterCatalogTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            loaded_store = load_strategy_store(path=path)
-            loaded_strategy = load_strategy_config(path=path)
-            persisted = json.loads(path.read_text(encoding="utf-8"))
-
-            self.assertEqual(loaded_store["version"], 6)
-            self.assertEqual(loaded_store["active_strategy_id"], "legacy-strategy")
-            self.assertEqual(len(loaded_store["strategies"]), 1)
-            self.assertEqual(loaded_strategy["version"], 6)
-            self.assertEqual(loaded_strategy["id"], "legacy-strategy")
-            self.assertEqual(loaded_strategy["revision"], 3)
-            self.assertEqual(loaded_strategy["parent_strategy_id"], "legacy-parent")
-            self.assertEqual(loaded_strategy["exposure_policy"]["mode"], "LONG_ONLY")
-            self.assertIn("margin_policy", loaded_strategy)
-            self.assertIn("short_policy", loaded_strategy)
-            self.assertEqual(persisted, legacy_store)
-
-    def test_v5_projection_rejects_ordinary_write_paths_without_touching_file(self):
-        operations = (
-            (
-                "activate",
-                lambda path: activate_strategy("legacy-strategy", path=path),
-            ),
-            (
-                "save_config",
-                lambda path: save_strategy_config(
-                    load_strategy_config(path=path),
-                    path=path,
-                ),
-            ),
-        )
-        for name, operation in operations:
-            with self.subTest(operation=name), tempfile.TemporaryDirectory() as directory:
-                path = Path(directory) / "strategies.json"
-                strategy = default_strategy_config()
-                strategy.update({"version": 5, "id": "legacy-strategy"})
-                for section in (
-                    "exposure_policy",
-                    "margin_policy",
-                    "short_policy",
-                ):
-                    strategy.pop(section)
-                path.write_text(
-                    json.dumps(
-                        {
-                            "version": 5,
-                            "active_strategy_id": "legacy-strategy",
-                            "strategies": [strategy],
-                        },
-                        ensure_ascii=False,
-                    ),
-                    encoding="utf-8",
-                )
-                original_bytes = path.read_bytes()
-
-                with self.assertRaisesRegex(
-                    StrategyLifecycleError,
-                    "只读|迁移|version=5",
-                ):
-                    operation(path)
-
-                self.assertEqual(path.read_bytes(), original_bytes)
-                self.assertEqual(
-                    json.loads(path.read_text(encoding="utf-8"))["version"],
-                    5,
-                )
+            original_bytes = path.read_bytes()
+            for loader in (load_strategy_store, load_strategy_config):
+                with self.subTest(loader=loader.__name__):
+                    with self.assertRaisesRegex(
+                        StrategyLifecycleError,
+                        "version=6|迁移",
+                    ):
+                        loader(path=path)
+                    self.assertEqual(path.read_bytes(), original_bytes)
 
     def test_strategy_store_rejects_unknown_schema_versions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -191,7 +131,7 @@ class ParameterCatalogTests(unittest.TestCase):
                 ):
                     load_strategy_store(path=path)
 
-    def test_v5_store_cannot_enable_policy_fields_from_the_new_schema(self):
+    def test_v5_store_with_new_policy_fields_is_still_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "strategies.json"
             strategy = default_strategy_config()
@@ -210,9 +150,8 @@ class ParameterCatalogTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            loaded = load_strategy_config(path=path)
-
-            self.assertEqual(loaded["exposure_policy"]["mode"], "LONG_ONLY")
+            with self.assertRaisesRegex(StrategyLifecycleError, "version=6|迁移"):
+                load_strategy_config(path=path)
 
     def test_catalog_covers_common_stock_screening_dimensions(self):
         groups = {item["group"] for item in PARAMETER_CATALOG}

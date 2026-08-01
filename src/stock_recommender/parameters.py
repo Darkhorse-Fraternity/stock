@@ -198,17 +198,10 @@ DELIVERY_FREQUENCIES = {"daily", "weekdays"}
 STRATEGY_STAGES = {"draft", "backtesting", "paper", "live", "paused", "archived"}
 LOCKED_STRATEGY_STAGES = {"live", "archived"}
 STRATEGY_STORE_VERSION = 6
-_LEGACY_STRATEGY_STORE_VERSION = 5
 
 
 class StrategyLifecycleError(ValueError):
     pass
-
-
-class _StrategyStoreProjection(dict):
-    def __init__(self, payload: dict, *, source_version: int):
-        super().__init__(payload)
-        self.source_version = source_version
 
 
 def strategy_config_path() -> Path:
@@ -589,6 +582,16 @@ def normalize_strategy_config(config: dict | None) -> dict:
     normalized = default_strategy_config()
     if not isinstance(config, dict):
         return normalized
+    if "version" in config:
+        version = config["version"]
+        if (
+            isinstance(version, bool)
+            or not isinstance(version, int)
+            or version != STRATEGY_STORE_VERSION
+        ):
+            raise StrategyLifecycleError(
+                "策略 schema 只接受 version=6；旧版本请先使用迁移命令"
+            )
     if isinstance(config.get("name"), str) and config["name"].strip():
         normalized["name"] = config["name"].strip()[:80]
     strategy_id = str(config.get("id") or "").strip()
@@ -675,15 +678,11 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
     if (
         isinstance(source_version, bool)
         or not isinstance(source_version, int)
-        or source_version not in {
-            _LEGACY_STRATEGY_STORE_VERSION,
-            STRATEGY_STORE_VERSION,
-        }
+        or source_version != STRATEGY_STORE_VERSION
     ):
         raise StrategyLifecycleError(
             "不支持或无效的策略配置 schema version；"
-            f"当前 version={STRATEGY_STORE_VERSION}，"
-            f"version={_LEGACY_STRATEGY_STORE_VERSION} 仅支持只读迁移投影"
+            f"运行时只接受 version={STRATEGY_STORE_VERSION}，旧版本请先执行迁移"
         )
     if not isinstance(payload.get("strategies"), list):
         raise StrategyLifecycleError("策略配置缺少 strategies 列表")
@@ -695,11 +694,14 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
         if not isinstance(item, dict):
             raise StrategyLifecycleError("strategies 只能包含策略对象")
         item_version = item.get("version")
-        if isinstance(item_version, bool) or not isinstance(item_version, int):
+        if (
+            isinstance(item_version, bool)
+            or not isinstance(item_version, int)
+            or item_version != STRATEGY_STORE_VERSION
+        ):
             raise StrategyLifecycleError(
-                "策略 schema version 无效，必须是整数；"
-                f"当前 version={STRATEGY_STORE_VERSION}，"
-                f"version={_LEGACY_STRATEGY_STORE_VERSION} 仅支持只读迁移投影"
+                "策略 schema version 无效；"
+                f"运行时只接受 version={STRATEGY_STORE_VERSION}，旧版本请先执行迁移"
             )
         if item_version != source_version:
             raise StrategyLifecycleError(
@@ -720,11 +722,10 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             "portfolio",
             "delivery",
             "parameters",
+            "exposure_policy",
+            "margin_policy",
+            "short_policy",
         ]
-        if source_version == STRATEGY_STORE_VERSION:
-            required_sections.extend(
-                ("exposure_policy", "margin_policy", "short_policy")
-            )
         missing_sections = [
             section for section in required_sections if not isinstance(item.get(section), dict)
         ]
@@ -732,12 +733,7 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
             raise StrategyLifecycleError(
                 f"策略 {strategy_id} 缺少配置段: {', '.join(missing_sections)}"
             )
-        strategy_payload = item
-        if source_version == _LEGACY_STRATEGY_STORE_VERSION:
-            strategy_payload = deepcopy(item)
-            for section in ("exposure_policy", "margin_policy", "short_policy"):
-                strategy_payload.pop(section, None)
-        strategy = normalize_strategy_config(strategy_payload)
+        strategy = normalize_strategy_config(item)
         strategy["id"] = strategy_id
         used_ids.add(strategy_id)
         strategies.append(strategy)
@@ -749,11 +745,6 @@ def _normalize_strategy_store(payload: dict | None) -> dict:
         "active_strategy_id": configured_active_id,
         "strategies": strategies,
     }
-    if source_version == _LEGACY_STRATEGY_STORE_VERSION:
-        return _StrategyStoreProjection(
-            normalized_store,
-            source_version=source_version,
-        )
     return normalized_store
 
 
@@ -769,13 +760,6 @@ def load_strategy_store(path: str | Path | None = None) -> dict:
 
 
 def save_strategy_store(store: dict, path: str | Path | None = None) -> dict:
-    if (
-        isinstance(store, _StrategyStoreProjection)
-        and store.source_version == _LEGACY_STRATEGY_STORE_VERSION
-    ):
-        raise StrategyLifecycleError(
-            "version=5 策略配置是只读迁移投影；请先执行原子迁移再写入"
-        )
     config_path = Path(path) if path is not None else strategy_config_path()
     normalized = _normalize_strategy_store(store)
     config_path.parent.mkdir(parents=True, exist_ok=True)
