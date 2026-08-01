@@ -401,6 +401,17 @@ class _DeeplyImmutable:
 
 
 @dataclass(frozen=True)
+class AccrualLifecycle(_DeeplyImmutable):
+    id: str
+    started_on: date
+
+    def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        if type(self.started_on) is not date:
+            raise TypeError("started_on must be a date")
+
+
+@dataclass(frozen=True)
 class PositionSnapshot(_DeeplyImmutable):
     symbol: str
     side: PositionSide
@@ -413,6 +424,7 @@ class PositionSnapshot(_DeeplyImmutable):
     position_mode: str = "NORMAL"
     sellable_quantity: int | None = None
     sellable_on: date | None = None
+    borrow_lifecycle: AccrualLifecycle | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
@@ -440,6 +452,11 @@ class PositionSnapshot(_DeeplyImmutable):
             self.sellable_quantity is not None or self.sellable_on is not None
         ):
             raise ValueError("SHORT position must not carry long T+1 state")
+        if self.borrow_lifecycle is not None:
+            if type(self.borrow_lifecycle) is not AccrualLifecycle:
+                raise TypeError("borrow_lifecycle must be AccrualLifecycle or None")
+            if self.side is not PositionSide.SHORT:
+                raise ValueError("only SHORT positions may have borrow_lifecycle")
 
     @property
     def market_value(self) -> float | None:
@@ -513,6 +530,7 @@ class CarryAccrualRecord(_DeeplyImmutable):
     accrual_date: date
     elapsed_days: int
     amount: float
+    lifecycle_id: str
     symbol: str | None = None
 
     def __post_init__(self) -> None:
@@ -524,6 +542,7 @@ class CarryAccrualRecord(_DeeplyImmutable):
         if self.elapsed_days < 0:
             raise ValueError("elapsed_days must be nonnegative")
         _require_nonnegative_finite_number(self.amount, "amount")
+        _require_string(self.lifecycle_id, "lifecycle_id")
         if self.cost_type is CarryCostType.FINANCING:
             if self.symbol is not None:
                 raise ValueError("FINANCING accrual must not have a symbol")
@@ -531,8 +550,16 @@ class CarryAccrualRecord(_DeeplyImmutable):
             _require_string(self.symbol, "symbol")
 
     @property
-    def idempotency_key(self) -> tuple[str, CarryCostType, date, str | None]:
-        return (self.account_id, self.cost_type, self.accrual_date, self.symbol)
+    def idempotency_key(
+        self,
+    ) -> tuple[str, CarryCostType, str, date, str | None]:
+        return (
+            self.account_id,
+            self.cost_type,
+            self.lifecycle_id,
+            self.accrual_date,
+            self.symbol,
+        )
 
 
 @dataclass(frozen=True)
@@ -548,6 +575,7 @@ class AccountSnapshot(_DeeplyImmutable):
     accrued_borrow_cost: float = 0.0
     positions: tuple[PositionSnapshot, ...] = ()
     carry_accruals: tuple[CarryAccrualRecord, ...] = ()
+    financing_lifecycle: AccrualLifecycle | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.id, "id")
@@ -574,7 +602,16 @@ class AccountSnapshot(_DeeplyImmutable):
             CarryAccrualRecord,
             "carry_accruals",
         )
-        keys: set[tuple[str, CarryCostType, date, str | None]] = set()
+        if self.financing_lifecycle is not None:
+            if type(self.financing_lifecycle) is not AccrualLifecycle:
+                raise TypeError(
+                    "financing_lifecycle must be AccrualLifecycle or None"
+                )
+            if self.margin_loan == 0:
+                raise ValueError(
+                    "financing_lifecycle requires a positive margin_loan"
+                )
+        keys: set[tuple[str, CarryCostType, str, date, str | None]] = set()
         for record in carry_accruals:
             if record.account_id != self.id:
                 raise ValueError("carry accrual account_id must match account id")
@@ -746,6 +783,7 @@ class ValuationResult(_DeeplyImmutable):
             "position_mode",
             "sellable_quantity",
             "sellable_on",
+            "borrow_lifecycle",
         )
         for index, (account_position, valued_position) in enumerate(
             zip(self.account.positions, positions, strict=True)
@@ -1004,36 +1042,189 @@ class ExecutionFill(_DeeplyImmutable):
             raise ValueError("status must be FILLED or PARTIAL")
 
 
+def stable_execution_progress_fill_id(
+    *,
+    intent_id: str,
+    symbol: str,
+    position_side: PositionSide,
+    order_side: OrderSide,
+    snapshot_id: str,
+    occurred_at: datetime,
+    quantity: int,
+    price: float,
+    fees: float,
+    commission: float,
+    status: str,
+) -> str:
+    material = "|".join(
+        (
+            intent_id,
+            symbol,
+            position_side.value,
+            order_side.value,
+            snapshot_id,
+            occurred_at.isoformat(),
+            str(quantity),
+            format(price, ".17g"),
+            format(fees, ".17g"),
+            format(commission, ".17g"),
+            status,
+        )
+    )
+    return "progress-fill-" + hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:24]
+
+
+@dataclass(frozen=True)
+class ExecutionProgressFill(_DeeplyImmutable):
+    id: str
+    intent_id: str
+    symbol: str
+    position_side: PositionSide
+    order_side: OrderSide
+    snapshot_id: str
+    occurred_at: datetime
+    quantity: int
+    price: float
+    fees: float
+    commission: float
+    status: str
+
+    def __post_init__(self) -> None:
+        _require_string(self.id, "id")
+        _require_string(self.intent_id, "intent_id")
+        _require_string(self.symbol, "symbol")
+        _require_enum(self.position_side, PositionSide, "position_side")
+        _require_enum(self.order_side, OrderSide, "order_side")
+        _require_string(self.snapshot_id, "snapshot_id")
+        _require_datetime(self.occurred_at, "occurred_at")
+        _require_positive_quantity(self.quantity)
+        _require_positive_finite_number(self.price, "price")
+        _require_nonnegative_finite_number(self.fees, "fees")
+        _require_nonnegative_finite_number(
+            self.commission,
+            "commission",
+        )
+        if self.commission > self.fees:
+            raise ValueError("commission must not exceed fees")
+        if self.status not in {"PARTIAL", "FILLED"}:
+            raise ValueError("status must be PARTIAL or FILLED")
+        expected_id = stable_execution_progress_fill_id(
+            intent_id=self.intent_id,
+            symbol=self.symbol,
+            position_side=self.position_side,
+            order_side=self.order_side,
+            snapshot_id=self.snapshot_id,
+            occurred_at=self.occurred_at,
+            quantity=self.quantity,
+            price=self.price,
+            fees=self.fees,
+            commission=self.commission,
+            status=self.status,
+        )
+        if self.id != expected_id:
+            raise ValueError("execution progress fill ID does not match its facts")
+
+
 @dataclass(frozen=True)
 class OrderExecutionProgress(_DeeplyImmutable):
     intent_id: str
     symbol: str
     position_side: PositionSide
-    last_snapshot_id: str
-    filled_quantity: int
-    filled_notional: float
-    commission_charged: float
-    status: str
+    order_side: OrderSide
+    intent_quantity: int
+    fills: tuple[ExecutionProgressFill, ...]
     position_average_cost: float | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.intent_id, "intent_id")
         _require_string(self.symbol, "symbol")
         _require_enum(self.position_side, PositionSide, "position_side")
-        _require_string(self.last_snapshot_id, "last_snapshot_id")
-        _require_positive_quantity(self.filled_quantity)
-        _require_nonnegative_finite_number(self.filled_notional, "filled_notional")
-        _require_nonnegative_finite_number(
-            self.commission_charged,
+        _require_enum(self.order_side, OrderSide, "order_side")
+        _require_positive_quantity(self.intent_quantity)
+        fills = _typed_tuple(self.fills, ExecutionProgressFill, "fills")
+        if not fills:
+            raise ValueError("fills must not be empty")
+        if len({item.snapshot_id for item in fills}) != len(fills):
+            raise ValueError("fills must not repeat a market snapshot")
+        if any(
+            later.occurred_at <= earlier.occurred_at
+            for earlier, later in zip(fills, fills[1:])
+        ):
+            raise ValueError("fills must be in strictly increasing time order")
+        for fill in fills:
+            if (
+                fill.intent_id != self.intent_id
+                or fill.symbol != self.symbol
+                or fill.position_side is not self.position_side
+                or fill.order_side is not self.order_side
+            ):
+                raise ValueError("fill identity must match execution progress")
+        filled_quantity = sum((item.quantity for item in fills), 0)
+        if filled_quantity > self.intent_quantity:
+            raise ValueError("fills must not exceed intent_quantity")
+        if any(item.status != "PARTIAL" for item in fills[:-1]):
+            raise ValueError("only the final progress fill may be FILLED")
+        expected_status = (
+            "FILLED" if filled_quantity == self.intent_quantity else "PARTIAL"
+        )
+        if fills[-1].status != expected_status:
+            raise ValueError("final fill status is inconsistent with total quantity")
+        _finite_derived_value(
+            sum((item.quantity * item.price for item in fills), 0.0),
+            "filled_notional",
+        )
+        _finite_derived_value(
+            sum((item.commission for item in fills), 0.0),
             "commission_charged",
+        )
+        _finite_derived_value(
+            sum((item.fees for item in fills), 0.0),
+            "fees_charged",
         )
         if self.position_average_cost is not None:
             _require_positive_finite_number(
                 self.position_average_cost,
                 "position_average_cost",
             )
-        if self.status not in {"PARTIAL", "FILLED"}:
-            raise ValueError("status must be PARTIAL or FILLED")
+        if self.intent_id.startswith("risk-"):
+            if self.position_average_cost is None:
+                raise ValueError(
+                    "risk progress requires position_average_cost"
+                )
+        elif self.position_average_cost is not None:
+            raise ValueError(
+                "execution progress must not have position_average_cost"
+            )
+        object.__setattr__(self, "fills", fills)
+
+    @property
+    def filled_quantity(self) -> int:
+        return sum((item.quantity for item in self.fills), 0)
+
+    @property
+    def filled_notional(self) -> float:
+        value = sum((item.quantity * item.price for item in self.fills), 0.0)
+        return _finite_derived_value(value, "filled_notional")
+
+    @property
+    def commission_charged(self) -> float:
+        value = sum((item.commission for item in self.fills), 0.0)
+        return _finite_derived_value(value, "commission_charged")
+
+    @property
+    def fees_charged(self) -> float:
+        value = sum((item.fees for item in self.fills), 0.0)
+        return _finite_derived_value(value, "fees_charged")
+
+    @property
+    def status(self) -> str:
+        return self.fills[-1].status
+
+    @property
+    def last_snapshot_id(self) -> str:
+        return self.fills[-1].snapshot_id
 
 
 @dataclass(frozen=True)
@@ -1103,6 +1294,7 @@ class DecisionBatch(_DeeplyImmutable):
 
 
 _DEEPLY_IMMUTABLE_TYPES = (
+    AccrualLifecycle,
     PositionSnapshot,
     PositionRiskUpdate,
     CarryAccrualRecord,
@@ -1114,6 +1306,7 @@ _DEEPLY_IMMUTABLE_TYPES = (
     OrderIntent,
     MarketSnapshot,
     ExecutionFill,
+    ExecutionProgressFill,
     OrderExecutionProgress,
     PortfolioEvent,
     DecisionBatch,

@@ -14,9 +14,11 @@ from ..markets import market_date, next_business_date
 from ..pipeline import PipelineContractError, StageInput, StageOutput
 from .contracts import (
     AccountSnapshot,
+    AccrualLifecycle,
     CarryAccrualRecord,
     CarryCostType,
     ExecutionFill,
+    ExecutionProgressFill,
     MarketSnapshot,
     OrderIntent,
     OrderExecutionProgress,
@@ -27,6 +29,7 @@ from .contracts import (
     PortfolioEvent,
     TargetPosition,
     stable_execution_intent_id,
+    stable_execution_progress_fill_id,
     verify_order_intent_id,
 )
 from .margin import IntentSemanticsError, project_account_for_intent
@@ -954,24 +957,103 @@ def _account_for_position_projection(
 ) -> AccountSnapshot:
     """Keep long sellability valid while a reduction projection changes quantity."""
 
+    projection_account = account
+    if not intent.increases_risk and account.financing_lifecycle is not None:
+        projection_account = replace(account, financing_lifecycle=None)
     if intent.position_side is not PositionSide.LONG or intent.increases_risk:
-        return account
+        return projection_account
     held = next(
-        (item for item in account.positions if item.symbol == intent.symbol),
+        (
+            item
+            for item in projection_account.positions
+            if item.symbol == intent.symbol
+        ),
         None,
     )
     if held is None or held.sellable_quantity is None:
-        return account
+        return projection_account
     remaining = held.quantity - fill_quantity
     if remaining <= 0 or held.sellable_quantity <= remaining:
-        return account
+        return projection_account
     adjusted = replace(held, sellable_quantity=remaining)
     return replace(
-        account,
+        projection_account,
         positions=tuple(
             adjusted if item.symbol == adjusted.symbol else item
-            for item in account.positions
+            for item in projection_account.positions
         ),
+    )
+
+
+def _new_accrual_lifecycle(
+    kind: str,
+    account_id: str,
+    intent_id: str,
+    market: MarketSnapshot,
+    policy: ExecutionPolicy,
+) -> AccrualLifecycle:
+    material = "|".join((kind, account_id, intent_id, market.id))
+    lifecycle_id = kind + "-" + hashlib.sha256(
+        material.encode("utf-8")
+    ).hexdigest()[:24]
+    return AccrualLifecycle(
+        id=lifecycle_id,
+        started_on=market_date(market.occurred_at, policy.market),
+    )
+
+
+def _apply_accrual_lifecycles(
+    before: AccountSnapshot,
+    after: AccountSnapshot,
+    intent: OrderIntent,
+    market: MarketSnapshot,
+    policy: ExecutionPolicy,
+) -> AccountSnapshot:
+    prior_by_symbol = {item.symbol: item for item in before.positions}
+    positions: list[PositionSnapshot] = []
+    changed = False
+    for held in after.positions:
+        if held.side is not PositionSide.SHORT:
+            positions.append(held)
+            continue
+        prior = prior_by_symbol.get(held.symbol)
+        lifecycle = (
+            prior.borrow_lifecycle
+            if prior is not None
+            else _new_accrual_lifecycle(
+                "borrow",
+                after.id,
+                intent.id,
+                market,
+                policy,
+            )
+        )
+        if held.borrow_lifecycle != lifecycle:
+            held = replace(held, borrow_lifecycle=lifecycle)
+            changed = True
+        positions.append(held)
+
+    financing_lifecycle = after.financing_lifecycle
+    if after.margin_loan == 0:
+        financing_lifecycle = None
+    elif before.margin_loan == 0:
+        financing_lifecycle = _new_accrual_lifecycle(
+            "financing",
+            after.id,
+            intent.id,
+            market,
+            policy,
+        )
+    elif financing_lifecycle is None:
+        financing_lifecycle = before.financing_lifecycle
+    if financing_lifecycle != after.financing_lifecycle:
+        changed = True
+    if not changed:
+        return after
+    return replace(
+        after,
+        positions=tuple(positions),
+        financing_lifecycle=financing_lifecycle,
     )
 
 
@@ -1001,6 +1083,10 @@ def _validate_prior_progress_binding(
         raise ValueError("prior progress symbol does not match intent")
     if progress.position_side is not intent.position_side:
         raise ValueError("prior progress position side does not match intent")
+    if progress.order_side is not intent.order_side:
+        raise ValueError("prior progress order side does not match intent")
+    if progress.intent_quantity != intent.quantity:
+        raise ValueError("prior progress quantity does not match intent")
     if progress.filled_quantity > intent.quantity:
         raise ValueError("prior progress exceeds intent quantity")
     if progress.filled_quantity == intent.quantity:
@@ -1215,6 +1301,13 @@ def execute_intents(
                 )
             )
             continue
+        current = _apply_accrual_lifecycles(
+            before_fill,
+            current,
+            original,
+            market,
+            policy,
+        )
         current = _apply_position_sellability(
             before_fill,
             current,
@@ -1240,15 +1333,34 @@ def execute_intents(
             Decimal(str(prior_commission)),
             required_commission,
         )
+        incremental_commission = float(cumulative_commission) - prior_commission
+        progress_fill_values = {
+            "intent_id": original.id,
+            "symbol": original.symbol,
+            "position_side": original.position_side,
+            "order_side": original.order_side,
+            "snapshot_id": market.id,
+            "occurred_at": market.occurred_at,
+            "quantity": fill.quantity,
+            "price": fill.price,
+            "fees": fill.fees,
+            "commission": incremental_commission,
+            "status": fill.status,
+        }
+        progress_fill = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**progress_fill_values),
+            **progress_fill_values,
+        )
         progress_by_id[original.id] = OrderExecutionProgress(
             intent_id=original.id,
             symbol=original.symbol,
             position_side=original.position_side,
-            last_snapshot_id=market.id,
-            filled_quantity=previously_filled + fill.quantity,
-            filled_notional=cumulative_notional,
-            commission_charged=float(cumulative_commission),
-            status=fill.status,
+            order_side=original.order_side,
+            intent_quantity=original.quantity,
+            fills=(
+                *(previous.fills if previous is not None else ()),
+                progress_fill,
+            ),
             position_average_cost=(
                 identity_position_by_id[original.id].average_cost
                 if original.id.startswith("risk-")
@@ -1384,17 +1496,23 @@ def _accrual_elapsed_days(
     account: AccountSnapshot,
     cost_type: CarryCostType,
     as_of: date,
+    lifecycle: AccrualLifecycle,
     symbol: str | None = None,
 ) -> int | None:
-    key = (account.id, cost_type, as_of, symbol)
+    key = (account.id, cost_type, lifecycle.id, as_of, symbol)
     if any(item.idempotency_key == key for item in account.carry_accruals):
         return None
     previous = [
         item.accrual_date
         for item in account.carry_accruals
-        if item.cost_type is cost_type and item.symbol == symbol
+        if item.cost_type is cost_type
+        and item.symbol == symbol
+        and item.lifecycle_id == lifecycle.id
     ]
-    start = max(previous) if previous else account.occurred_at.date()
+    start = max(
+        lifecycle.started_on,
+        max(previous) if previous else lifecycle.started_on,
+    )
     elapsed = (as_of - start).days
     if elapsed < 0:
         raise ValueError("as_of must not precede the last carry accrual date")
@@ -1429,6 +1547,7 @@ def _carry_event(
         (
             record.account_id,
             record.cost_type.value,
+            record.lifecycle_id,
             record.accrual_date.isoformat(),
             record.symbol or "",
         )
@@ -1441,6 +1560,7 @@ def _carry_event(
         data={
             "account_id": record.account_id,
             "cost_type": record.cost_type.value,
+            "lifecycle_id": record.lifecycle_id,
             "symbol": record.symbol,
             "accrual_date": record.accrual_date.isoformat(),
             "elapsed_days": record.elapsed_days,
@@ -1480,12 +1600,17 @@ def accrue_carry_costs(
         CarryCostType.FINANCING: 0.0,
         CarryCostType.BORROW: 0.0,
     }
-    financing_days = _accrual_elapsed_days(
-        account,
-        CarryCostType.FINANCING,
-        as_of,
-    )
-    if financing_days is not None:
+    financing_days: int | None = None
+    if account.margin_loan > 0:
+        if account.financing_lifecycle is None:
+            raise ValueError("active margin loan requires financing_lifecycle")
+        financing_days = _accrual_elapsed_days(
+            account,
+            CarryCostType.FINANCING,
+            as_of,
+            account.financing_lifecycle,
+        )
+    if financing_days is not None and account.financing_lifecycle is not None:
         financing_cost = (
             Decimal(str(account.margin_loan))
             * Decimal(str(financing_apr))
@@ -1505,16 +1630,23 @@ def accrue_carry_costs(
                 accrual_date=as_of,
                 elapsed_days=financing_days,
                 amount=amount,
+                lifecycle_id=account.financing_lifecycle.id,
             )
         )
 
     for held in sorted(account.positions, key=lambda item: item.symbol):
         if held.side is not PositionSide.SHORT:
             continue
+        if held.borrow_lifecycle is None:
+            diagnostics.append(
+                CarryAccrualDiagnostic(held.symbol, "BORROW_LIFECYCLE_MISSING")
+            )
+            continue
         borrow_days = _accrual_elapsed_days(
             account,
             CarryCostType.BORROW,
             as_of,
+            held.borrow_lifecycle,
             held.symbol,
         )
         if borrow_days is None:
@@ -1569,6 +1701,7 @@ def accrue_carry_costs(
                 accrual_date=as_of,
                 elapsed_days=borrow_days,
                 amount=amount,
+                lifecycle_id=held.borrow_lifecycle.id,
                 symbol=held.symbol,
             )
         )

@@ -87,6 +87,13 @@ def risk_close(existing, *, snapshot_id, reason):
     )
 
 
+def accrual_lifecycle(lifecycle_id, started_on=date(2026, 7, 30)):
+    return domain_contracts.AccrualLifecycle(
+        id=lifecycle_id,
+        started_on=started_on,
+    )
+
+
 class OrderIntentPlanningTests(unittest.TestCase):
     def test_delta_semantics_are_exact_for_both_directions(self):
         cases = (
@@ -805,12 +812,10 @@ class AccountExecutionTests(unittest.TestCase):
         )
         progress = first.progress[0]
         for label, updates in (
-            ("filled", {"filled_quantity": 3}),
             ("intent_id", {"intent_id": "risk-forged"}),
             ("symbol", {"symbol": "B"}),
             ("direction", {"position_side": PositionSide.LONG}),
             ("average_cost", {"position_average_cost": 101.0}),
-            ("overfill", {"filled_quantity": 11, "status": "FILLED"}),
         ):
             with self.subTest(label=label), self.assertRaises(ValueError):
                 execution.execute_intents(
@@ -826,6 +831,213 @@ class AccountExecutionTests(unittest.TestCase):
                     policy,
                     prior_progress=(replace(progress, **updates),),
                 )
+
+        original_fill = progress.fills[0]
+        underfilled_values = {
+            "intent_id": original_fill.intent_id,
+            "symbol": original_fill.symbol,
+            "position_side": original_fill.position_side,
+            "order_side": original_fill.order_side,
+            "snapshot_id": original_fill.snapshot_id,
+            "occurred_at": original_fill.occurred_at,
+            "quantity": 3,
+            "price": original_fill.price,
+            "fees": original_fill.fees,
+            "commission": original_fill.commission,
+            "status": "PARTIAL",
+        }
+        underfilled = domain_contracts.ExecutionProgressFill(
+            id=domain_contracts.stable_execution_progress_fill_id(
+                **underfilled_values
+            ),
+            **underfilled_values,
+        )
+        with self.assertRaises(ValueError):
+            execution.execute_intents(
+                first.account,
+                (intent,),
+                self._market(
+                    "market-3",
+                    NOW + timedelta(minutes=10),
+                    "A",
+                    80.0,
+                    volume=6,
+                ),
+                policy,
+                prior_progress=(replace(progress, fills=(underfilled,)),),
+            )
+
+        overfilled_values = {**underfilled_values, "quantity": 11, "status": "FILLED"}
+        overfilled = domain_contracts.ExecutionProgressFill(
+            id=domain_contracts.stable_execution_progress_fill_id(
+                **overfilled_values
+            ),
+            **overfilled_values,
+        )
+        with self.assertRaises(ValueError):
+            replace(progress, fills=(overfilled,))
+
+    def test_progress_aggregates_are_derived_from_bound_fill_history(self):
+        intent = execution.intent_for_delta(
+            None,
+            target("A"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        first = execution.execute_intents(
+            account(cash=2_000.0),
+            (intent,),
+            self._market(
+                "market-2",
+                NOW + timedelta(minutes=5),
+                "A",
+                100.0,
+                volume=4,
+            ),
+            self._zero_cost_policy("us", participation=100.0),
+        )
+        progress = first.progress[0]
+
+        self.assertEqual(progress.filled_quantity, 4)
+        self.assertEqual(progress.filled_notional, 400.0)
+        self.assertEqual(progress.commission_charged, 0.0)
+        progress_values = {
+            "intent_id": intent.id,
+            "symbol": "A",
+            "position_side": PositionSide.LONG,
+            "order_side": OrderSide.BUY,
+            "intent_quantity": 10,
+            "fills": progress.fills,
+        }
+        for aggregate_name in ("commission_charged", "filled_notional"):
+            with self.subTest(aggregate_name=aggregate_name), self.assertRaises(
+                TypeError
+            ):
+                execution.OrderExecutionProgress(
+                    **progress_values,
+                    **{aggregate_name: 999.0},
+                )
+        for field_name, forged_value in (
+            ("price", 999.0),
+            ("fees", 999.0),
+            ("commission", 999.0),
+            ("status", "FILLED"),
+        ):
+            with self.subTest(field_name=field_name), self.assertRaises(ValueError):
+                replace(
+                    progress.fills[0],
+                    **{field_name: forged_value},
+                )
+
+    def test_execution_rotates_carry_lifecycles_only_after_full_exit(self):
+        policy = self._zero_cost_policy("us", participation=100.0)
+
+        open_short = execution.intent_for_delta(
+            None,
+            target("S", PositionSide.SHORT),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        short_opened = execution.execute_intents(
+            account(cash=0.0),
+            (open_short,),
+            self._market("market-2", NOW, "S", 100.0),
+            policy,
+        )
+        first_borrow_lifecycle = short_opened.account.positions[0].borrow_lifecycle
+        close_short = risk_close(
+            short_opened.account.positions[0],
+            snapshot_id="market-2",
+            reason="SHORT_STOP_LOSS",
+        )
+        short_partial = execution.execute_intents(
+            short_opened.account,
+            (close_short,),
+            self._market("market-3", NOW + timedelta(minutes=5), "S", 90.0, volume=4),
+            policy,
+        )
+        self.assertEqual(
+            short_partial.account.positions[0].borrow_lifecycle,
+            first_borrow_lifecycle,
+        )
+        short_closed = execution.execute_intents(
+            short_partial.account,
+            (close_short,),
+            self._market("market-4", NOW + timedelta(minutes=10), "S", 90.0, volume=6),
+            policy,
+            prior_progress=short_partial.progress,
+        )
+        short_reopened = execution.execute_intents(
+            short_closed.account,
+            (
+                execution.intent_for_delta(
+                    None,
+                    target("S", PositionSide.SHORT),
+                    target_quantity=10,
+                    created_snapshot_id="market-4",
+                ),
+            ),
+            self._market("market-5", NOW + timedelta(minutes=15), "S", 90.0),
+            policy,
+        )
+        self.assertNotEqual(
+            short_reopened.account.positions[0].borrow_lifecycle.id,
+            first_borrow_lifecycle.id,
+        )
+
+        open_long = execution.intent_for_delta(
+            None,
+            target("L"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        long_opened = execution.execute_intents(
+            account(cash=0.0),
+            (open_long,),
+            self._market("market-2", NOW, "L", 100.0),
+            policy,
+        )
+        first_financing_lifecycle = long_opened.account.financing_lifecycle
+        close_long = risk_close(
+            long_opened.account.positions[0],
+            snapshot_id="market-2",
+            reason="LONG_STOP_LOSS",
+        )
+        long_partial = execution.execute_intents(
+            long_opened.account,
+            (close_long,),
+            self._market("market-3", NOW + timedelta(minutes=5), "L", 100.0, volume=4),
+            policy,
+        )
+        self.assertEqual(
+            long_partial.account.financing_lifecycle,
+            first_financing_lifecycle,
+        )
+        long_closed = execution.execute_intents(
+            long_partial.account,
+            (close_long,),
+            self._market("market-4", NOW + timedelta(minutes=10), "L", 100.0, volume=6),
+            policy,
+            prior_progress=long_partial.progress,
+        )
+        self.assertIsNone(long_closed.account.financing_lifecycle)
+        long_reopened = execution.execute_intents(
+            long_closed.account,
+            (
+                execution.intent_for_delta(
+                    None,
+                    target("L"),
+                    target_quantity=10,
+                    created_snapshot_id="market-4",
+                ),
+            ),
+            self._market("market-5", NOW + timedelta(minutes=15), "L", 100.0),
+            policy,
+        )
+        self.assertNotEqual(
+            long_reopened.account.financing_lifecycle.id,
+            first_financing_lifecycle.id,
+        )
 
     def test_forged_intent_is_locally_rejected_by_batch_execution(self):
         valid = execution.intent_for_delta(
@@ -924,15 +1136,30 @@ class AccountExecutionTests(unittest.TestCase):
         )
 
     def test_execution_progress_is_contract_owned_and_decision_batch_safe(self):
+        fill_values = {
+            "intent_id": "intent-1",
+            "symbol": "AAPL",
+            "position_side": PositionSide.LONG,
+            "order_side": OrderSide.BUY,
+            "snapshot_id": "market-2",
+            "occurred_at": NOW,
+            "quantity": 1,
+            "price": 100.0,
+            "fees": 0.0,
+            "commission": 0.0,
+            "status": "FILLED",
+        }
+        progress_fill = domain_contracts.ExecutionProgressFill(
+            id=domain_contracts.stable_execution_progress_fill_id(**fill_values),
+            **fill_values,
+        )
         progress = execution.OrderExecutionProgress(
             intent_id="intent-1",
             symbol="AAPL",
             position_side=PositionSide.LONG,
-            last_snapshot_id="market-2",
-            filled_quantity=1,
-            filled_notional=100.0,
-            commission_charged=0.0,
-            status="FILLED",
+            order_side=OrderSide.BUY,
+            intent_quantity=1,
+            fills=(progress_fill,),
         )
         self.assertIs(type(progress), domain_contracts.OrderExecutionProgress)
         self.assertIs(copy.deepcopy(progress), progress)
@@ -978,6 +1205,7 @@ class CarryAccrualTests(unittest.TestCase):
             cash=100.0,
             occurred_at=datetime(2026, 7, 30, 14, 30, tzinfo=timezone.utc),
             margin_loan=3_650.0,
+            financing_lifecycle=accrual_lifecycle("financing-main"),
             restricted_short_proceeds=1_000.0,
             positions=(
                 position(
@@ -986,6 +1214,7 @@ class CarryAccrualTests(unittest.TestCase):
                     10,
                     100.0,
                     current_price=100.0,
+                    borrow_lifecycle=accrual_lifecycle("borrow-s"),
                 ),
             ),
         )
@@ -1021,6 +1250,63 @@ class CarryAccrualTests(unittest.TestCase):
         self.assertEqual(repeated.events, ())
         self.assertEqual(repeated.account, first.account)
 
+    def test_reopened_borrow_and_financing_ignore_old_lifecycle_records(self):
+        old_borrow = domain_contracts.CarryAccrualRecord(
+            account_id="account-1",
+            cost_type=domain_contracts.CarryCostType.BORROW,
+            accrual_date=date(2026, 7, 1),
+            elapsed_days=1,
+            amount=1.0,
+            symbol="S",
+            lifecycle_id="borrow-old",
+        )
+        old_financing = domain_contracts.CarryAccrualRecord(
+            account_id="account-1",
+            cost_type=domain_contracts.CarryCostType.FINANCING,
+            accrual_date=date(2026, 7, 1),
+            elapsed_days=1,
+            amount=1.0,
+            lifecycle_id="financing-old",
+        )
+        reopened = account(
+            cash=100.0,
+            occurred_at=datetime(2026, 7, 10, 14, 30, tzinfo=timezone.utc),
+            margin_loan=3_650.0,
+            financing_lifecycle=domain_contracts.AccrualLifecycle(
+                id="financing-new",
+                started_on=date(2026, 7, 10),
+            ),
+            restricted_short_proceeds=1_000.0,
+            positions=(
+                position(
+                    "S",
+                    PositionSide.SHORT,
+                    10,
+                    100.0,
+                    current_price=100.0,
+                    borrow_lifecycle=domain_contracts.AccrualLifecycle(
+                        id="borrow-new",
+                        started_on=date(2026, 7, 10),
+                    ),
+                ),
+            ),
+            carry_accruals=(old_borrow, old_financing),
+        )
+
+        result = execution.accrue_carry_costs(
+            reopened,
+            as_of=date(2026, 7, 11),
+            financing_apr_pct=10.0,
+            borrow_apr_by_symbol={"S": 36.5},
+        )
+
+        self.assertEqual(result.financing_cost, 1.0)
+        self.assertEqual(result.borrow_cost, 1.0)
+        self.assertEqual(
+            {(item.cost_type.value, item.elapsed_days) for item in result.new_accruals},
+            {("FINANCING", 1), ("BORROW", 1)},
+        )
+
     def test_weekend_uses_actual_three_calendar_days_over_365(self):
         friday = execution.accrue_carry_costs(
             self._leveraged_short_account(),
@@ -1046,11 +1332,26 @@ class CarryAccrualTests(unittest.TestCase):
         original = replace(
             self._leveraged_short_account(),
             positions=(
-                position("A", PositionSide.SHORT, 10, 100.0, current_price=100.0),
-                position("B", PositionSide.SHORT, 20, 50.0, current_price=50.0),
+                position(
+                    "A",
+                    PositionSide.SHORT,
+                    10,
+                    100.0,
+                    current_price=100.0,
+                    borrow_lifecycle=accrual_lifecycle("borrow-a"),
+                ),
+                position(
+                    "B",
+                    PositionSide.SHORT,
+                    20,
+                    50.0,
+                    current_price=50.0,
+                    borrow_lifecycle=accrual_lifecycle("borrow-b"),
+                ),
             ),
             restricted_short_proceeds=2_000.0,
             margin_loan=0.0,
+            financing_lifecycle=None,
         )
 
         result = execution.accrue_carry_costs(
@@ -1067,8 +1368,21 @@ class CarryAccrualTests(unittest.TestCase):
         mixed = replace(
             self._leveraged_short_account(),
             positions=(
-                position("A", PositionSide.SHORT, 10, 100.0, current_price=100.0),
-                position("B", PositionSide.SHORT, 10, 50.0),
+                position(
+                    "A",
+                    PositionSide.SHORT,
+                    10,
+                    100.0,
+                    current_price=100.0,
+                    borrow_lifecycle=accrual_lifecycle("borrow-a"),
+                ),
+                position(
+                    "B",
+                    PositionSide.SHORT,
+                    10,
+                    50.0,
+                    borrow_lifecycle=accrual_lifecycle("borrow-b"),
+                ),
             ),
             restricted_short_proceeds=1_500.0,
         )
