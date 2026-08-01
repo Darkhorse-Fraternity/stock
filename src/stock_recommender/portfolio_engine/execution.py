@@ -292,6 +292,7 @@ def _intent_id(
     quantity: int,
     reason: str,
     created_snapshot_id: str,
+    created_market_at: datetime,
 ) -> str:
     return stable_execution_intent_id(
         symbol=symbol,
@@ -301,6 +302,7 @@ def _intent_id(
         quantity=quantity,
         reason=reason,
         created_snapshot_id=created_snapshot_id,
+        created_market_at=created_market_at,
     )
 
 
@@ -319,6 +321,7 @@ def intent_for_delta(
     *,
     target_quantity: int,
     created_snapshot_id: str,
+    created_market_at: datetime,
     reason: str = "REBALANCE",
 ) -> OrderIntent | None:
     """Plan one unambiguous delta; reversals close before a later snapshot opens."""
@@ -333,6 +336,12 @@ def intent_for_delta(
         raise ValueError("target_quantity must be nonnegative")
     if type(created_snapshot_id) is not str or not created_snapshot_id:
         raise ValueError("created_snapshot_id must be a non-empty string")
+    if (
+        type(created_market_at) is not datetime
+        or created_market_at.tzinfo is None
+        or created_market_at.utcoffset() is None
+    ):
+        raise ValueError("created_market_at must be a timezone-aware datetime")
     if type(reason) is not str or not reason:
         raise ValueError("reason must be a non-empty string")
     if existing is None and target is None:
@@ -379,6 +388,7 @@ def intent_for_delta(
         quantity=quantity,
         reason=reason,
         created_snapshot_id=created_snapshot_id,
+        created_market_at=created_market_at,
     )
     return OrderIntent(
         id=intent_id,
@@ -389,6 +399,7 @@ def intent_for_delta(
         quantity=quantity,
         reason=reason,
         created_snapshot_id=created_snapshot_id,
+        created_market_at=created_market_at,
     )
 
 
@@ -503,6 +514,7 @@ def plan_rebalance_intents(
                 requested,
                 target_quantity=0,
                 created_snapshot_id=market.id,
+                created_market_at=market.occurred_at,
             )
             if intent is not None:
                 planned.append(intent)
@@ -521,6 +533,7 @@ def plan_rebalance_intents(
                         requested,
                         target_quantity=0,
                         created_snapshot_id=market.id,
+                        created_market_at=market.occurred_at,
                     )
                     if intent is not None:
                         planned.append(intent)
@@ -535,6 +548,7 @@ def plan_rebalance_intents(
             requested,
             target_quantity=target_quantity,
             created_snapshot_id=market.id,
+            created_market_at=market.occurred_at,
         )
         if intent is not None:
             planned.append(intent)
@@ -1332,6 +1346,15 @@ def execute_intents(
                 )
             )
             continue
+        if original.created_market_at >= market.occurred_at:
+            diagnostics.append(
+                ExecutionDiagnostic(
+                    original.id,
+                    original.symbol,
+                    "MARKET_TIME_NOT_LATER",
+                )
+            )
+            continue
         remaining = original.quantity - previously_filled
         resume_effect = original.position_effect
         if previous is not None and resume_effect is PositionEffect.OPEN:
@@ -1519,6 +1542,12 @@ class ExecutionSimulationStage:
     def evaluate(self, stage_input: StageInput) -> StageOutput:
         if type(stage_input) is not StageInput:
             raise TypeError("stage_input must be StageInput")
+        pre_execution_admitted = [
+            fact
+            for fact in stage_input.upstream_facts
+            if isinstance(fact, Mapping)
+            and fact.get("kind") == "pre_execution_admitted_intents"
+        ]
         admitted = [
             fact
             for fact in stage_input.upstream_facts
@@ -1530,7 +1559,11 @@ class ExecutionSimulationStage:
             for fact in stage_input.upstream_facts
             if isinstance(fact, Mapping) and fact.get("kind") == "order_intents"
         ]
-        selected = admitted if admitted else planned
+        selected = (
+            pre_execution_admitted
+            if pre_execution_admitted
+            else admitted if admitted else planned
+        )
         if len(selected) > 1:
             raise PipelineContractError("duplicate upstream execution intent fact")
         items: object = () if not selected else selected[0].get("items", ())

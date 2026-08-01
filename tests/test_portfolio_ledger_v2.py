@@ -45,6 +45,15 @@ from stock_recommender.portfolio_engine.ledger import (
 
 
 NOW = datetime(2026, 7, 31, 14, 30, tzinfo=timezone.utc)
+INTENT_CREATED_AT = datetime(2026, 7, 31, 14, 29, tzinfo=timezone.utc)
+
+
+_OrderIntent = OrderIntent
+
+
+def OrderIntent(**kwargs):
+    kwargs.setdefault("created_market_at", INTENT_CREATED_AT)
+    return _OrderIntent(**kwargs)
 
 
 def account(*, strategy_id: str = "strategy", cash: float = 1_000.0) -> AccountSnapshot:
@@ -901,6 +910,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             "quantity": 2,
             "reason": "TARGET",
             "created_snapshot_id": "market-0",
+            "created_market_at": INTENT_CREATED_AT,
         }
         intent = OrderIntent(
             id=stable_execution_intent_id(**intent_values),

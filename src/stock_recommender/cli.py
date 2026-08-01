@@ -170,6 +170,8 @@ def main() -> None:
             candidate_limit=candidate_limit,
             selection_limit=selection_limit,
             strategy=strategy,
+            portfolio_engine=portfolio_engine,
+            portfolio_account=portfolio_account,
             **universe_options,
         )
         _persist_scheduled_plan(

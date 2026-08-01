@@ -503,6 +503,7 @@ def _order_intent_from_v1(
     *,
     positions: Mapping[str, PositionSnapshot],
     snapshot_id: str,
+    created_market_at: datetime,
 ) -> dict[str, Any] | None:
     order = _mapping(raw, "order")
     status = _nonempty_string(order.get("status"), "order.status")
@@ -541,6 +542,7 @@ def _order_intent_from_v1(
         "quantity": remaining,
         "reason": reason,
         "created_snapshot_id": snapshot_id,
+        "created_market_at": created_market_at.isoformat(),
     }
 
 
@@ -601,7 +603,10 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
     open_intents = []
     for raw_order in orders:
         intent = _order_intent_from_v1(
-            raw_order, positions=positions, snapshot_id=snapshot_id
+            raw_order,
+            positions=positions,
+            snapshot_id=snapshot_id,
+            created_market_at=occurred_at,
         )
         if intent is not None:
             open_intents.append(intent)

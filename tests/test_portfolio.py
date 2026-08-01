@@ -401,9 +401,10 @@ class StrategyPortfolioTests(unittest.TestCase):
             [{"symbol": "600001", "name": "测试股票", "price": 10.0, "percent": 1.0, "score": 0.8}],
             now=self.t0,
         )
+        daily_path = Path(self.temp_dir.name) / "daily.json"
         with self.assertRaisesRegex(ValueError, "portfolio_decision"):
             save_daily_selection(
-                Path(self.temp_dir.name) / "daily.json",
+                daily_path,
                 plan,
                 strategy=self.strategy,
                 now=self.t0,
@@ -412,6 +413,7 @@ class StrategyPortfolioTests(unittest.TestCase):
         account = load_portfolio_account("tech-ai", path=self.path)
 
         self.assertIsNone(account)
+        self.assertFalse(daily_path.exists())
 
 
 if __name__ == "__main__":

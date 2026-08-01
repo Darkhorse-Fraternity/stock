@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -26,8 +27,32 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _snapshot_id(market: str, occurred_at: datetime, symbols: tuple[str, ...]) -> str:
-    material = "|".join((market, occurred_at.isoformat(), *symbols))
+def _utc_datetime(value: object, field_name: str = "occurred_at") -> datetime:
+    if (
+        type(value) is not datetime
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(f"{field_name} must be a timezone-aware datetime")
+    return value.astimezone(timezone.utc)
+
+
+def _snapshot_id(
+    market: str,
+    occurred_at: datetime,
+    quotes: Mapping[str, Mapping[str, float]],
+) -> str:
+    material = json.dumps(
+        {
+            "market": market,
+            "occurred_at": occurred_at.isoformat(),
+            "quotes": quotes,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
     return "market-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
@@ -41,6 +66,7 @@ class MarketAdapterQuoteProvider:
         symbols: tuple[str, ...],
         occurred_at: datetime,
     ) -> MarketSnapshot:
+        captured_at = _utc_datetime(occurred_at)
         rows, error = self._adapter.fetch_watchlist(
             ({"symbol": symbol} for symbol in symbols),
             strategy=self._strategy,
@@ -86,8 +112,8 @@ class MarketAdapterQuoteProvider:
             raise RuntimeError(error or "portfolio quote snapshot is empty")
         market = strategy_market(self._strategy)
         return MarketSnapshot(
-            id=_snapshot_id(market, occurred_at, symbols),
-            occurred_at=occurred_at,
+            id=_snapshot_id(market, captured_at, quotes),
+            occurred_at=captured_at,
             quotes=quotes,
         )
 
@@ -98,7 +124,8 @@ class FailClosedBorrowProvider:
         symbols: tuple[str, ...],
         occurred_at: datetime,
     ) -> BorrowSnapshot:
-        material = "|".join((occurred_at.isoformat(), *symbols))
+        captured_at = _utc_datetime(occurred_at)
+        material = "|".join((captured_at.isoformat(), *symbols))
         snapshot_id = "borrow-" + hashlib.sha256(
             material.encode("utf-8")
         ).hexdigest()[:24]
@@ -111,6 +138,7 @@ class EmptyEventCalendarProvider:
         symbols: tuple[str, ...],
         occurred_at: datetime,
     ) -> Mapping[str, int | None]:
+        _utc_datetime(occurred_at)
         return {symbol: None for symbol in symbols}
 
 
@@ -123,6 +151,7 @@ def open_portfolio_runtime(
 ) -> tuple[PortfolioEngine, AccountSnapshot]:
     """Open the strict ledger and bootstrap exactly one strategy account."""
 
+    captured_at = _utc_datetime(occurred_at)
     strategy_id = str(strategy.get("id") or "")
     if not strategy_id:
         raise ValueError("strategy.id is required for portfolio runtime")
@@ -146,7 +175,7 @@ def open_portfolio_runtime(
                 id=f"account-{strategy_id}",
                 strategy_id=strategy_id,
                 strategy_revision=revision,
-                occurred_at=occurred_at,
+                occurred_at=captured_at,
                 available_cash=initial_cash,
                 snapshot_id=f"bootstrap-{strategy_id}-r{revision}",
             )
@@ -167,11 +196,12 @@ def process_portfolio_runtime(
     account: AccountSnapshot,
     occurred_at: datetime,
 ) -> tuple[DecisionBatch, PortfolioSnapshot]:
+    captured_at = _utc_datetime(occurred_at)
     request = engine.prepare_process_request(
-        run_key=f"process:{strategy['id']}:{occurred_at.isoformat()}",
+        run_key=f"process:{strategy['id']}:{captured_at.isoformat()}",
         strategy=strategy,
         account=account,
-        occurred_at=occurred_at,
+        occurred_at=captured_at,
     )
     batch = engine.process_and_commit(request)
     snapshot = engine.performance(str(strategy["id"]), request.market)

@@ -255,6 +255,7 @@ class PortfolioEngineContractTests(unittest.TestCase):
             "quantity": 1,
             "reason": "target",
             "created_snapshot_id": "market-1",
+            "created_market_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
         }
         values.update(updates)
         return OrderIntent(**values)

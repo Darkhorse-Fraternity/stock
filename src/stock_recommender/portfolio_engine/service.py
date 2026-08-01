@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping
 
@@ -40,6 +41,7 @@ from .execution import (
 )
 from .exposure import ExposureBudgetStage
 from .margin import MarginAdmissionStage
+from .pre_execution import PreExecutionAdmissionStage, hard_cap_breaches
 from .risk import PortfolioRiskStage
 from .signal_ports import SIGNAL_MODELS, SignalModel
 from .target_pipeline import TargetNettingStage
@@ -403,14 +405,6 @@ class PortfolioEngine:
             "margin_admitted_intents",
             OrderIntent,
         )
-        rebalance_output = StageOutput(
-            stage="rebalance_intent",
-            component_version=RebalanceIntentStage.component_version,
-            facts=(
-                {"kind": "order_intents", "items": admitted_intents},
-                _fact(rebalance_output_raw, "execution_planning_diagnostics"),
-            ),
-        )
         risk_updates = _typed_items(
             risk_output,
             "position_risk_updates",
@@ -448,9 +442,9 @@ class PortfolioEngine:
             net_output,
             exposure_output,
             borrow_output,
-            margin_output,
             risk_output,
-            rebalance_output,
+            rebalance_output_raw,
+            margin_output,
         ))
         return DecisionBatch(
             run_key=request.run_key,
@@ -489,11 +483,12 @@ class PortfolioEngine:
         if view.account != request.account:
             raise ValueError("stale portfolio account snapshot")
 
-        _, margin_policy, short_policy = self._policies(request.strategy)
+        exposure_policy, margin_policy, short_policy = self._policies(request.strategy)
         eligible = tuple(
             item
             for item in view.open_intents
             if item.created_snapshot_id != request.market.id
+            and item.created_market_at < request.market.occurred_at
         )
         eligible_ids = {item.id for item in eligible}
         progress = tuple(
@@ -501,16 +496,19 @@ class PortfolioEngine:
             for item in view.execution_progress
             if item.intent_id in eligible_ids
         )
-        execution_output = ExecutionSimulationStage(
+        resolved_execution_policy = execution_policy(
+            request.market_name,
+            {
+                "max_bar_participation_pct": 5.0,
+                **dict(request.strategy.get("portfolio", {})),
+            },
+        )
+        pre_execution_output = PreExecutionAdmissionStage(
             request.account,
             request.market,
-            execution_policy(
-                request.market_name,
-                {
-                    "max_bar_participation_pct": 5.0,
-                    **dict(request.strategy.get("portfolio", {})),
-                },
-            ),
+            exposure_policy,
+            margin_policy,
+            resolved_execution_policy,
         ).evaluate(
             _stage_input(
                 request,
@@ -520,11 +518,44 @@ class PortfolioEngine:
                 ),
             )
         )
+        admitted_for_execution = _typed_items(
+            pre_execution_output,
+            "pre_execution_admitted_intents",
+            OrderIntent,
+        )
+        execution_output = ExecutionSimulationStage(
+            request.account,
+            request.market,
+            resolved_execution_policy,
+        ).evaluate(
+            _stage_input(
+                request,
+                (
+                    {
+                        "kind": "pre_execution_admitted_intents",
+                        "items": admitted_for_execution,
+                    },
+                    {"kind": "execution_progress", "items": progress},
+                ),
+            )
+        )
         execution_account = _fact(execution_output, "execution_account").get(
             "account"
         )
         if type(execution_account) is not AccountSnapshot:
             raise TypeError("execution stage must return AccountSnapshot")
+        if any(item.increases_risk for item in admitted_for_execution):
+            post_execution_breaches = hard_cap_breaches(
+                execution_account,
+                request.market,
+                exposure_policy,
+                margin_policy,
+            )
+            if post_execution_breaches:
+                raise RuntimeError(
+                    "post-execution hard-cap breach: "
+                    + ", ".join(post_execution_breaches)
+                )
 
         borrow_apr = {
             symbol: security.borrow_apr_pct
@@ -623,6 +654,18 @@ class PortfolioEngine:
             PositionRiskUpdate,
         )
         diagnostics: list[Mapping[str, Any]] = []
+        for item in _fact(
+            pre_execution_output,
+            "pre_execution_diagnostics",
+        ).get("items", ()):
+            if isinstance(item, Mapping):
+                diagnostics.append(
+                    {
+                        "code": str(item.get("reason") or "PRE_EXECUTION_REJECTED"),
+                        "stage": "pre_execution_admission",
+                        "symbol": str(item.get("symbol") or ""),
+                    }
+                )
         for item in _fact(execution_output, "execution_diagnostics").get(
             "items", ()
         ):
@@ -666,6 +709,7 @@ class PortfolioEngine:
             stage_outputs=tuple(
                 _ledger_safe_output(item)
                 for item in (
+                    pre_execution_output,
                     execution_output,
                     carry_output,
                     borrow_output,
@@ -698,8 +742,9 @@ class PortfolioEngine:
             and market.quotes[held.symbol].get("price") is not None
         }
         valuation = value_account(view.account, prices)
+        valued_account = replace(view.account, positions=valuation.positions)
         return PortfolioSnapshot(
-            account=view.account,
+            account=valued_account,
             metrics=valuation.metrics,
             positions=valuation.positions,
             open_intents=view.open_intents,

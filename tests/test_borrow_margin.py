@@ -77,6 +77,7 @@ def intent(
         quantity=quantity,
         reason="rebalance",
         created_snapshot_id="account-1",
+        created_market_at=NOW,
     )
 
 

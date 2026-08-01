@@ -25,6 +25,22 @@ from stock_recommender.pipeline import PipelineContractError, PipelineRunner, St
 
 
 NOW = datetime(2026, 7, 31, 14, 30, tzinfo=timezone.utc)
+INTENT_CREATED_AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+
+class _ExecutionFixture:
+    def __init__(self, module):
+        self._module = module
+
+    def __getattr__(self, name):
+        return getattr(self._module, name)
+
+    def intent_for_delta(self, *args, **kwargs):
+        kwargs.setdefault("created_market_at", INTENT_CREATED_AT)
+        return self._module.intent_for_delta(*args, **kwargs)
+
+
+execution = _ExecutionFixture(execution)
 
 
 def target(symbol="AAPL", side=PositionSide.LONG, weight=10.0):
@@ -67,12 +83,19 @@ def account(*, cash=1_000.0, positions=(), **updates):
     return AccountSnapshot(**values)
 
 
-def risk_close(existing, *, snapshot_id, reason):
+def risk_close(
+    existing,
+    *,
+    snapshot_id,
+    reason,
+    created_market_at=INTENT_CREATED_AT,
+):
     return OrderIntent(
         id=domain_contracts.stable_risk_intent_id(
             snapshot_id,
             existing,
             reason,
+            created_market_at=created_market_at,
         ),
         symbol=existing.symbol,
         position_side=existing.side,
@@ -85,6 +108,7 @@ def risk_close(existing, *, snapshot_id, reason):
         quantity=existing.quantity,
         reason=reason,
         created_snapshot_id=snapshot_id,
+        created_market_at=created_market_at,
     )
 
 
@@ -215,8 +239,9 @@ class FillSimulationTests(unittest.TestCase):
         policy = execution.execution_policy("cn", config)
         held = position("600001", quantity=100)
         sell = risk_close(
-            held,
-            snapshot_id="market-1",
+        held,
+        snapshot_id="market-1",
+        created_market_at=INTENT_CREATED_AT,
             reason="LONG_STOP_LOSS",
         )
 
@@ -1184,6 +1209,7 @@ class AccountExecutionTests(unittest.TestCase):
         risk_intent = evaluate_position_risk(
             held,
             snapshot_id="market-1",
+            created_market_at=INTENT_CREATED_AT,
         ).intents[0]
         quote = {"price": 92.0, "bar_volume": 1_000}
 
@@ -1216,7 +1242,11 @@ class AccountExecutionTests(unittest.TestCase):
 
     def test_same_batch_close_then_open_reversal_executes_only_close_locally(self):
         held = position("A", quantity=10, average_cost=100.0, current_price=92.0)
-        close_a = evaluate_position_risk(held, snapshot_id="market-1").intents[0]
+        close_a = evaluate_position_risk(
+            held,
+            snapshot_id="market-1",
+            created_market_at=INTENT_CREATED_AT,
+        ).intents[0]
         open_a_short = execution.intent_for_delta(
             None,
             target("A", PositionSide.SHORT, 5.0),

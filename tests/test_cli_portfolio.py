@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from stock_recommender import cli
@@ -95,6 +96,39 @@ class PortfolioCliTests(unittest.TestCase):
 
         self.assertEqual(stream.getvalue(), "")
         process.assert_called_once()
+
+    def test_scheduled_ai_passes_runtime_to_one_plan_and_tracks_exact_plan(self):
+        environment = {
+            "STOCK_AGENT_MODE": "ai",
+            "STOCK_AGENT_EXECUTION_KIND": "scheduled",
+            "STOCK_AGENT_OUTPUT": "",
+            "STOCK_AGENT_SCHEDULE_GUARD": "0",
+            "STOCK_AGENT_DELIVERY_RUN": "0",
+        }
+        plan = object()
+        engine = object()
+        account = object()
+        with patch.dict(os.environ, environment, clear=False), patch.object(
+            cli, "load_strategy_config", return_value=self.strategy
+        ), patch.object(
+            cli, "open_portfolio_runtime", return_value=(engine, account)
+        ), patch.object(
+            cli, "should_publish_at_market_open", return_value=True
+        ), patch.object(
+            cli, "collect_recommendation_plan", return_value=plan
+        ) as collect, patch.object(
+            cli, "save_daily_selection"
+        ) as save, patch.object(
+            cli,
+            "render_ai_report_result",
+            return_value=SimpleNamespace(report="AI report"),
+        ), redirect_stdout(io.StringIO()):
+            cli.main()
+
+        self.assertIs(collect.call_args.kwargs["portfolio_engine"], engine)
+        self.assertIs(collect.call_args.kwargs["portfolio_account"], account)
+        self.assertIs(save.call_args.args[1], plan)
+        self.assertIs(save.call_args.kwargs["portfolio_engine"], engine)
 
 
 if __name__ == "__main__":

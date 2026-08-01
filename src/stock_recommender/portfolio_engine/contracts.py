@@ -323,6 +323,8 @@ def _require_integer(value: object, field_name: str) -> None:
 def _require_datetime(value: object, field_name: str) -> None:
     if type(value) is not datetime:
         raise TypeError(f"{field_name} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
 
 
 def _require_mapping(value: object, field_name: str) -> None:
@@ -941,6 +943,7 @@ class OrderIntent(_DeeplyImmutable):
     quantity: int
     reason: str
     created_snapshot_id: str
+    created_market_at: datetime
 
     def __post_init__(self) -> None:
         _require_string(self.id, "id")
@@ -951,6 +954,7 @@ class OrderIntent(_DeeplyImmutable):
         _require_positive_quantity(self.quantity)
         _require_string(self.reason, "reason")
         _require_string(self.created_snapshot_id, "created_snapshot_id")
+        _require_datetime(self.created_market_at, "created_market_at")
 
     @property
     def increases_risk(self) -> bool:
@@ -978,12 +982,15 @@ def stable_execution_intent_id(
     quantity: int,
     reason: str,
     created_snapshot_id: str,
+    created_market_at: datetime,
 ) -> str:
     """Bind an execution-generated ID to every executable intent semantic."""
 
+    _require_datetime(created_market_at, "created_market_at")
     material = "|".join(
         (
             created_snapshot_id,
+            created_market_at.isoformat(),
             symbol,
             position_side.value,
             order_side.value,
@@ -999,12 +1006,16 @@ def stable_risk_intent_id(
     snapshot_id: str,
     position: PositionSnapshot,
     reason: str,
+    *,
+    created_market_at: datetime,
 ) -> str:
     """Return the established stable ID for a position-level risk exit."""
 
+    _require_datetime(created_market_at, "created_market_at")
     material = "|".join(
         (
             snapshot_id,
+            created_market_at.isoformat(),
             position.symbol,
             position.side.value,
             str(position.quantity),
@@ -1037,6 +1048,7 @@ def verify_order_intent_id(
             quantity=intent.quantity,
             reason=intent.reason,
             created_snapshot_id=intent.created_snapshot_id,
+            created_market_at=intent.created_market_at,
         )
     if not intent.id.startswith("risk-") or existing_position is None:
         return False
@@ -1056,6 +1068,7 @@ def verify_order_intent_id(
             intent.created_snapshot_id,
             existing_position,
             intent.reason,
+            created_market_at=intent.created_market_at,
         )
     )
 
@@ -1489,6 +1502,7 @@ class PlanRequest(_DeeplyImmutable):
             raise TypeError("account must be AccountSnapshot")
         if type(self.market) is not MarketSnapshot:
             raise TypeError("market must be MarketSnapshot")
+        _require_datetime(self.market.occurred_at, "market.occurred_at")
         if type(self.borrow) is not BorrowSnapshot:
             raise TypeError("borrow must be BorrowSnapshot")
         if not self.account.snapshot_id:
@@ -1525,6 +1539,7 @@ class ProcessRequest(_DeeplyImmutable):
             raise TypeError("account must be AccountSnapshot")
         if type(self.market) is not MarketSnapshot:
             raise TypeError("market must be MarketSnapshot")
+        _require_datetime(self.market.occurred_at, "market.occurred_at")
         if type(self.borrow) is not BorrowSnapshot:
             raise TypeError("borrow must be BorrowSnapshot")
         if not self.account.snapshot_id:
@@ -1556,10 +1571,34 @@ class PortfolioSnapshot(_DeeplyImmutable):
         positions = _typed_tuple(self.positions, PositionSnapshot, "positions")
         intents = _typed_tuple(self.open_intents, OrderIntent, "open_intents")
         events = _typed_tuple(self.recent_events, PortfolioEvent, "recent_events")
-        if tuple(item.symbol for item in positions) != tuple(
-            item.symbol for item in self.account.positions
+        if positions != self.account.positions:
+            raise ValueError("portfolio positions must fully match account.positions")
+        if any(position.market_value is None for position in positions):
+            raise ValueError("portfolio positions require current prices")
+        long_market_value = sum(
+            position.market_value or 0.0
+            for position in positions
+            if position.side is PositionSide.LONG
+        )
+        short_liability = sum(
+            position.market_value or 0.0
+            for position in positions
+            if position.side is PositionSide.SHORT
+        )
+        account_metric_values = {
+            "available_cash": self.account.available_cash,
+            "restricted_short_proceeds": self.account.restricted_short_proceeds,
+            "margin_loan": self.account.margin_loan,
+            "accrued_financing_cost": self.account.accrued_financing_cost,
+            "accrued_borrow_cost": self.account.accrued_borrow_cost,
+            "long_market_value": long_market_value,
+            "short_liability": short_liability,
+        }
+        if any(
+            not _metric_matches(getattr(self.metrics, field_name), expected)
+            for field_name, expected in account_metric_values.items()
         ):
-            raise ValueError("portfolio positions must match the account position order")
+            raise ValueError("portfolio metrics must be derived from the same account")
         object.__setattr__(self, "positions", positions)
         object.__setattr__(self, "open_intents", intents)
         object.__setattr__(self, "recent_events", events)

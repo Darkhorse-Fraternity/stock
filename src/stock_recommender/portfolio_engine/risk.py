@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal
 from types import MappingProxyType
 from typing import Iterator
@@ -255,6 +256,7 @@ class RiskDecision(_ImmutableRiskValue):
             raise ValueError("intent must match the risk decision and updated position")
         if self.intent is not None and self.intent.id != _stable_intent_id(
             self.intent.created_snapshot_id,
+            self.intent.created_market_at,
             self.updated_position,
             self.intent.reason,
         ):
@@ -402,21 +404,28 @@ class ForcedDeleveragingResult(_ImmutableRiskValue):
 
 def _stable_intent_id(
     snapshot_id: str,
+    created_market_at: datetime,
     position: PositionSnapshot,
     reason: str,
 ) -> str:
     if type(snapshot_id) is not str or not snapshot_id:
         raise RiskError("snapshot_id must be a non-empty string")
-    return stable_risk_intent_id(snapshot_id, position, reason)
+    return stable_risk_intent_id(
+        snapshot_id,
+        position,
+        reason,
+        created_market_at=created_market_at,
+    )
 
 
 def _close_intent(
     position: PositionSnapshot,
     reason: str,
     snapshot_id: str,
+    created_market_at: datetime,
 ) -> OrderIntent:
     return OrderIntent(
-        id=_stable_intent_id(snapshot_id, position, reason),
+        id=_stable_intent_id(snapshot_id, created_market_at, position, reason),
         symbol=position.symbol,
         position_side=position.side,
         order_side=(
@@ -426,6 +435,7 @@ def _close_intent(
         quantity=position.quantity,
         reason=reason,
         created_snapshot_id=snapshot_id,
+        created_market_at=created_market_at,
     )
 
 
@@ -466,6 +476,7 @@ def evaluate_position_risk(
     policies: PositionRiskPolicies | ShortPolicy | Mapping[str, object] | None = None,
     *,
     snapshot_id: str = "risk-snapshot",
+    created_market_at: datetime,
 ) -> PositionRiskResult:
     """Evaluate one immutable position, updating anchors without mutating it."""
 
@@ -531,7 +542,7 @@ def evaluate_position_risk(
 
     if reason is None:
         return PositionRiskResult(updated_position=updated)
-    intent = _close_intent(updated, reason, snapshot_id)
+    intent = _close_intent(updated, reason, snapshot_id, created_market_at)
     decision = RiskDecision(
         reason=reason,
         position_effect=PositionEffect.CLOSE,
@@ -821,6 +832,8 @@ def evaluate_forced_deleveraging(
     account: AccountSnapshot,
     prices: MarketSnapshot | Mapping[str, object],
     margin_policy: MarginPolicy | None = None,
+    *,
+    created_market_at: datetime,
 ) -> ForcedDeleveragingResult:
     """Plan deterministic full closes until the liquidation buffer is restored."""
 
@@ -870,7 +883,12 @@ def evaluate_forced_deleveraging(
         price = _market_price(raw_prices, held.symbol)
         if price is None:
             continue
-        intent = _close_intent(held, MARGIN_CALL, account.id)
+        intent = _close_intent(
+            held,
+            MARGIN_CALL,
+            account.id,
+            created_market_at,
+        )
         try:
             candidate_account = project_account_for_intent(account, intent, raw_prices)
             _value_risk_account(
@@ -954,10 +972,17 @@ def plan_forced_deleveraging(
     account: AccountSnapshot,
     prices: MarketSnapshot | Mapping[str, object],
     margin_policy: MarginPolicy | None = None,
+    *,
+    created_market_at: datetime,
 ) -> tuple[OrderIntent, ...]:
     """Compatibility helper returning only executable deleveraging intents."""
 
-    return evaluate_forced_deleveraging(account, prices, margin_policy).intents
+    return evaluate_forced_deleveraging(
+        account,
+        prices,
+        margin_policy,
+        created_market_at=created_market_at,
+    ).intents
 
 
 def _quote_for(
@@ -1037,6 +1062,12 @@ class PortfolioRiskStage:
     def evaluate(self, stage_input: StageInput) -> StageOutput:
         if type(stage_input) is not StageInput:
             raise TypeError("stage_input must be StageInput")
+        try:
+            created_market_at = datetime.fromisoformat(stage_input.as_of)
+        except (TypeError, ValueError) as exc:
+            raise PipelineContractError("stage as_of must be an ISO datetime") from exc
+        if created_market_at.tzinfo is None or created_market_at.utcoffset() is None:
+            raise PipelineContractError("stage as_of must be timezone-aware")
         upstream_modes = self._upstream_modes(stage_input)
         modes = dict(self._borrow_position_modes)
         for symbol, mode in upstream_modes.items():
@@ -1068,6 +1099,7 @@ class PortfolioRiskStage:
                     valued,
                     self._policies,
                     snapshot_id=stage_input.portfolio_snapshot_id,
+                    created_market_at=created_market_at,
                 )
                 squeeze = evaluate_squeeze(
                     position_result.updated_position,
@@ -1118,6 +1150,7 @@ class PortfolioRiskStage:
                 self._account,
                 self._market_or_prices,
                 self._margin_policy,
+                created_market_at=created_market_at,
             )
         except (TypeError, ValueError) as exc:
             raise PipelineContractError(str(exc)) from exc

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from stock_recommender.parameters import default_strategy_config
 from stock_recommender.portfolio_runtime import (
+    EmptyEventCalendarProvider,
+    FailClosedBorrowProvider,
     MarketAdapterQuoteProvider,
     format_portfolio_snapshot,
     open_portfolio_runtime,
@@ -44,6 +46,27 @@ class Adapter:
 
 
 class PortfolioRuntimeTests(unittest.TestCase):
+    def test_runtime_boundaries_reject_naive_time_and_normalize_aware_time_to_utc(self):
+        naive = NOW.replace(tzinfo=None)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            FailClosedBorrowProvider().snapshot(("AAPL",), naive)
+        with self.assertRaisesRegex(ValueError, "timezone-aware"):
+            EmptyEventCalendarProvider().sessions_until_events(("AAPL",), naive)
+        with TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(ValueError, "timezone-aware"):
+                open_portfolio_runtime(
+                    strategy(),
+                    path=Path(temporary) / "portfolio-v2.json",
+                    adapter=Adapter(),
+                    occurred_at=naive,
+                )
+        offset_time = NOW.astimezone(timezone(timedelta(hours=8)))
+        snapshot = MarketAdapterQuoteProvider(
+            Adapter([{"symbol": "AAPL", "price": 200}]), strategy()
+        ).snapshot(("AAPL",), offset_time)
+        self.assertEqual(snapshot.occurred_at, NOW)
+        self.assertIs(snapshot.occurred_at.tzinfo, timezone.utc)
+
     def test_quote_adapter_builds_strict_bar_snapshot(self):
         adapter = Adapter(
             [
@@ -73,6 +96,40 @@ class PortfolioRuntimeTests(unittest.TestCase):
             },
         )
         self.assertEqual(adapter.calls[0][0], ({"symbol": "AAPL"},))
+
+    def test_snapshot_id_is_bound_to_complete_canonical_quote_content(self):
+        first_rows = [
+            {
+                "symbol": "AAPL",
+                "price": 200,
+                "open": 198,
+                "high": 202,
+                "low": 197,
+                "volume": 1_000_000,
+            }
+        ]
+        reordered_rows = [
+            {
+                "volume": 1_000_000,
+                "low": 197,
+                "high": 202,
+                "open": 198,
+                "price": 200,
+                "symbol": "AAPL",
+            }
+        ]
+        changed_rows = [{**first_rows[0], "price": 201}]
+        first = MarketAdapterQuoteProvider(Adapter(first_rows), strategy()).snapshot(
+            ("AAPL",), NOW
+        )
+        reordered = MarketAdapterQuoteProvider(
+            Adapter(reordered_rows), strategy()
+        ).snapshot(("AAPL",), NOW)
+        changed = MarketAdapterQuoteProvider(Adapter(changed_rows), strategy()).snapshot(
+            ("AAPL",), NOW
+        )
+        self.assertEqual(first.id, reordered.id)
+        self.assertNotEqual(first.id, changed.id)
 
     def test_runtime_bootstraps_processes_and_renders_typed_snapshot(self):
         adapter = Adapter()

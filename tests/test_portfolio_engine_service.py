@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -248,6 +249,60 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertEqual(spy.batches, [decision])
         self.assertIs(spy.batches[0], decision)
 
+    def test_tracking_identity_or_commit_failure_writes_no_daily_state(self):
+        decision = service.PortfolioEngine(
+            signal_registry={
+                "long-test-v1": StaticSignalModel(
+                    "long-test-v1", PositionSide.LONG, "L"
+                )
+            }
+        ).evaluate(
+            PlanRequest(
+                run_key="plan:tracking-zero-write",
+                strategy=strategy("LONG_ONLY"),
+                account=account(),
+                analyzed_rows=({"symbol": "L"},),
+                market=market("tracking-zero-write-market"),
+                borrow=BorrowSnapshot.unavailable(),
+                event_calendar={},
+            )
+        )
+
+        class CommitSpy:
+            def __init__(self, error: Exception | None = None):
+                self.error = error
+                self.batches = []
+
+            def commit(self, batch):
+                self.batches.append(batch)
+                if self.error is not None:
+                    raise self.error
+                return account("committed")
+
+        with TemporaryDirectory() as temporary:
+            daily = Path(temporary) / "daily.json"
+            mismatch_spy = CommitSpy()
+            with self.assertRaisesRegex(ValueError, "identity mismatch"):
+                save_daily_selection(
+                    daily,
+                    recommendation_plan(replace(decision, strategy_id="other")),
+                    strategy=strategy("LONG_ONLY"),
+                    portfolio_engine=mismatch_spy,
+                )
+            self.assertFalse(daily.exists())
+            self.assertEqual(mismatch_spy.batches, [])
+
+            failure_spy = CommitSpy(RuntimeError("commit failed"))
+            with self.assertRaisesRegex(RuntimeError, "commit failed"):
+                save_daily_selection(
+                    daily,
+                    recommendation_plan(decision),
+                    strategy=strategy("LONG_ONLY"),
+                    portfolio_engine=failure_spy,
+                )
+            self.assertFalse(daily.exists())
+            self.assertEqual(failure_spy.batches, [decision])
+
     def test_context_evaluates_one_immutable_analyzed_universe(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
         ledger = PoisonLedger()
@@ -423,9 +478,9 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                 "target_netting",
                 "exposure_budget",
                 "borrow_admission",
-                "margin_admission",
                 "portfolio_risk",
                 "rebalance_intent",
+                "margin_admission",
             ],
         )
 
@@ -477,6 +532,51 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             self.assertEqual(len(later.fills), 1)
             self.assertEqual(ledger.commit_calls, 3)
             self.assertEqual(ledger.load_view("strategy-us").open_intents, ())
+
+    def test_process_requires_strictly_later_market_time_not_only_new_id(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+            )
+            engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:market-time",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"},),
+                    market=market("created-id", occurred_at=NOW),
+                    borrow=BorrowSnapshot.unavailable(),
+                    event_calendar={},
+                )
+            )
+            for run_key, snapshot_id, occurred_at in (
+                ("same-time", "different-id", NOW),
+                ("earlier-time", "earlier-id", NOW - timedelta(minutes=1)),
+            ):
+                result = engine.process_and_commit(
+                    ProcessRequest(
+                        run_key=f"process:{run_key}",
+                        strategy=strategy("LONG_ONLY"),
+                        account=ledger.load("strategy-us"),
+                        market=market(snapshot_id, occurred_at=occurred_at),
+                        borrow=BorrowSnapshot.unavailable(),
+                    )
+                )
+                self.assertEqual(result.fills, ())
+            later = engine.process_and_commit(
+                ProcessRequest(
+                    run_key="process:later-time",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    market=market("later-id", occurred_at=NOW + timedelta(minutes=1)),
+                    borrow=BorrowSnapshot.unavailable(),
+                )
+            )
+            self.assertEqual(len(later.fills), 1)
 
     def test_process_stale_account_fails_without_commit_and_performance_is_read_only(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
@@ -564,6 +664,99 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             self.assertEqual(second.fills[0].quantity, 5)
             progress = ledger.load_view("strategy-us").execution_progress
             self.assertEqual(progress[0].filled_quantity, 10)
+
+    def test_process_rechecks_stale_intent_against_current_hard_caps(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+            )
+            engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:gap",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"},),
+                    market=market("gap-plan"),
+                    borrow=BorrowSnapshot.unavailable(),
+                    event_calendar={},
+                )
+            )
+            gap_market = MarketSnapshot(
+                id="gap-current",
+                occurred_at=NOW + timedelta(minutes=5),
+                quotes={
+                    "L": {
+                        "price": 2_000.0,
+                        "bar_open": 2_000.0,
+                        "bar_high": 2_000.0,
+                        "bar_low": 2_000.0,
+                        "bar_volume": 1_000_000,
+                    }
+                },
+            )
+            processed = engine.process_and_commit(
+                ProcessRequest(
+                    run_key="process:gap",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    market=gap_market,
+                    borrow=BorrowSnapshot.unavailable(),
+                )
+            )
+            self.assertEqual(processed.fills, ())
+            self.assertIn("GROSS_EXPOSURE_CAP", processed.diagnostic_codes)
+            self.assertEqual(
+                [item.stage for item in processed.stage_outputs[:2]],
+                ["pre_execution_admission", "execution_simulation"],
+            )
+            self.assertEqual(ledger.load("strategy-us").positions, ())
+
+    def test_post_execution_hard_cap_failure_writes_nothing_to_ledger(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+            )
+            engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:post-cap",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"},),
+                    market=market("post-cap-plan"),
+                    borrow=BorrowSnapshot.unavailable(),
+                    event_calendar={},
+                )
+            )
+            before = ledger.load_view("strategy-us")
+            commit_calls_before = ledger.commit_calls
+            with patch.object(
+                service,
+                "hard_cap_breaches",
+                return_value=("GROSS_EXPOSURE_CAP",),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "post-execution hard-cap"):
+                    engine.process_and_commit(
+                        ProcessRequest(
+                            run_key="process:post-cap",
+                            strategy=strategy("LONG_ONLY"),
+                            account=before.account,
+                            market=market(
+                                "post-cap-current",
+                                occurred_at=NOW + timedelta(minutes=1),
+                            ),
+                            borrow=BorrowSnapshot.unavailable(),
+                        )
+                    )
+            self.assertEqual(ledger.commit_calls, commit_calls_before)
+            self.assertEqual(ledger.load_view("strategy-us"), before)
 
     def test_process_accrues_short_carry_once_per_market_day(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")

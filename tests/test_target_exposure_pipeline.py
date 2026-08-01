@@ -697,6 +697,7 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             quantity=1,
             reason="target",
             created_snapshot_id="market-1",
+            created_market_at=now,
         )
         market = MarketSnapshot(
             id="market-1",
@@ -961,6 +962,7 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             "quantity": 1,
             "reason": "target",
             "created_snapshot_id": "market-1",
+            "created_market_at": datetime(2026, 8, 1, tzinfo=timezone.utc),
         }
         for field_name, invalid in (
             ("id", []),
@@ -1042,6 +1044,7 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             quantity=1,
             reason="target",
             created_snapshot_id="market-1",
+            created_market_at=now,
         )
         fill = ExecutionFill(
             intent_id="intent-1",

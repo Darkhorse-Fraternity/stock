@@ -43,6 +43,32 @@ from stock_recommender.portfolio_engine.valuation import value_account
 NOW = datetime(2026, 7, 31, 8, tzinfo=timezone.utc)
 
 
+_OrderIntent = OrderIntent
+_evaluate_position_risk = evaluate_position_risk
+_evaluate_forced_deleveraging = evaluate_forced_deleveraging
+_plan_forced_deleveraging = plan_forced_deleveraging
+
+
+def OrderIntent(**kwargs):
+    kwargs.setdefault("created_market_at", NOW)
+    return _OrderIntent(**kwargs)
+
+
+def evaluate_position_risk(*args, **kwargs):
+    kwargs.setdefault("created_market_at", NOW)
+    return _evaluate_position_risk(*args, **kwargs)
+
+
+def evaluate_forced_deleveraging(*args, **kwargs):
+    kwargs.setdefault("created_market_at", NOW)
+    return _evaluate_forced_deleveraging(*args, **kwargs)
+
+
+def plan_forced_deleveraging(*args, **kwargs):
+    kwargs.setdefault("created_market_at", NOW)
+    return _plan_forced_deleveraging(*args, **kwargs)
+
+
 def position(
     symbol="XYZ",
     side=PositionSide.LONG,
@@ -97,6 +123,7 @@ def stable_risk_intent_id(snapshot_id, held, reason):
     material = "|".join(
         (
             snapshot_id,
+            NOW.isoformat(),
             held.symbol,
             held.side.value,
             str(held.quantity),

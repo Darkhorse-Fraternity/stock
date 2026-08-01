@@ -378,6 +378,7 @@ def _intent_to_json(intent: OrderIntent) -> dict[str, Any]:
         "quantity": intent.quantity,
         "reason": intent.reason,
         "created_snapshot_id": intent.created_snapshot_id,
+        "created_market_at": intent.created_market_at.isoformat(),
     }
 
 
@@ -395,6 +396,7 @@ def _intent_from_json(value: object) -> OrderIntent:
                 "quantity",
                 "reason",
                 "created_snapshot_id",
+                "created_market_at",
             }
         ),
         "intent",
@@ -411,6 +413,10 @@ def _intent_from_json(value: object) -> OrderIntent:
             quantity=item["quantity"],
             reason=item["reason"],
             created_snapshot_id=item["created_snapshot_id"],
+            created_market_at=_iso_datetime(
+                item["created_market_at"],
+                "intent.created_market_at",
+            ),
         )
     except (KeyError, TypeError, ValueError) as exc:
         if isinstance(exc, LedgerSchemaError):

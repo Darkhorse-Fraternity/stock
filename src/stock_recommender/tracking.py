@@ -12,6 +12,7 @@ from .markets import market_date, order_session_date
 from .parameters import record_paper_session
 from .performance import upsert_recommendation_history
 from .portfolio_engine.ledger import JsonLedgerStore
+from .portfolio_engine.contracts import DecisionBatch
 from .portfolio_engine.service import PortfolioEngine
 from .recommendation import RecommendationPlan, recommendation_tracking_entries
 from .reports import format_recommendation_snapshot
@@ -44,8 +45,22 @@ def save_daily_selection(
     portfolio_path: str | Path | None = None,
     portfolio_engine: PortfolioEngine | None = None,
 ) -> list[str]:
+    if type(plan) is not RecommendationPlan:
+        raise TypeError("plan must be RecommendationPlan")
     if strategy and strategy.get("id"):
         assert_strategy_runnable(strategy, execution_kind="scheduled", mode="report")
+    strategy_id = (strategy or {}).get("id")
+    portfolio_required = bool(strategy_id) and bool(
+        (strategy or {}).get("portfolio", {}).get("enabled", True)
+    )
+    decision = plan.portfolio_decision
+    if portfolio_required:
+        if type(decision) is not DecisionBatch:
+            raise ValueError("recommendation plan is missing portfolio_decision")
+        if decision.strategy_id != strategy_id:
+            raise ValueError("portfolio_decision strategy identity mismatch")
+        if decision.strategy_revision != (strategy or {}).get("revision"):
+            raise ValueError("portfolio_decision strategy revision mismatch")
     entries = recommendation_tracking_entries(plan)
     symbols = [item["symbol"] for item in entries]
     market_regime = deepcopy(plan.market_regime)
@@ -89,6 +104,15 @@ def save_daily_selection(
         "market_regime": market_regime,
         "data_quality": deepcopy(plan.data_quality),
     }
+    if portfolio_required:
+        engine = portfolio_engine or PortfolioEngine(
+            ledger_store=JsonLedgerStore(portfolio_path)
+        )
+        account = engine.commit(decision)
+        payload["portfolio_account_id"] = account.id
+        payload["portfolio_decision_run_key"] = decision.run_key
+        payload["portfolio_intent_ids"] = [intent.id for intent in decision.intents]
+        payload["portfolio_event_ids"] = [event.id for event in decision.events]
     _save_state(target, payload)
     if payload["strategy_id"] and payload["strategy_stage"] == "paper":
         try:
@@ -96,27 +120,6 @@ def save_daily_selection(
         except Exception as exc:
             payload["paper_session_error"] = str(exc)[:500]
             _save_state(target, payload)
-    if payload["strategy_id"] and (strategy or {}).get("portfolio", {}).get("enabled", True):
-        if plan.portfolio_decision is None:
-            raise ValueError("recommendation plan is missing portfolio_decision")
-        try:
-            engine = portfolio_engine or PortfolioEngine(
-                ledger_store=JsonLedgerStore(portfolio_path)
-            )
-            account = engine.commit(plan.portfolio_decision)
-            payload["portfolio_account_id"] = account.id
-            payload["portfolio_decision_run_key"] = plan.portfolio_decision.run_key
-            payload["portfolio_intent_ids"] = [
-                intent.id for intent in plan.portfolio_decision.intents
-            ]
-            payload["portfolio_event_ids"] = [
-                event.id for event in plan.portfolio_decision.events
-            ]
-            _save_state(target, payload)
-        except Exception as exc:
-            payload["portfolio_plan_error"] = str(exc)[:500]
-            _save_state(target, payload)
-            raise
     if history_path is not None:
         try:
             upsert_recommendation_history(payload, path=history_path, now=current)
