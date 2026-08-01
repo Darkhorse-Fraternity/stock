@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 import stat
+import threading
 import unittest
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from stock_recommender.portfolio_engine.config import (
     default_short_policy,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerSchemaError
+from stock_recommender.portfolio_engine import migration as migration_module
 from stock_recommender.portfolio_engine.migration import (
     MigrationError,
     migrate_portfolio_store,
@@ -31,6 +33,57 @@ from stock_recommender.parameters import (
 
 
 FIXED_NOW = datetime(2026, 8, 1, 12, 34, 56, tzinfo=timezone.utc)
+
+
+def tree_snapshot(root: Path) -> tuple[tuple[str, str, bytes | str | None], ...]:
+    entries = []
+    for path in sorted(root.rglob("*")):
+        relative = str(path.relative_to(root))
+        if path.is_symlink():
+            entries.append((relative, "symlink", os.readlink(path)))
+        elif path.is_dir():
+            entries.append((relative, "directory", None))
+        else:
+            entries.append((relative, "file", path.read_bytes()))
+    return tuple(entries)
+
+
+def write_two_sources_under_exclusive_locks(
+    strategy_path: str,
+    strategy_bytes: bytes,
+    portfolio_path: str,
+    portfolio_bytes: bytes,
+    first_written: multiprocessing.synchronize.Event,
+    finish: multiprocessing.synchronize.Event,
+) -> None:
+    import fcntl
+
+    paths = tuple(sorted((Path(strategy_path), Path(portfolio_path))))
+    handles = {path: path.open("r+b") for path in paths}
+    try:
+        for path in paths:
+            fcntl.flock(handles[path].fileno(), fcntl.LOCK_EX)
+        strategy_handle = handles[Path(strategy_path)]
+        strategy_handle.seek(0)
+        strategy_handle.write(strategy_bytes)
+        strategy_handle.truncate()
+        strategy_handle.flush()
+        os.fsync(strategy_handle.fileno())
+        first_written.set()
+        if not finish.wait(timeout=10):
+            raise RuntimeError("timed out waiting to finish concurrent source write")
+        portfolio_handle = handles[Path(portfolio_path)]
+        portfolio_handle.seek(0)
+        portfolio_handle.write(portfolio_bytes)
+        portfolio_handle.truncate()
+        portfolio_handle.flush()
+        os.fsync(portfolio_handle.fileno())
+    finally:
+        for path in reversed(paths):
+            try:
+                fcntl.flock(handles[path].fileno(), fcntl.LOCK_UN)
+            finally:
+                handles[path].close()
 
 
 def crash_combined_migration_after_first_replace(
@@ -225,6 +278,151 @@ class PortfolioMigrationTests(unittest.TestCase):
         self.assertFalse(report.applied)
         self.assertTrue(report.nav_parity)
         self.assertIsNone(report.backup_path)
+
+    def test_single_store_dry_runs_leave_directory_entries_and_bytes_unchanged(self) -> None:
+        cases = (
+            ("strategy", v5_strategy_store(), migrate_strategy_store),
+            ("portfolio", v1_long_only_store(), migrate_portfolio_store),
+        )
+        for name, payload, migrate in cases:
+            with self.subTest(name=name):
+                root = Path(self.temporary.name) / f"single-{name}"
+                root.mkdir()
+                target = root / f"{name}.json"
+                self._write_json(target, payload)
+                before = tree_snapshot(root)
+
+                report = migrate(target, apply=False, now=FIXED_NOW)
+
+                self.assertTrue(report.changed)
+                self.assertEqual(tree_snapshot(root), before)
+
+    def test_combined_dry_run_across_directories_is_byte_for_byte_zero_write(self) -> None:
+        root = Path(self.temporary.name) / "combined-check"
+        strategy_path = root / "strategy" / "strategy.json"
+        portfolio_path = root / "portfolio" / "portfolio.json"
+        strategy_path.parent.mkdir(parents=True)
+        portfolio_path.parent.mkdir(parents=True)
+        self._write_json(strategy_path, v5_strategy_store())
+        self._write_json(portfolio_path, v1_long_only_store())
+        before = tree_snapshot(root)
+
+        report = migrate_stores(
+            strategy_path,
+            portfolio_path,
+            apply=False,
+            now=FIXED_NOW,
+        )
+
+        self.assertTrue(report.strategy.changed)
+        self.assertTrue(report.portfolio.changed)
+        self.assertEqual(tree_snapshot(root), before)
+
+    def test_dry_run_missing_and_symlink_sources_fail_without_any_write(self) -> None:
+        root = Path(self.temporary.name) / "invalid-check"
+        root.mkdir()
+        missing = root / "missing.json"
+        before_missing = tree_snapshot(root)
+        with self.assertRaises(MigrationError):
+            migrate_portfolio_store(missing, apply=False, now=FIXED_NOW)
+        self.assertEqual(tree_snapshot(root), before_missing)
+
+        real = root / "real.json"
+        link = root / "link.json"
+        self._write_json(real, v1_long_only_store())
+        link.symlink_to(real)
+        before_link = tree_snapshot(root)
+        with self.assertRaises(MigrationError):
+            migrate_portfolio_store(link, apply=False, now=FIXED_NOW)
+        self.assertEqual(tree_snapshot(root), before_link)
+
+    def test_combined_dry_run_never_observes_cooperative_writer_mixed_generation(self) -> None:
+        root = Path(self.temporary.name) / "concurrent-check"
+        strategy_path = root / "a-strategy" / "strategy.json"
+        portfolio_path = root / "z-portfolio" / "portfolio.json"
+        strategy_path.parent.mkdir(parents=True)
+        portfolio_path.parent.mkdir(parents=True)
+        old_strategy = v5_strategy_store()
+        old_strategy["strategies"][0]["description"] = "old-generation"
+        new_strategy = deepcopy(old_strategy)
+        new_strategy["strategies"][0]["description"] = "new-generation"
+        old_portfolio = v1_long_only_store()
+        old_portfolio["accounts"]["tech"]["updated_at"] = "2026-07-30T16:00:00+00:00"
+        new_portfolio = deepcopy(old_portfolio)
+        new_portfolio["accounts"]["tech"]["updated_at"] = "2026-07-31T16:00:00+00:00"
+        self._write_json(strategy_path, old_strategy)
+        self._write_json(portfolio_path, old_portfolio)
+        context = multiprocessing.get_context("spawn")
+        first_written = context.Event()
+        finish = context.Event()
+        writer = context.Process(
+            target=write_two_sources_under_exclusive_locks,
+            args=(
+                str(strategy_path),
+                json.dumps(new_strategy).encode("utf-8"),
+                str(portfolio_path),
+                json.dumps(new_portfolio).encode("utf-8"),
+                first_written,
+                finish,
+            ),
+        )
+        writer.start()
+        self.assertTrue(first_written.wait(timeout=5))
+        observed: list[str] = []
+        original_strategy_prepare = migration_module._prepare_strategy
+        original_portfolio_prepare = migration_module._prepare_portfolio
+        strategy_prepared = threading.Event()
+        outcome: list[BaseException | object] = []
+
+        def prepare_strategy(path: Path, raw: bytes):
+            observed.append(json.loads(raw)["strategies"][0]["description"])
+            strategy_prepared.set()
+            return original_strategy_prepare(path, raw)
+
+        def prepare_portfolio(path: Path, raw: bytes, now: datetime):
+            observed.append(json.loads(raw)["accounts"]["tech"]["updated_at"])
+            return original_portfolio_prepare(path, raw, now)
+
+        def check() -> None:
+            try:
+                outcome.append(
+                    migrate_stores(
+                        strategy_path,
+                        portfolio_path,
+                        apply=False,
+                        now=FIXED_NOW,
+                    )
+                )
+            except BaseException as exc:
+                outcome.append(exc)
+
+        with patch.object(migration_module, "_prepare_strategy", side_effect=prepare_strategy), patch.object(
+            migration_module,
+            "_prepare_portfolio",
+            side_effect=prepare_portfolio,
+        ):
+            checker = threading.Thread(target=check)
+            checker.start()
+            strategy_prepared.wait(timeout=0.25)
+            finish.set()
+            checker.join(timeout=10)
+        writer.join(timeout=10)
+
+        self.assertFalse(checker.is_alive())
+        self.assertFalse(writer.is_alive())
+        self.assertEqual(writer.exitcode, 0)
+        self.assertEqual(len(outcome), 1)
+        if isinstance(outcome[0], BaseException):
+            self.assertIsInstance(outcome[0], MigrationError)
+            self.assertRegex(str(outcome[0]), "changed|retry|consistent")
+        else:
+            self.assertIn(
+                tuple(observed),
+                {
+                    ("old-generation", "2026-07-30T16:00:00+00:00"),
+                    ("new-generation", "2026-07-31T16:00:00+00:00"),
+                },
+            )
 
     def test_nav_mismatch_fails_preflight_without_writing(self) -> None:
         store = v1_long_only_store()

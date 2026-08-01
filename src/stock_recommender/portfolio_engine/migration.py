@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
 import stat
 import threading
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
@@ -47,6 +48,7 @@ LEGACY_STRATEGY_SCHEMA_VERSION = 5
 LEGACY_PORTFOLIO_SCHEMA_VERSION = 1
 _OPEN_ORDER_STATES = frozenset({"INTENDED", "ACCEPTED", "PARTIAL"})
 _MIGRATION_LOCK = threading.RLock()
+_SOURCE_SNAPSHOT_ATTEMPTS = 3
 
 
 class MigrationError(ValueError):
@@ -184,6 +186,146 @@ def _read_bytes(path: Path) -> bytes:
             return handle.read()
     except OSError as exc:
         raise MigrationError(f"cannot read migration source {path}: {exc}") from exc
+
+
+class _SourceChanged(RuntimeError):
+    """Internal signal that a source pathname changed during lock acquisition."""
+
+
+def _source_signature(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _inspect_source(path: Path) -> os.stat_result:
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError as exc:
+        raise MigrationError(f"migration source does not exist: {path}") from exc
+    except OSError as exc:
+        raise MigrationError(f"cannot inspect migration source {path}: {exc}") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise MigrationError(f"migration source must be a regular non-symlink file: {path}")
+    return metadata
+
+
+def _source_order(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(path)))
+
+
+def _verify_source_path(path: Path, descriptor_metadata: os.stat_result) -> None:
+    try:
+        path_metadata = os.lstat(path)
+    except OSError as exc:
+        raise _SourceChanged(f"migration source changed while being locked: {path}") from exc
+    if (
+        stat.S_ISLNK(path_metadata.st_mode)
+        or not stat.S_ISREG(path_metadata.st_mode)
+        or (path_metadata.st_dev, path_metadata.st_ino)
+        != (descriptor_metadata.st_dev, descriptor_metadata.st_ino)
+    ):
+        raise _SourceChanged(f"migration source changed while being locked: {path}")
+
+
+@contextmanager
+def _source_snapshot(paths: Iterable[Path], *, exclusive: bool):
+    """Read one generation while holding locks on the source files themselves."""
+
+    ordered = tuple(sorted(tuple(paths), key=_source_order))
+    lock_operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    with _MIGRATION_LOCK:
+        retained_stack: ExitStack | None = None
+        originals: dict[Path, bytes] | None = None
+        for _attempt in range(_SOURCE_SNAPSHOT_ATTEMPTS):
+            stack = ExitStack()
+            try:
+                handles = {}
+                descriptor_metadata = {}
+                identities: set[tuple[int, int]] = set()
+                for path in ordered:
+                    inspected = _inspect_source(path)
+                    flags = os.O_RDONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    try:
+                        descriptor = os.open(path, flags)
+                    except FileNotFoundError as exc:
+                        raise _SourceChanged(
+                            f"migration source changed while being opened: {path}"
+                        ) from exc
+                    except OSError as exc:
+                        raise MigrationError(
+                            f"cannot open migration source {path}: {exc}"
+                        ) from exc
+                    try:
+                        handle = os.fdopen(descriptor, "rb")
+                    except BaseException:
+                        os.close(descriptor)
+                        raise
+                    stack.enter_context(handle)
+                    try:
+                        fcntl.flock(handle.fileno(), lock_operation)
+                        stack.callback(fcntl.flock, handle.fileno(), fcntl.LOCK_UN)
+                    except OSError as exc:
+                        raise MigrationError(
+                            f"cannot lock migration source {path}: {exc}"
+                        ) from exc
+                    opened = os.fstat(handle.fileno())
+                    if not stat.S_ISREG(opened.st_mode):
+                        raise MigrationError(
+                            f"migration source must be a regular non-symlink file: {path}"
+                        )
+                    identity = (opened.st_dev, opened.st_ino)
+                    if identity in identities:
+                        raise MigrationError(
+                            "strategy and portfolio paths must be different files"
+                        )
+                    identities.add(identity)
+                    if identity != (inspected.st_dev, inspected.st_ino):
+                        raise _SourceChanged(
+                            f"migration source changed while being opened: {path}"
+                        )
+                    handles[path] = handle
+                    descriptor_metadata[path] = opened
+
+                for path in ordered:
+                    _verify_source_path(path, descriptor_metadata[path])
+
+                candidate: dict[Path, bytes] = {}
+                for path in ordered:
+                    handle = handles[path]
+                    before = os.fstat(handle.fileno())
+                    handle.seek(0)
+                    candidate[path] = handle.read()
+                    after = os.fstat(handle.fileno())
+                    if _source_signature(before) != _source_signature(after):
+                        raise _SourceChanged(
+                            f"migration source changed while being read: {path}"
+                        )
+                    _verify_source_path(path, after)
+                retained_stack = stack
+                originals = candidate
+                break
+            except _SourceChanged:
+                stack.close()
+                continue
+            except BaseException:
+                stack.close()
+                raise
+
+        if retained_stack is None or originals is None:
+            raise MigrationError(
+                "migration sources changed repeatedly; retry for a consistent snapshot"
+            )
+        try:
+            yield originals
+        finally:
+            retained_stack.close()
 
 
 def _strategy_sections(strategy: Mapping[str, Any], *, current: bool) -> None:
@@ -566,6 +708,15 @@ def _locked_paths(paths: Iterable[Path]):
         yield
 
 
+@contextmanager
+def _combined_apply_snapshot(paths: Iterable[Path]):
+    targets = tuple(paths)
+    with _locked_paths(targets), _source_snapshot(
+        targets, exclusive=True
+    ) as originals:
+        yield originals
+
+
 def _timestamp(now: datetime) -> str:
     if type(now) is not datetime or now.tzinfo is None:
         raise MigrationError("migration timestamp must be a timezone-aware datetime")
@@ -666,12 +817,15 @@ def migrate_strategy_store(
 ) -> MigrationReport:
     target = Path(path).expanduser()
     current = now or datetime.now().astimezone()
-    with _locked_paths((target,)):
-        raw = _read_bytes(target)
-        prepared = _prepare_strategy(target, raw)
-        if not apply:
+    if not apply:
+        with _source_snapshot((target,), exclusive=False) as originals:
+            prepared = _prepare_strategy(target, originals[target])
             return prepared.report
-        return _apply_prepared((prepared,), {target: raw}, current)[0]
+    with _locked_paths((target,)), _source_snapshot(
+        (target,), exclusive=True
+    ) as originals:
+        prepared = _prepare_strategy(target, originals[target])
+        return _apply_prepared((prepared,), originals, current)[0]
 
 
 def migrate_portfolio_store(
@@ -682,12 +836,15 @@ def migrate_portfolio_store(
 ) -> MigrationReport:
     target = Path(path).expanduser()
     current = now or datetime.now().astimezone()
-    with _locked_paths((target,)):
-        raw = _read_bytes(target)
-        prepared = _prepare_portfolio(target, raw, current)
-        if not apply:
+    if not apply:
+        with _source_snapshot((target,), exclusive=False) as originals:
+            prepared = _prepare_portfolio(target, originals[target], current)
             return prepared.report
-        return _apply_prepared((prepared,), {target: raw}, current)[0]
+    with _locked_paths((target,)), _source_snapshot(
+        (target,), exclusive=True
+    ) as originals:
+        prepared = _prepare_portfolio(target, originals[target], current)
+        return _apply_prepared((prepared,), originals, current)[0]
 
 
 def migrate_stores(
@@ -699,14 +856,16 @@ def migrate_stores(
 ) -> CombinedMigrationReport:
     strategy_target = Path(strategy_path).expanduser()
     portfolio_target = Path(portfolio_path).expanduser()
-    if strategy_target.resolve() == portfolio_target.resolve():
+    if _source_order(strategy_target) == _source_order(portfolio_target):
         raise MigrationError("strategy and portfolio paths must be different files")
     current = now or datetime.now().astimezone()
-    with _locked_paths((strategy_target, portfolio_target)):
-        originals = {
-            strategy_target: _read_bytes(strategy_target),
-            portfolio_target: _read_bytes(portfolio_target),
-        }
+    targets = (strategy_target, portfolio_target)
+    lock_context = (
+        _source_snapshot(targets, exclusive=False)
+        if not apply
+        else _combined_apply_snapshot(targets)
+    )
+    with lock_context as originals:
         strategy = _prepare_strategy(strategy_target, originals[strategy_target])
         portfolio = _prepare_portfolio(
             portfolio_target, originals[portfolio_target], current
