@@ -477,6 +477,7 @@ class PortfolioMigrationTests(unittest.TestCase):
                 "open_intents",
                 "fills",
                 "execution_progress",
+                "risk_facts",
                 "events",
                 "committed_batches",
             },
@@ -487,6 +488,13 @@ class PortfolioMigrationTests(unittest.TestCase):
         self.assertEqual(account["reserved_cash"], 100.0)
         self.assertEqual(account["restricted_short_proceeds"], 0.0)
         self.assertEqual(account["margin_loan"], 0.0)
+        self.assertEqual(account["risk_facts"], [])
+        self.assertTrue(
+            all(
+                committed["risk_fact_ids"] == []
+                for committed in account["committed_batches"]
+            )
+        )
         intents = {item["id"]: item for item in account["open_intents"]}
         self.assertEqual(intents["buy-open"]["position_effect"], "OPEN")
         self.assertEqual(intents["buy-increase"]["position_effect"], "INCREASE")

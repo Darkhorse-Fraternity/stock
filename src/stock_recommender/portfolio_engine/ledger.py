@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import threading
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -56,7 +56,26 @@ _ACCOUNT_SNAPSHOT_FIELDS = frozenset(
     }
 )
 _ACCOUNT_FIELDS = _ACCOUNT_SNAPSHOT_FIELDS | frozenset(
-    {"open_intents", "fills", "execution_progress", "events", "committed_batches"}
+    {
+        "open_intents",
+        "fills",
+        "execution_progress",
+        "risk_facts",
+        "events",
+        "committed_batches",
+    }
+)
+_RISK_FACT_FIELDS = frozenset(
+    {
+        "fact_id",
+        "strategy_id",
+        "strategy_revision",
+        "run_key",
+        "portfolio_snapshot_id",
+        "market_snapshot_id",
+        "occurred_at",
+        "update",
+    }
 )
 
 
@@ -74,6 +93,18 @@ class StalePortfolioSnapshotError(LedgerError):
 
 class UnknownPortfolioEventError(LedgerError):
     """Raised when no exhaustive event handler exists."""
+
+
+@dataclass(frozen=True)
+class _RiskFact:
+    fact_id: str
+    strategy_id: str
+    strategy_revision: int
+    run_key: str
+    portfolio_snapshot_id: str
+    market_snapshot_id: str
+    occurred_at: datetime
+    update: PositionRiskUpdate
 
 
 def _require_mapping(value: object, label: str) -> Mapping[str, Any]:
@@ -474,6 +505,85 @@ def _risk_update_to_json(update: PositionRiskUpdate) -> dict[str, Any]:
     }
 
 
+def _risk_update_from_json(value: object) -> PositionRiskUpdate:
+    item = _require_mapping(value, "risk fact update")
+    _require_keys(
+        item,
+        frozenset(
+            {
+                "symbol",
+                "side",
+                "peak_price",
+                "trough_price",
+                "trailing_active",
+                "position_mode",
+            }
+        ),
+        "risk fact update",
+    )
+    try:
+        return PositionRiskUpdate(
+            symbol=item["symbol"],
+            side=PositionSide(item["side"]),
+            peak_price=item["peak_price"],
+            trough_price=item["trough_price"],
+            trailing_active=item["trailing_active"],
+            position_mode=item["position_mode"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LedgerSchemaError("invalid risk fact update") from exc
+
+
+def _risk_fact_to_json(fact: _RiskFact) -> dict[str, Any]:
+    return {
+        "fact_id": fact.fact_id,
+        "strategy_id": fact.strategy_id,
+        "strategy_revision": fact.strategy_revision,
+        "run_key": fact.run_key,
+        "portfolio_snapshot_id": fact.portfolio_snapshot_id,
+        "market_snapshot_id": fact.market_snapshot_id,
+        "occurred_at": fact.occurred_at.isoformat(),
+        "update": _risk_update_to_json(fact.update),
+    }
+
+
+def _risk_fact_from_json(value: object) -> _RiskFact:
+    item = _require_mapping(value, "risk fact")
+    _require_keys(item, _RISK_FACT_FIELDS, "risk fact")
+    for field_name in (
+        "fact_id",
+        "strategy_id",
+        "run_key",
+        "portfolio_snapshot_id",
+        "market_snapshot_id",
+    ):
+        if type(item[field_name]) is not str or not item[field_name]:
+            raise LedgerSchemaError(f"risk fact {field_name} must be non-empty")
+    if type(item["strategy_revision"]) is not int:
+        raise LedgerSchemaError("risk fact strategy_revision must be an integer")
+    fact = _RiskFact(
+        fact_id=item["fact_id"],
+        strategy_id=item["strategy_id"],
+        strategy_revision=item["strategy_revision"],
+        run_key=item["run_key"],
+        portfolio_snapshot_id=item["portfolio_snapshot_id"],
+        market_snapshot_id=item["market_snapshot_id"],
+        occurred_at=_iso_datetime(item["occurred_at"], "risk fact occurred_at"),
+        update=_risk_update_from_json(item["update"]),
+    )
+    expected_id = _stable_risk_fact_id(
+        strategy_id=fact.strategy_id,
+        strategy_revision=fact.strategy_revision,
+        run_key=fact.run_key,
+        portfolio_snapshot_id=fact.portfolio_snapshot_id,
+        market_snapshot_id=fact.market_snapshot_id,
+        update=fact.update,
+    )
+    if fact.fact_id != expected_id:
+        raise LedgerSchemaError("risk fact ID does not match its canonical content")
+    return fact
+
+
 def _progress_fill_to_json(fill: ExecutionProgressFill) -> dict[str, Any]:
     return {
         "id": fill.id,
@@ -688,6 +798,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             "open_intents",
             "fills",
             "execution_progress",
+            "risk_facts",
             "events",
             "committed_batches",
         ):
@@ -747,6 +858,11 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 _validate_event(event)
             except LedgerError as exc:
                 raise LedgerSchemaError(f"invalid persisted event: {exc}") from exc
+        risk_facts = [_risk_fact_from_json(raw) for raw in item["risk_facts"]]
+        risk_fact_ids = [fact.fact_id for fact in risk_facts]
+        if len(set(risk_fact_ids)) != len(risk_fact_ids):
+            raise LedgerSchemaError("account.risk_facts contains duplicate IDs")
+        risk_facts_by_id = {fact.fact_id: fact for fact in risk_facts}
         fill_events = {
             str(event.data["progress_fill_id"]): event
             for event in events
@@ -767,6 +883,36 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 raise LedgerSchemaError(
                     "persisted fill event does not exactly match execution progress"
                 )
+        risk_event_fact_ids = [
+            str(event.data["risk_fact_id"])
+            for event in events
+            if event.type == "RISK_CHANGED"
+        ]
+        if risk_event_fact_ids != risk_fact_ids:
+            raise LedgerSchemaError(
+                "persisted risk events and canonical risk facts must preserve append order"
+            )
+        risk_events = {
+            fact_id: event
+            for fact_id, event in zip(
+                risk_event_fact_ids,
+                (event for event in events if event.type == "RISK_CHANGED"),
+                strict=True,
+            )
+        }
+        if len(risk_events) != len(risk_event_fact_ids):
+            raise LedgerSchemaError(
+                "persisted risk events contain duplicate canonical fact IDs"
+            )
+        if set(risk_events) != set(risk_facts_by_id):
+            raise LedgerSchemaError(
+                "persisted risk events and canonical risk facts must be one-to-one"
+            )
+        for fact_id, fact in risk_facts_by_id.items():
+            if risk_events[fact_id] != _derived_risk_event(fact):
+                raise LedgerSchemaError(
+                    "persisted RISK_CHANGED event does not exactly match canonical risk fact"
+                )
         try:
             _validate_carry_event_pairs(decoded.carry_accruals, events)
         except LedgerError as exc:
@@ -775,6 +921,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             ) from exc
         committed = item["committed_batches"]
         run_keys: set[str] = set()
+        referenced_risk_fact_ids: list[str] = []
         for index, raw_batch in enumerate(committed):
             batch = _require_mapping(raw_batch, f"committed_batches[{index}]")
             _require_keys(
@@ -787,6 +934,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                         "source_snapshot_id",
                         "result_snapshot_id",
                         "market_snapshot_id",
+                        "risk_fact_ids",
                         "fingerprint",
                     }
                 ),
@@ -815,7 +963,43 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 )
             if type(batch.get("fingerprint")) is not str or not batch["fingerprint"]:
                 raise LedgerSchemaError("committed batch fingerprint must be non-empty")
+            batch_risk_fact_ids = _require_list(
+                batch["risk_fact_ids"],
+                f"committed_batches[{index}].risk_fact_ids",
+            )
+            if any(
+                type(fact_id) is not str or not fact_id
+                for fact_id in batch_risk_fact_ids
+            ):
+                raise LedgerSchemaError(
+                    "committed batch risk_fact_ids must contain non-empty strings"
+                )
+            if len(set(batch_risk_fact_ids)) != len(batch_risk_fact_ids):
+                raise LedgerSchemaError(
+                    "committed batch risk_fact_ids contains duplicate IDs"
+                )
+            for fact_id in batch_risk_fact_ids:
+                fact = risk_facts_by_id.get(fact_id)
+                if fact is None:
+                    raise LedgerSchemaError(
+                        "committed batch references a missing canonical risk fact"
+                    )
+                if (
+                    fact.strategy_id != batch["strategy_id"]
+                    or fact.strategy_revision != batch["strategy_revision"]
+                    or fact.run_key != batch["run_key"]
+                    or fact.portfolio_snapshot_id != batch["source_snapshot_id"]
+                    or fact.market_snapshot_id != batch["market_snapshot_id"]
+                ):
+                    raise LedgerSchemaError(
+                        "canonical risk fact batch identity does not match committed batch"
+                    )
+            referenced_risk_fact_ids.extend(batch_risk_fact_ids)
             run_keys.add(run_key)
+        if referenced_risk_fact_ids != risk_fact_ids:
+            raise LedgerSchemaError(
+                "committed batches and canonical risk facts must be append-only one-to-one"
+            )
     return payload
 
 
@@ -855,6 +1039,57 @@ def _stable_snapshot_id(batch: DecisionBatch) -> str:
         )
     )
     return "snapshot-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def _stable_risk_fact_id(
+    *,
+    strategy_id: str,
+    strategy_revision: int,
+    run_key: str,
+    portfolio_snapshot_id: str,
+    market_snapshot_id: str,
+    update: PositionRiskUpdate,
+) -> str:
+    material = {
+        "strategy_id": strategy_id,
+        "strategy_revision": strategy_revision,
+        "run_key": run_key,
+        "portfolio_snapshot_id": portfolio_snapshot_id,
+        "market_snapshot_id": market_snapshot_id,
+        "update": _risk_update_to_json(update),
+    }
+    encoded = json.dumps(
+        material,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    return "risk-fact-" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:24]
+
+
+def _risk_fact_for_batch(
+    batch: DecisionBatch,
+    update: PositionRiskUpdate,
+    occurred_at: datetime,
+) -> _RiskFact:
+    return _RiskFact(
+        fact_id=_stable_risk_fact_id(
+            strategy_id=batch.strategy_id,
+            strategy_revision=batch.strategy_revision,
+            run_key=batch.run_key,
+            portfolio_snapshot_id=batch.portfolio_snapshot_id,
+            market_snapshot_id=batch.market_snapshot_id,
+            update=update,
+        ),
+        strategy_id=batch.strategy_id,
+        strategy_revision=batch.strategy_revision,
+        run_key=batch.run_key,
+        portfolio_snapshot_id=batch.portfolio_snapshot_id,
+        market_snapshot_id=batch.market_snapshot_id,
+        occurred_at=occurred_at,
+        update=update,
+    )
 
 
 def _unique_typed(
@@ -1045,7 +1280,20 @@ def _batch_fingerprint(
             "intents": [_fingerprint_plain(item) for item in intents],
             "fills": [_fingerprint_plain(item) for item in fills],
             "execution_progress": [_fingerprint_plain(item) for item in progress],
-            "position_risk_updates": [_fingerprint_plain(item) for item in updates],
+            "position_risk_updates": [
+                {
+                    "fact_id": _stable_risk_fact_id(
+                        strategy_id=batch.strategy_id,
+                        strategy_revision=batch.strategy_revision,
+                        run_key=batch.run_key,
+                        portfolio_snapshot_id=batch.portfolio_snapshot_id,
+                        market_snapshot_id=batch.market_snapshot_id,
+                        update=item,
+                    ),
+                    "update": _fingerprint_plain(item),
+                }
+                for item in updates
+            ],
             "position_settlement_updates": [
                 _fingerprint_plain(item) for item in settlement_updates
             ],
@@ -1357,7 +1605,11 @@ def _validate_risk_event(event: PortfolioEvent) -> None:
         event,
         frozenset(
             {
+                "risk_fact_id",
+                "strategy_id",
+                "strategy_revision",
                 "run_key",
+                "portfolio_snapshot_id",
                 "market_snapshot_id",
                 "symbol",
                 "side",
@@ -1368,8 +1620,17 @@ def _validate_risk_event(event: PortfolioEvent) -> None:
             }
         ),
     )
-    for field_name in ("run_key", "market_snapshot_id", "symbol"):
+    for field_name in (
+        "risk_fact_id",
+        "strategy_id",
+        "run_key",
+        "portfolio_snapshot_id",
+        "market_snapshot_id",
+        "symbol",
+    ):
         _require_event_string(event, field_name)
+    if type(event.data["strategy_revision"]) is not int:
+        raise LedgerError("RISK_CHANGED strategy_revision must be an integer")
     if event.data["side"] not in {item.value for item in PositionSide}:
         raise LedgerError("RISK_CHANGED side is invalid")
     for field_name in ("peak_price", "trough_price"):
@@ -1484,26 +1745,24 @@ def _derived_fill_event(fill: ExecutionProgressFill) -> PortfolioEvent:
     )
 
 
-def _derived_risk_event(
-    batch: DecisionBatch,
-    update: PositionRiskUpdate,
-    occurred_at: datetime,
-) -> PortfolioEvent:
-    material = f"{batch.run_key}|{batch.market_snapshot_id}|{update.symbol}"
+def _derived_risk_event(fact: _RiskFact) -> PortfolioEvent:
     return PortfolioEvent(
-        id="risk-change-"
-        + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24],
+        id="risk-change-" + fact.fact_id.removeprefix("risk-fact-"),
         type="RISK_CHANGED",
-        occurred_at=occurred_at,
+        occurred_at=fact.occurred_at,
         data={
-            "run_key": batch.run_key,
-            "market_snapshot_id": batch.market_snapshot_id,
-            "symbol": update.symbol,
-            "side": update.side.value,
-            "peak_price": update.peak_price,
-            "trough_price": update.trough_price,
-            "trailing_active": update.trailing_active,
-            "position_mode": update.position_mode,
+            "risk_fact_id": fact.fact_id,
+            "strategy_id": fact.strategy_id,
+            "strategy_revision": fact.strategy_revision,
+            "run_key": fact.run_key,
+            "portfolio_snapshot_id": fact.portfolio_snapshot_id,
+            "market_snapshot_id": fact.market_snapshot_id,
+            "symbol": fact.update.symbol,
+            "side": fact.update.side.value,
+            "peak_price": fact.update.peak_price,
+            "trough_price": fact.update.trough_price,
+            "trailing_active": fact.update.trailing_active,
+            "position_mode": fact.update.position_mode,
         },
     )
 
@@ -1511,8 +1770,7 @@ def _derived_risk_event(
 def _reconcile_batch_events(
     batch: DecisionBatch,
     paired_fills: Iterable[tuple[ExecutionProgressFill, ExecutionFill]],
-    risk_updates: Iterable[PositionRiskUpdate],
-    occurred_at: datetime,
+    risk_facts: Iterable[_RiskFact],
 ) -> tuple[PortfolioEvent, ...]:
     submitted = tuple(batch.events)
     submitted_ids = [event.id for event in submitted]
@@ -1523,10 +1781,7 @@ def _reconcile_batch_events(
 
     derived = (
         *(_derived_fill_event(detail) for detail, _summary in paired_fills),
-        *(
-            _derived_risk_event(batch, update, occurred_at)
-            for update in risk_updates
-        ),
+        *(_derived_risk_event(fact) for fact in risk_facts),
     )
     derived_by_id = {event.id: event for event in derived}
     fact_bound_types = {"ORDER_FILLED", "ORDER_PARTIAL", "RISK_CHANGED"}
@@ -1616,6 +1871,7 @@ class JsonLedgerStore:
             "open_intents": [],
             "fills": [],
             "execution_progress": [],
+            "risk_facts": [],
             "events": [_event_to_json(opened)],
             "committed_batches": [],
         }
@@ -1747,11 +2003,14 @@ class JsonLedgerStore:
             )
             current = _apply_risk_updates(current, updates)
             current = _apply_carry(current, accruals)
+            new_risk_facts = tuple(
+                _risk_fact_for_batch(batch, update, current.occurred_at)
+                for update in updates
+            )
             reconciled_events = _reconcile_batch_events(
                 batch,
                 paired_fills,
-                updates,
-                current.occurred_at,
+                new_risk_facts,
             )
             existing_events = tuple(
                 _event_from_json(raw)
@@ -1788,6 +2047,10 @@ class JsonLedgerStore:
                         merged_progress.values(), key=lambda value: value.intent_id
                     )
                 ],
+                "risk_facts": [
+                    *_require_list(persisted["risk_facts"], "account.risk_facts"),
+                    *(_risk_fact_to_json(fact) for fact in new_risk_facts),
+                ],
                 "events": [_event_to_json(item) for item in merged_events],
                 "committed_batches": [
                     *committed,
@@ -1798,6 +2061,7 @@ class JsonLedgerStore:
                         "source_snapshot_id": batch.portfolio_snapshot_id,
                         "result_snapshot_id": new_snapshot_id,
                         "market_snapshot_id": batch.market_snapshot_id,
+                        "risk_fact_ids": [fact.fact_id for fact in new_risk_facts],
                         "fingerprint": fingerprint,
                     },
                 ],
@@ -1807,6 +2071,7 @@ class JsonLedgerStore:
                 "accounts": dict(store["accounts"]),
             }
             next_store["accounts"][batch.strategy_id] = raw_account
+            validate_ledger_payload(next_store)
             _atomic_write(self.path, next_store)
             return current
 

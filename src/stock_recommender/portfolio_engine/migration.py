@@ -628,6 +628,7 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
                 "source_snapshot_id": snapshot_id,
                 "result_snapshot_id": snapshot_id,
                 "market_snapshot_id": None,
+                "risk_fact_ids": [],
                 "fingerprint": _stable_identifier("legacy-", value),
             }
         )
@@ -636,6 +637,7 @@ def _convert_account_v1(strategy_id: str, raw: object, now: datetime) -> dict[st
         "open_intents": sorted(open_intents, key=lambda item: item["id"]),
         "fills": [],
         "execution_progress": [],
+        "risk_facts": [],
         "events": [],
         "committed_batches": committed_batches,
     }

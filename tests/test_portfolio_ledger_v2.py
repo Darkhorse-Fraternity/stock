@@ -131,6 +131,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
                             "open_intents": [],
                             "fills": [],
                             "execution_progress": [],
+                            "risk_facts": [],
                             "events": [],
                             "committed_batches": [],
                         }
@@ -139,6 +140,70 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+
+    def _persist_two_risk_updates(self) -> tuple[Path, dict[str, object]]:
+        path = self.path.parent / "risk-history.json"
+        opened = AccountSnapshot(
+            id="account-risk-history",
+            strategy_id="risk-history",
+            strategy_revision=2,
+            occurred_at=NOW,
+            available_cash=10_000.0,
+            positions=(
+                PositionSnapshot(
+                    symbol="AAPL",
+                    side=PositionSide.LONG,
+                    quantity=1,
+                    average_cost=100.0,
+                    current_price=100.0,
+                    peak_price=100.0,
+                ),
+            ),
+            snapshot_id="risk-snapshot-0",
+        )
+        store = JsonLedgerStore(path)
+        store.create_account(opened)
+        update = PositionRiskUpdate(
+            symbol="AAPL",
+            side=PositionSide.LONG,
+            peak_price=110.0,
+            trough_price=None,
+            trailing_active=True,
+            position_mode="NORMAL",
+        )
+        first = store.commit(
+            DecisionBatch(
+                run_key="risk-run-1",
+                strategy_id="risk-history",
+                strategy_revision=2,
+                portfolio_snapshot_id="risk-snapshot-0",
+                market_snapshot_id="risk-market-1",
+                position_risk_updates=(update,),
+            )
+        )
+        store.commit(
+            DecisionBatch(
+                run_key="risk-run-2",
+                strategy_id="risk-history",
+                strategy_revision=2,
+                portfolio_snapshot_id=first.snapshot_id,
+                market_snapshot_id="risk-market-2",
+                position_risk_updates=(update,),
+            )
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return path, payload
+
+    def _assert_corrupt_risk_payload_is_read_only(
+        self,
+        path: Path,
+        payload: dict[str, object],
+    ) -> None:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        before = path.read_bytes()
+        with self.assertRaisesRegex(LedgerSchemaError, "risk|RISK"):
+            JsonLedgerStore(path).load("risk-history")
+        self.assertEqual(path.read_bytes(), before)
 
     def test_decision_batch_commits_once_and_returns_account_snapshot(self):
         store = JsonLedgerStore(self.path)
@@ -173,6 +238,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
         persisted = json.loads(path.read_text(encoding="utf-8"))["accounts"][
             "bootstrap"
         ]
+        self.assertEqual(persisted["risk_facts"], [])
         self.assertEqual(len(persisted["events"]), 1)
         opened = persisted["events"][0]
         self.assertEqual(opened["type"], "ACCOUNT_OPENED")
@@ -397,6 +463,7 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             "open_intents",
             "fills",
             "execution_progress",
+            "risk_facts",
             "events",
             "committed_batches",
         )
@@ -631,8 +698,125 @@ class PortfolioLedgerV2Tests(unittest.TestCase):
             [event["type"] for event in persisted["events"]],
             ["ORDER_FILLED", "RISK_CHANGED"],
         )
+        before_repeat = self.path.read_bytes()
         repeated = JsonLedgerStore(self.path).commit(decision)
         self.assertEqual(repeated, committed)
+        self.assertEqual(self.path.read_bytes(), before_repeat)
+
+    def test_same_risk_update_in_different_runs_persists_distinct_canonical_facts(self):
+        path, payload = self._persist_two_risk_updates()
+        persisted = payload["accounts"]["risk-history"]
+
+        facts = persisted["risk_facts"]
+        self.assertEqual(len(facts), 2)
+        self.assertEqual(len({fact["fact_id"] for fact in facts}), 2)
+        self.assertEqual(
+            [fact["run_key"] for fact in facts],
+            ["risk-run-1", "risk-run-2"],
+        )
+        self.assertEqual(facts[0]["update"], facts[1]["update"])
+        self.assertEqual(
+            facts[0]["update"],
+            {
+                "symbol": "AAPL",
+                "side": "LONG",
+                "peak_price": 110.0,
+                "trough_price": None,
+                "trailing_active": True,
+                "position_mode": "NORMAL",
+            },
+        )
+        self.assertEqual(facts[0]["strategy_id"], "risk-history")
+        self.assertEqual(facts[0]["strategy_revision"], 2)
+        self.assertEqual(facts[0]["portfolio_snapshot_id"], "risk-snapshot-0")
+        self.assertEqual(facts[0]["market_snapshot_id"], "risk-market-1")
+        events = [event for event in persisted["events"] if event["type"] == "RISK_CHANGED"]
+        self.assertEqual(len(events), 2)
+        self.assertEqual(
+            {event["data"]["risk_fact_id"] for event in events},
+            {fact["fact_id"] for fact in facts},
+        )
+        committed_fact_ids = {
+            fact_id
+            for committed in persisted["committed_batches"]
+            for fact_id in committed["risk_fact_ids"]
+        }
+        self.assertEqual(committed_fact_ids, {fact["fact_id"] for fact in facts})
+        self.assertEqual(
+            JsonLedgerStore(path).load("risk-history").positions[0].peak_price,
+            110.0,
+        )
+
+    def test_copied_risk_event_with_a_new_id_is_rejected_without_writing(self):
+        path, payload = self._persist_two_risk_updates()
+        persisted = payload["accounts"]["risk-history"]
+        copied = next(
+            event for event in persisted["events"] if event["type"] == "RISK_CHANGED"
+        ).copy()
+        copied["id"] = "forged-risk-event-id"
+        persisted["events"].append(copied)
+
+        self._assert_corrupt_risk_payload_is_read_only(path, payload)
+
+    def test_copied_risk_fact_is_rejected_without_writing(self):
+        path, original = self._persist_two_risk_updates()
+        for copied_as in ("same-id", "new-id"):
+            with self.subTest(copied_as=copied_as):
+                payload = json.loads(json.dumps(original))
+                persisted = payload["accounts"]["risk-history"]
+                copied = json.loads(json.dumps(persisted["risk_facts"][0]))
+                if copied_as == "new-id":
+                    copied["fact_id"] = "risk-fact-forged-copy"
+                persisted["risk_facts"].append(copied)
+                self._assert_corrupt_risk_payload_is_read_only(path, payload)
+
+    def test_missing_risk_event_or_fact_is_rejected_without_writing(self):
+        path, original = self._persist_two_risk_updates()
+        for missing in ("event", "fact", "event-and-fact", "batch-fact-ids"):
+            with self.subTest(missing=missing):
+                payload = json.loads(json.dumps(original))
+                persisted = payload["accounts"]["risk-history"]
+                if missing == "event":
+                    index = next(
+                        index
+                        for index, event in enumerate(persisted["events"])
+                        if event["type"] == "RISK_CHANGED"
+                    )
+                    del persisted["events"][index]
+                elif missing == "fact":
+                    del persisted["risk_facts"][0]
+                elif missing == "event-and-fact":
+                    del persisted["risk_facts"][0]
+                    index = next(
+                        index
+                        for index, event in enumerate(persisted["events"])
+                        if event["type"] == "RISK_CHANGED"
+                    )
+                    del persisted["events"][index]
+                else:
+                    del persisted["committed_batches"][0]["risk_fact_ids"]
+                self._assert_corrupt_risk_payload_is_read_only(path, payload)
+
+    def test_tampered_risk_fact_or_event_content_is_rejected_without_writing(self):
+        path, original = self._persist_two_risk_updates()
+        for target in ("fact", "event", "batch", "append-order"):
+            with self.subTest(target=target):
+                payload = json.loads(json.dumps(original))
+                persisted = payload["accounts"]["risk-history"]
+                if target == "fact":
+                    persisted["risk_facts"][0]["update"]["peak_price"] = 111.0
+                elif target == "event":
+                    event = next(
+                        event
+                        for event in persisted["events"]
+                        if event["type"] == "RISK_CHANGED"
+                    )
+                    event["data"]["peak_price"] = 111.0
+                elif target == "batch":
+                    persisted["risk_facts"][0]["run_key"] = "risk-run-forged"
+                else:
+                    persisted["risk_facts"].reverse()
+                self._assert_corrupt_risk_payload_is_read_only(path, payload)
 
     def test_execution_account_fact_must_match_replayed_progress(self):
         intent = OrderIntent(
