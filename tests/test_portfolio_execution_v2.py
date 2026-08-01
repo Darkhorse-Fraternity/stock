@@ -1,0 +1,841 @@
+import copy
+import math
+import unittest
+from dataclasses import FrozenInstanceError, replace
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+from stock_recommender.portfolio_engine import execution
+from stock_recommender.portfolio_engine.contracts import (
+    AccountSnapshot,
+    ExecutionFill,
+    MarketSnapshot,
+    OrderIntent,
+    OrderSide,
+    PositionEffect,
+    PositionSide,
+    PositionSnapshot,
+    TargetPosition,
+)
+from stock_recommender.parameters import default_portfolio_config
+from stock_recommender.pipeline import PipelineContractError, PipelineRunner, StageInput
+
+
+NOW = datetime(2026, 7, 31, 14, 30, tzinfo=timezone.utc)
+
+
+def target(symbol="AAPL", side=PositionSide.LONG, weight=10.0):
+    return TargetPosition(
+        symbol=symbol,
+        side=side,
+        target_weight_pct=weight,
+        signal_score=0.9,
+        model_id="model-v1",
+        thesis_id=f"thesis-{symbol}",
+    )
+
+
+def position(
+    symbol="AAPL",
+    side=PositionSide.LONG,
+    quantity=10,
+    average_cost=100.0,
+    **updates,
+):
+    return PositionSnapshot(
+        symbol=symbol,
+        side=side,
+        quantity=quantity,
+        average_cost=average_cost,
+        **updates,
+    )
+
+
+def account(*, cash=1_000.0, positions=(), **updates):
+    values = dict(
+        id="account-1",
+        strategy_id="strategy-1",
+        strategy_revision=2,
+        occurred_at=NOW,
+        available_cash=cash,
+        positions=positions,
+    )
+    values.update(updates)
+    return AccountSnapshot(**values)
+
+
+class OrderIntentPlanningTests(unittest.TestCase):
+    def test_delta_semantics_are_exact_for_both_directions(self):
+        cases = (
+            (None, target(side=PositionSide.LONG), 10, ("LONG", "BUY", "OPEN")),
+            (position(quantity=5), target(), 10, ("LONG", "BUY", "INCREASE")),
+            (position(quantity=15), target(), 10, ("LONG", "SELL", "REDUCE")),
+            (position(), None, 0, ("LONG", "SELL", "CLOSE")),
+            (None, target(side=PositionSide.SHORT), 10, ("SHORT", "SELL", "OPEN")),
+            (
+                position(side=PositionSide.SHORT, quantity=5),
+                target(side=PositionSide.SHORT),
+                10,
+                ("SHORT", "SELL", "INCREASE"),
+            ),
+            (
+                position(side=PositionSide.SHORT, quantity=15),
+                target(side=PositionSide.SHORT),
+                10,
+                ("SHORT", "BUY", "REDUCE"),
+            ),
+            (
+                position(side=PositionSide.SHORT),
+                None,
+                0,
+                ("SHORT", "BUY", "CLOSE"),
+            ),
+        )
+        for existing, requested, quantity, expected in cases:
+            with self.subTest(expected=expected):
+                intent = execution.intent_for_delta(
+                    existing,
+                    requested,
+                    target_quantity=quantity,
+                    created_snapshot_id="market-1",
+                )
+                self.assertEqual(intent.semantic_tuple(), expected)
+
+    def test_reversal_closes_first_and_never_forges_a_single_flip(self):
+        existing = position(side=PositionSide.LONG, quantity=7)
+
+        first = execution.intent_for_delta(
+            existing,
+            target(side=PositionSide.SHORT),
+            target_quantity=3,
+            created_snapshot_id="market-1",
+        )
+
+        self.assertEqual(first.semantic_tuple(), ("LONG", "SELL", "CLOSE"))
+        self.assertEqual(first.quantity, 7)
+
+    def test_planned_intent_id_is_stable_and_bound_to_all_semantics(self):
+        original = execution.intent_for_delta(
+            None,
+            target(),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        repeated = execution.intent_for_delta(
+            None,
+            target(),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        self.assertEqual(original, repeated)
+        self.assertTrue(execution.verify_intent_id(original))
+        for field_name, value in (
+            ("quantity", 11),
+            ("reason", "OTHER"),
+            ("created_snapshot_id", "market-2"),
+            ("order_side", OrderSide.SELL),
+        ):
+            with self.subTest(field=field_name):
+                forged = replace(original, **{field_name: value})
+                self.assertFalse(execution.verify_intent_id(forged))
+
+
+class FillSimulationTests(unittest.TestCase):
+    @staticmethod
+    def _short_open(quantity=1_000, snapshot_id="market-1"):
+        return execution.intent_for_delta(
+            None,
+            target("NVDA", PositionSide.SHORT, 5.0),
+            target_quantity=quantity,
+            created_snapshot_id=snapshot_id,
+        )
+
+    def test_partial_short_fill_respects_market_lot_and_five_percent_volume(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+
+        fill = execution.simulate_fill(
+            self._short_open(),
+            {"price": 20.0, "bar_volume": 2_000},
+            policy,
+            current_snapshot_id="market-2",
+        )
+
+        self.assertIsInstance(fill, ExecutionFill)
+        self.assertEqual(fill.quantity, 100)
+        self.assertEqual(fill.status, "PARTIAL")
+        self.assertEqual(fill.price, 19.98)
+        self.assertEqual(fill.fees, 0.0)
+
+    def test_fill_uses_commission_transfer_stamp_and_bar_bounded_slippage(self):
+        config = default_portfolio_config()
+        policy = execution.execution_policy("cn", config)
+        sell = OrderIntent(
+            id="risk-close-1",
+            symbol="600001",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.CLOSE,
+            quantity=100,
+            reason="LONG_STOP_LOSS",
+            created_snapshot_id="market-1",
+        )
+
+        fill = execution.simulate_fill(
+            sell,
+            {
+                "bar_open": 10.0,
+                "bar_low": 9.995,
+                "bar_high": 10.1,
+                "bar_volume": 10_000,
+            },
+            policy,
+            current_snapshot_id="market-2",
+        )
+
+        self.assertEqual(fill.price, 9.995)
+        notional = 999.5
+        expected = 5.0 + notional * 0.001 / 100 + notional * 0.05 / 100
+        self.assertAlmostEqual(fill.fees, expected)
+        self.assertEqual(fill.status, "FILLED")
+
+    def test_missing_invalid_or_zero_liquidity_quote_fails_closed(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+        cases = (
+            None,
+            {},
+            {"price": math.nan, "bar_volume": 1_000},
+            {"price": 0.0, "bar_volume": 1_000},
+            {"price": 20.0},
+            {"price": 20.0, "bar_volume": 0},
+            {"price": 20.0, "bar_volume": math.inf},
+        )
+        for quote in cases:
+            with self.subTest(quote=quote):
+                self.assertIsNone(
+                    execution.simulate_fill(
+                        self._short_open(),
+                        quote,
+                        policy,
+                        current_snapshot_id="market-2",
+                    )
+                )
+
+    def test_same_snapshot_and_invalid_direction_semantics_fail_closed(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+        valid = self._short_open()
+        invalid = replace(valid, order_side=OrderSide.BUY)
+        quote = {"price": 20.0, "bar_volume": 1_000}
+
+        self.assertIsNone(
+            execution.simulate_fill(
+                valid,
+                quote,
+                policy,
+                current_snapshot_id="market-1",
+            )
+        )
+        self.assertIsNone(
+            execution.simulate_fill(
+                invalid,
+                quote,
+                policy,
+                current_snapshot_id="market-2",
+            )
+        )
+
+    def test_execution_policy_is_frozen_and_rejects_nonfinite_costs(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+        with self.assertRaises(FrozenInstanceError):
+            policy.__setattr__("lot_size", 2)
+        with self.assertRaises(ValueError):
+            replace(policy, slippage_bps=math.inf)
+        with self.assertRaises(ValueError):
+            replace(policy, slippage_bps=10**1_000)
+        self.assertIsNone(
+            execution.simulate_fill(
+                self._short_open(),
+                {"price": 10**1_000, "bar_volume": 1_000},
+                policy,
+                current_snapshot_id="market-2",
+            )
+        )
+
+
+class RebalancePlanningStageTests(unittest.TestCase):
+    @staticmethod
+    def _market(quotes):
+        return MarketSnapshot(id="market-1", occurred_at=NOW, quotes=quotes)
+
+    def test_batch_planning_is_stable_risk_first_and_fail_closed_per_symbol(self):
+        original = account(
+            positions=(
+                position("A", quantity=5),
+                position("B", quantity=10),
+            )
+        )
+        targets = (
+            target("C", weight=10.0),
+            target("B", weight=5.0),
+            target("D", weight=10.0),
+        )
+        policy = execution.execution_policy("us", default_portfolio_config())
+
+        result = execution.plan_rebalance_intents(
+            original,
+            targets,
+            self._market(
+                {
+                    "A": {"price": 100.0, "bar_volume": 1_000},
+                    "B": {"price": 100.0, "bar_volume": 1_000},
+                    "C": {"price": 100.0, "bar_volume": 1_000},
+                }
+            ),
+            policy,
+            account_equity=10_000.0,
+        )
+
+        self.assertEqual(
+            [(item.symbol, item.position_effect.value) for item in result.intents],
+            [("A", "CLOSE"), ("B", "REDUCE"), ("C", "OPEN")],
+        )
+        self.assertEqual(
+            [(item.symbol, item.reason) for item in result.diagnostics],
+            [("D", "MARKET_PRICE_MISSING")],
+        )
+        self.assertEqual(
+            result,
+            execution.plan_rebalance_intents(
+                original,
+                tuple(reversed(targets)),
+                self._market(
+                    {
+                        "C": {"price": 100.0, "bar_volume": 1_000},
+                        "B": {"price": 100.0, "bar_volume": 1_000},
+                        "A": {"price": 100.0, "bar_volume": 1_000},
+                    }
+                ),
+                policy,
+                account_equity=10_000.0,
+            ),
+        )
+
+    def test_stage_prefers_borrow_admitted_targets_over_retained_exposure_fact(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+        stage = execution.RebalanceIntentStage(
+            account(),
+            self._market({"AAPL": {"price": 100.0, "bar_volume": 1_000}}),
+            policy,
+            account_equity=10_000.0,
+        )
+
+        output = stage.evaluate(
+            StageInput(
+                run_id="run-1",
+                strategy_id="strategy-1",
+                strategy_version=2,
+                as_of=NOW.isoformat(),
+                market_snapshot_id="market-1",
+                portfolio_snapshot_id="account-1",
+                upstream_facts=(
+                    {"kind": "exposure_targets", "items": (target("REJECTED"),)},
+                    {"kind": "borrow_targets", "items": (target("AAPL"),)},
+                ),
+            )
+        )
+
+        self.assertEqual([item.symbol for item in output.facts[0]["items"]], ["AAPL"])
+
+    def test_opposite_target_closes_existing_position_even_without_target_quote(self):
+        result = execution.plan_rebalance_intents(
+            account(positions=(position("A", PositionSide.LONG, 10),)),
+            (target("A", PositionSide.SHORT, 5.0),),
+            self._market({}),
+            execution.execution_policy("us", default_portfolio_config()),
+            account_equity=10_000.0,
+        )
+
+        self.assertEqual(result.diagnostics, ())
+        self.assertEqual(result.intents[0].semantic_tuple(), ("LONG", "SELL", "CLOSE"))
+
+
+class AccountExecutionTests(unittest.TestCase):
+    @staticmethod
+    def _market(*args, volume=1_000):
+        if len(args) == 1:
+            return MarketSnapshot(id="market-1", occurred_at=NOW, quotes=args[0])
+        snapshot_id, occurred_at, symbol, price = args
+        return MarketSnapshot(
+            id=snapshot_id,
+            occurred_at=occurred_at,
+            quotes={symbol: {"price": price, "bar_volume": volume}},
+        )
+
+    @staticmethod
+    def _zero_cost_policy(market="us", participation=5.0):
+        return replace(
+            execution.execution_policy(market, default_portfolio_config()),
+            commission_rate_pct=0.0,
+            minimum_commission=0.0,
+            stamp_duty_rate_pct=0.0,
+            transfer_fee_rate_pct=0.0,
+            slippage_bps=0.0,
+            max_bar_participation_pct=participation,
+        )
+
+    def test_short_open_proceeds_are_restricted_and_close_releases_basis(self):
+        original = account(cash=0.0)
+        before = copy.deepcopy(original)
+        open_short = execution.intent_for_delta(
+            None,
+            target("S", PositionSide.SHORT, 5.0),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        opened = execution.execute_intents(
+            original,
+            (open_short,),
+            self._market("market-2", NOW + timedelta(minutes=5), "S", 100.0),
+            self._zero_cost_policy(),
+        )
+
+        self.assertEqual(original, before)
+        self.assertEqual(opened.account.available_cash, 0.0)
+        self.assertEqual(opened.account.restricted_short_proceeds, 1_000.0)
+        self.assertEqual(opened.account.positions[0].side, PositionSide.SHORT)
+        close = OrderIntent(
+            id="risk-close-s",
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+            reason="SHORT_STOP_LOSS",
+            created_snapshot_id="market-2",
+        )
+        closed = execution.execute_intents(
+            opened.account,
+            (close,),
+            self._market("market-3", NOW + timedelta(minutes=10), "S", 80.0),
+            self._zero_cost_policy(),
+        )
+
+        self.assertEqual(closed.account.positions, ())
+        self.assertEqual(closed.account.restricted_short_proceeds, 0.0)
+        self.assertEqual(closed.account.available_cash, 200.0)
+        self.assertEqual(closed.account.margin_loan, 0.0)
+
+    def test_partial_short_close_reuses_proportional_basis_settlement(self):
+        original = account(
+            cash=0.0,
+            positions=(position("S", PositionSide.SHORT, 10, 100.0),),
+            restricted_short_proceeds=1_000.0,
+        )
+        close = OrderIntent(
+            id="risk-close-s",
+            symbol="S",
+            position_side=PositionSide.SHORT,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+            reason="MARGIN_CALL",
+            created_snapshot_id="market-1",
+        )
+
+        result = execution.execute_intents(
+            original,
+            (close,),
+            self._market("market-2", NOW + timedelta(minutes=5), "S", 80.0, volume=4),
+            self._zero_cost_policy(participation=100.0),
+        )
+
+        self.assertEqual(result.fills[0].status, "PARTIAL")
+        self.assertEqual(result.fills[0].quantity, 4)
+        self.assertEqual(result.account.restricted_short_proceeds, 600.0)
+        self.assertEqual(result.account.available_cash, 80.0)
+        self.assertEqual(result.account.positions[0].quantity, 6)
+        self.assertEqual(result.account.positions[0].average_cost, 100.0)
+
+    def test_leveraged_long_consumes_cash_then_loan_and_sale_repay_loan_first(self):
+        original = account(cash=50.0)
+        open_long = execution.intent_for_delta(
+            None,
+            target("L", PositionSide.LONG, 10.0),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        opened = execution.execute_intents(
+            original,
+            (open_long,),
+            self._market("market-2", NOW + timedelta(minutes=5), "L", 100.0),
+            self._zero_cost_policy(),
+        )
+        self.assertEqual(opened.account.available_cash, 0.0)
+        self.assertEqual(opened.account.margin_loan, 950.0)
+
+        close = OrderIntent(
+            id="risk-close-l",
+            symbol="L",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+            reason="LONG_STOP_LOSS",
+            created_snapshot_id="market-2",
+        )
+        closed = execution.execute_intents(
+            opened.account,
+            (close,),
+            self._market("market-3", NOW + timedelta(minutes=10), "L", 100.0),
+            self._zero_cost_policy(),
+        )
+        self.assertEqual(closed.account.margin_loan, 0.0)
+        self.assertEqual(closed.account.available_cash, 50.0)
+
+    def test_cn_t_plus_one_blocks_risk_exit_until_next_business_date(self):
+        shanghai = ZoneInfo("Asia/Shanghai")
+        friday = datetime(2026, 7, 31, 10, 0, tzinfo=shanghai)
+        policy = self._zero_cost_policy("cn", participation=100.0)
+        open_long = execution.intent_for_delta(
+            None,
+            target("600001", PositionSide.LONG, 10.0),
+            target_quantity=100,
+            created_snapshot_id="market-1",
+        )
+        opened = execution.execute_intents(
+            account(cash=2_000.0, occurred_at=friday),
+            (open_long,),
+            self._market("market-2", friday + timedelta(minutes=5), "600001", 10.0),
+            policy,
+        )
+        held = opened.account.positions[0]
+        self.assertEqual(held.sellable_quantity, 0)
+        self.assertEqual(held.sellable_on, date(2026, 8, 3))
+        risk_close = OrderIntent(
+            id="risk-cn-close",
+            symbol="600001",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.CLOSE,
+            quantity=100,
+            reason="LONG_STOP_LOSS",
+            created_snapshot_id="market-2",
+        )
+
+        blocked = execution.execute_intents(
+            opened.account,
+            (risk_close,),
+            self._market("market-3", friday + timedelta(minutes=10), "600001", 9.0),
+            policy,
+        )
+        self.assertEqual(blocked.fills, ())
+        self.assertEqual(blocked.diagnostics[0].reason, "T_PLUS_ONE_LOCKED")
+        monday = datetime(2026, 8, 3, 10, 0, tzinfo=shanghai)
+        exited = execution.execute_intents(
+            blocked.account,
+            (risk_close,),
+            self._market("market-4", monday, "600001", 9.0),
+            policy,
+        )
+        self.assertEqual(exited.account.positions, ())
+        self.assertEqual(exited.fills[0].intent_id, risk_close.id)
+        self.assertEqual(risk_close.semantic_tuple(), ("LONG", "SELL", "CLOSE"))
+
+    def test_us_position_is_sellable_on_same_session_after_later_snapshot(self):
+        policy = self._zero_cost_policy("us", participation=100.0)
+        open_long = execution.intent_for_delta(
+            None,
+            target("AAPL"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        opened = execution.execute_intents(
+            account(cash=2_000.0),
+            (open_long,),
+            self._market("market-2", NOW + timedelta(minutes=5), "AAPL", 100.0),
+            policy,
+        )
+        self.assertEqual(opened.account.positions[0].sellable_quantity, 10)
+
+    def test_execution_stage_consumes_admitted_intents_without_persistence(self):
+        policy = self._zero_cost_policy()
+        original = account()
+        intent = execution.intent_for_delta(
+            None, target(), target_quantity=1, created_snapshot_id="market-1"
+        )
+        stage = execution.ExecutionSimulationStage(
+            original,
+            self._market("market-2", NOW + timedelta(minutes=5), "AAPL", 100.0),
+            policy,
+        )
+        output = stage.evaluate(
+            StageInput(
+                run_id="run-1",
+                strategy_id="strategy-1",
+                strategy_version=2,
+                as_of=NOW.isoformat(),
+                market_snapshot_id="market-2",
+                portfolio_snapshot_id="account-1",
+                upstream_facts=(
+                    {"kind": "margin_admitted_intents", "items": (intent,)},
+                ),
+            )
+        )
+        self.assertEqual(output.facts[0]["kind"], "execution_fills")
+        self.assertEqual(output.facts[0]["items"][0].intent_id, intent.id)
+        self.assertEqual(original.positions, ())
+
+    def test_partial_open_resumes_as_increase_and_finishes_without_overfill(self):
+        policy = self._zero_cost_policy("us", participation=5.0)
+        intent = execution.intent_for_delta(
+            None,
+            target("S", PositionSide.SHORT, 5.0),
+            target_quantity=1_000,
+            created_snapshot_id="market-1",
+        )
+        first = execution.execute_intents(
+            account(cash=1_000.0),
+            (intent,),
+            self._market("market-2", NOW + timedelta(minutes=5), "S", 100.0, volume=2_000),
+            policy,
+        )
+        second = execution.execute_intents(
+            first.account,
+            (intent,),
+            self._market("market-3", NOW + timedelta(minutes=10), "S", 100.0, volume=18_000),
+            policy,
+            prior_progress=first.progress,
+        )
+
+        self.assertEqual(first.fills[0].quantity, 100)
+        self.assertEqual(first.progress[0].filled_quantity, 100)
+        self.assertEqual(second.fills[0].quantity, 900)
+        self.assertEqual(second.fills[0].status, "FILLED")
+        self.assertEqual(second.progress[0].filled_quantity, 1_000)
+        self.assertEqual(second.account.positions[0].quantity, 1_000)
+        self.assertEqual(second.account.restricted_short_proceeds, 100_000.0)
+
+    def test_partial_commission_minimum_is_charged_once_across_snapshots(self):
+        policy = replace(
+            self._zero_cost_policy("cn", participation=5.0),
+            minimum_commission=5.0,
+        )
+        intent = execution.intent_for_delta(
+            None,
+            target("600001", PositionSide.LONG, 10.0),
+            target_quantity=200,
+            created_snapshot_id="market-1",
+        )
+        first = execution.execute_intents(
+            account(cash=10_000.0),
+            (intent,),
+            self._market("market-2", NOW + timedelta(minutes=5), "600001", 10.0, volume=2_000),
+            policy,
+        )
+        second = execution.execute_intents(
+            first.account,
+            (intent,),
+            self._market("market-3", NOW + timedelta(minutes=10), "600001", 10.0, volume=2_000),
+            policy,
+            prior_progress=first.progress,
+        )
+
+        self.assertEqual(first.fills[0].fees, 5.0)
+        self.assertEqual(second.fills[0].fees, 0.0)
+        self.assertEqual(second.progress[0].commission_charged, 5.0)
+
+
+class CarryAccrualTests(unittest.TestCase):
+    def _leveraged_short_account(self):
+        return account(
+            cash=100.0,
+            occurred_at=datetime(2026, 7, 30, 14, 30, tzinfo=timezone.utc),
+            margin_loan=3_650.0,
+            restricted_short_proceeds=1_000.0,
+            positions=(
+                position(
+                    "S",
+                    PositionSide.SHORT,
+                    10,
+                    100.0,
+                    current_price=100.0,
+                ),
+            ),
+        )
+
+    def test_daily_financing_and_borrow_accrual_is_idempotent(self):
+        original = self._leveraged_short_account()
+        before = copy.deepcopy(original)
+
+        first = execution.accrue_carry_costs(
+            original,
+            as_of=date(2026, 7, 31),
+            financing_apr_pct=10.0,
+            borrow_apr_by_symbol={"S": 36.5},
+        )
+        repeated = execution.accrue_carry_costs(
+            first.account,
+            as_of=date(2026, 7, 31),
+            financing_apr_pct=10.0,
+            borrow_apr_by_symbol={"S": 36.5},
+        )
+
+        self.assertEqual(original, before)
+        self.assertEqual(first.financing_cost, 1.0)
+        self.assertEqual(first.borrow_cost, 1.0)
+        self.assertEqual(first.account.available_cash, 98.0)
+        self.assertEqual(first.account.accrued_financing_cost, 1.0)
+        self.assertEqual(first.account.accrued_borrow_cost, 1.0)
+        self.assertEqual(
+            [event.type for event in first.events],
+            ["FINANCING_COST_ACCRUED", "BORROW_COST_ACCRUED"],
+        )
+        self.assertEqual(repeated.financing_cost + repeated.borrow_cost, 0.0)
+        self.assertEqual(repeated.events, ())
+        self.assertEqual(repeated.account, first.account)
+
+    def test_weekend_uses_actual_three_calendar_days_over_365(self):
+        friday = execution.accrue_carry_costs(
+            self._leveraged_short_account(),
+            as_of=date(2026, 7, 31),
+            financing_apr_pct=10.0,
+            borrow_apr_by_symbol={"S": 36.5},
+        )
+        monday = execution.accrue_carry_costs(
+            friday.account,
+            as_of=date(2026, 8, 3),
+            financing_apr_pct=10.0,
+            borrow_apr_by_symbol={"S": 36.5},
+        )
+
+        self.assertEqual(monday.financing_cost, 3.0)
+        self.assertEqual(monday.borrow_cost, 3.0)
+        self.assertEqual(
+            sorted(record.elapsed_days for record in monday.new_accruals),
+            [3, 3],
+        )
+
+    def test_borrow_cost_uses_each_short_liability_and_estimated_fallback(self):
+        original = replace(
+            self._leveraged_short_account(),
+            positions=(
+                position("A", PositionSide.SHORT, 10, 100.0, current_price=100.0),
+                position("B", PositionSide.SHORT, 20, 50.0, current_price=50.0),
+            ),
+            restricted_short_proceeds=2_000.0,
+            margin_loan=0.0,
+        )
+
+        result = execution.accrue_carry_costs(
+            original,
+            as_of=date(2026, 7, 31),
+            borrow_apr_by_symbol={"A": 36.5},
+            estimated_borrow_apr_pct=18.25,
+        )
+
+        self.assertEqual(result.financing_cost, 0.0)
+        self.assertEqual(result.borrow_cost, 1.5)
+
+    def test_missing_short_price_and_invalid_cost_inputs_fail_closed(self):
+        missing = replace(
+            self._leveraged_short_account(),
+            positions=(position("S", PositionSide.SHORT, 10, 100.0),),
+        )
+        with self.assertRaisesRegex(ValueError, "short price"):
+            execution.accrue_carry_costs(
+                missing,
+                as_of=date(2026, 7, 31),
+                borrow_apr_by_symbol={"S": 10.0},
+            )
+        for invalid in (math.nan, math.inf, -1.0, True):
+            with self.subTest(invalid=invalid), self.assertRaises((TypeError, ValueError)):
+                execution.accrue_carry_costs(
+                    self._leveraged_short_account(),
+                    as_of=date(2026, 7, 31),
+                    financing_apr_pct=invalid,
+                )
+
+
+class RebalancePlanningContractTests(unittest.TestCase):
+    @staticmethod
+    def _market(quotes):
+        return MarketSnapshot(id="market-1", occurred_at=NOW, quotes=quotes)
+
+    def test_risk_close_overrides_rebalance_and_keeps_original_semantics(self):
+        held = position("A", side=PositionSide.SHORT, quantity=10)
+        risk = OrderIntent(
+            id="risk-a",
+            symbol="A",
+            position_side=PositionSide.SHORT,
+            order_side=OrderSide.BUY,
+            position_effect=PositionEffect.CLOSE,
+            quantity=10,
+            reason="MARGIN_CALL",
+            created_snapshot_id="market-1",
+        )
+        policy = execution.execution_policy("us", default_portfolio_config())
+
+        result = execution.plan_rebalance_intents(
+            account(positions=(held,)),
+            (target("A", PositionSide.SHORT, 5.0),),
+            self._market({"A": {"price": 100.0, "bar_volume": 1_000}}),
+            policy,
+            account_equity=10_000.0,
+            risk_intents=(risk,),
+        )
+
+        self.assertEqual(result.intents, (risk,))
+        self.assertEqual(result.intents[0].semantic_tuple(), ("SHORT", "BUY", "CLOSE"))
+
+    def test_stage_emits_typed_order_intents_without_mutating_account(self):
+        original = account()
+        before = copy.deepcopy(original)
+        policy = execution.execution_policy("us", default_portfolio_config())
+        stage = execution.RebalanceIntentStage(
+            original,
+            self._market({"AAPL": {"price": 100.0, "bar_volume": 1_000}}),
+            policy,
+            account_equity=10_000.0,
+        )
+        outputs = PipelineRunner((stage,)).run(
+            StageInput(
+                run_id="run-1",
+                strategy_id="strategy-1",
+                strategy_version=2,
+                as_of=NOW.isoformat(),
+                market_snapshot_id="market-1",
+                portfolio_snapshot_id="account-1",
+                upstream_facts=(
+                    {"kind": "borrow_targets", "items": (target(),)},
+                    {"kind": "risk_intents", "items": ()},
+                ),
+            )
+        )
+
+        self.assertEqual(outputs[0].facts[0]["kind"], "order_intents")
+        self.assertEqual(outputs[0].facts[0]["items"][0].semantic_tuple(), ("LONG", "BUY", "OPEN"))
+        self.assertEqual(original, before)
+
+    def test_stage_rejects_duplicate_target_facts(self):
+        policy = execution.execution_policy("us", default_portfolio_config())
+        stage = execution.RebalanceIntentStage(
+            account(), self._market({}), policy, account_equity=1_000.0
+        )
+        with self.assertRaises(PipelineContractError):
+            stage.evaluate(
+                StageInput(
+                    run_id="run-1",
+                    strategy_id="strategy-1",
+                    strategy_version=2,
+                    as_of=NOW.isoformat(),
+                    market_snapshot_id="market-1",
+                    portfolio_snapshot_id="account-1",
+                    upstream_facts=(
+                        {"kind": "borrow_targets", "items": ()},
+                        {"kind": "borrow_targets", "items": ()},
+                    ),
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()

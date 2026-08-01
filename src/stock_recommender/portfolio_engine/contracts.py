@@ -410,6 +410,8 @@ class PositionSnapshot(_DeeplyImmutable):
     trough_price: float | None = None
     trailing_active: bool = False
     position_mode: str = "NORMAL"
+    sellable_quantity: int | None = None
+    sellable_on: date | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.symbol, "symbol")
@@ -425,6 +427,18 @@ class PositionSnapshot(_DeeplyImmutable):
             self.trailing_active,
             self.position_mode,
         )
+        if self.sellable_quantity is not None:
+            _require_integer(self.sellable_quantity, "sellable_quantity")
+            if not 0 <= self.sellable_quantity <= self.quantity:
+                raise ValueError(
+                    "sellable_quantity must be between zero and quantity"
+                )
+        if self.sellable_on is not None and type(self.sellable_on) is not date:
+            raise TypeError("sellable_on must be a date or None")
+        if self.side is PositionSide.SHORT and (
+            self.sellable_quantity is not None or self.sellable_on is not None
+        ):
+            raise ValueError("SHORT position must not carry long T+1 state")
 
     @property
     def market_value(self) -> float | None:
@@ -486,6 +500,34 @@ class PositionRiskUpdate(_DeeplyImmutable):
         )
 
 
+class CarryCostType(str, Enum):
+    FINANCING = "FINANCING"
+    BORROW = "BORROW"
+
+
+@dataclass(frozen=True)
+class CarryAccrualRecord(_DeeplyImmutable):
+    account_id: str
+    cost_type: CarryCostType
+    accrual_date: date
+    elapsed_days: int
+    amount: float
+
+    def __post_init__(self) -> None:
+        _require_string(self.account_id, "account_id")
+        _require_enum(self.cost_type, CarryCostType, "cost_type")
+        if type(self.accrual_date) is not date:
+            raise TypeError("accrual_date must be a date")
+        _require_integer(self.elapsed_days, "elapsed_days")
+        if self.elapsed_days < 0:
+            raise ValueError("elapsed_days must be nonnegative")
+        _require_nonnegative_finite_number(self.amount, "amount")
+
+    @property
+    def idempotency_key(self) -> tuple[str, CarryCostType, date]:
+        return (self.account_id, self.cost_type, self.accrual_date)
+
+
 @dataclass(frozen=True)
 class AccountSnapshot(_DeeplyImmutable):
     id: str
@@ -498,6 +540,7 @@ class AccountSnapshot(_DeeplyImmutable):
     accrued_financing_cost: float = 0.0
     accrued_borrow_cost: float = 0.0
     positions: tuple[PositionSnapshot, ...] = ()
+    carry_accruals: tuple[CarryAccrualRecord, ...] = ()
 
     def __post_init__(self) -> None:
         _require_string(self.id, "id")
@@ -519,6 +562,18 @@ class AccountSnapshot(_DeeplyImmutable):
             "accrued_borrow_cost",
         )
         positions = _typed_tuple(self.positions, PositionSnapshot, "positions")
+        carry_accruals = _typed_tuple(
+            self.carry_accruals,
+            CarryAccrualRecord,
+            "carry_accruals",
+        )
+        keys: set[tuple[str, CarryCostType, date]] = set()
+        for record in carry_accruals:
+            if record.account_id != self.id:
+                raise ValueError("carry accrual account_id must match account id")
+            if record.idempotency_key in keys:
+                raise ValueError("carry_accruals must have unique idempotency keys")
+            keys.add(record.idempotency_key)
         seen_symbols: set[str] = set()
         for position in positions:
             if position.symbol in seen_symbols:
@@ -528,6 +583,7 @@ class AccountSnapshot(_DeeplyImmutable):
                 )
             seen_symbols.add(position.symbol)
         object.__setattr__(self, "positions", positions)
+        object.__setattr__(self, "carry_accruals", carry_accruals)
 
 
 @dataclass(frozen=True)
@@ -681,6 +737,8 @@ class ValuationResult(_DeeplyImmutable):
             "trough_price",
             "trailing_active",
             "position_mode",
+            "sellable_quantity",
+            "sellable_on",
         )
         for index, (account_position, valued_position) in enumerate(
             zip(self.account.positions, positions, strict=True)
@@ -805,6 +863,15 @@ class OrderIntent(_DeeplyImmutable):
             PositionEffect.INCREASE,
         }
 
+    def semantic_tuple(self) -> tuple[str, str, str]:
+        """Return the complete direction/order/effect execution meaning."""
+
+        return (
+            self.position_side.value,
+            self.order_side.value,
+            self.position_effect.value,
+        )
+
 
 @dataclass(frozen=True)
 class MarketSnapshot(_DeeplyImmutable):
@@ -832,9 +899,11 @@ class ExecutionFill(_DeeplyImmutable):
         _require_string(self.intent_id, "intent_id")
         _require_string(self.symbol, "symbol")
         _require_positive_quantity(self.quantity)
-        _require_finite_number(self.price, "price")
-        _require_finite_number(self.fees, "fees")
+        _require_positive_finite_number(self.price, "price")
+        _require_nonnegative_finite_number(self.fees, "fees")
         _require_string(self.status, "status")
+        if self.status not in {"FILLED", "PARTIAL"}:
+            raise ValueError("status must be FILLED or PARTIAL")
 
 
 @dataclass(frozen=True)
@@ -906,6 +975,7 @@ class DecisionBatch(_DeeplyImmutable):
 _DEEPLY_IMMUTABLE_TYPES = (
     PositionSnapshot,
     PositionRiskUpdate,
+    CarryAccrualRecord,
     AccountSnapshot,
     PortfolioMetrics,
     ValuationResult,
