@@ -972,8 +972,7 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             ("reason", []),
             ("created_snapshot_id", []),
         ):
-            error = ValueError if field_name == "quantity" else TypeError
-            with self.subTest(field=field_name), self.assertRaises(error):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
                 OrderIntent(**{**values, field_name: invalid})
 
     def test_market_snapshot_rejects_wrong_field_types(self):
@@ -1007,8 +1006,7 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
             ("fees", []),
             ("status", []),
         ):
-            error = ValueError if field_name == "quantity" else TypeError
-            with self.subTest(field=field_name), self.assertRaises(error):
+            with self.subTest(field=field_name), self.assertRaises(TypeError):
                 ExecutionFill(**{**values, field_name: invalid})
         for field_name in ("price", "fees"):
             for invalid in (math.nan, math.inf, -math.inf):

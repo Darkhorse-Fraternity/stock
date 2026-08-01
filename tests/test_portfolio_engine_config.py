@@ -270,13 +270,38 @@ class PortfolioEngineContractTests(unittest.TestCase):
         self.assertEqual(PositionEffect.CLOSE.value, "CLOSE")
 
     def test_order_intent_requires_positive_integer_quantity(self):
-        for quantity in (0, -1, 1.5, True):
-            with self.subTest(quantity=quantity), self.assertRaises(ValueError):
+        for quantity in (1.5, True, "1", None):
+            with self.subTest(quantity=quantity), self.assertRaisesRegex(
+                TypeError,
+                "integer",
+            ):
+                self._intent(quantity=quantity)
+        for quantity in (0, -1):
+            with self.subTest(quantity=quantity), self.assertRaisesRegex(
+                ValueError,
+                "positive",
+            ):
                 self._intent(quantity=quantity)
 
     def test_execution_fill_requires_positive_integer_quantity(self):
-        for quantity in (0, -1, 1.5, False):
-            with self.subTest(quantity=quantity), self.assertRaises(ValueError):
+        for quantity in (1.5, False, "1", None):
+            with self.subTest(quantity=quantity), self.assertRaisesRegex(
+                TypeError,
+                "integer",
+            ):
+                ExecutionFill(
+                    intent_id="intent-1",
+                    symbol="AAPL",
+                    quantity=quantity,
+                    price=100.0,
+                    fees=1.0,
+                    status="FILLED",
+                )
+        for quantity in (0, -1):
+            with self.subTest(quantity=quantity), self.assertRaisesRegex(
+                ValueError,
+                "positive",
+            ):
                 ExecutionFill(
                     intent_id="intent-1",
                     symbol="AAPL",

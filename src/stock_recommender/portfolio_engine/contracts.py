@@ -560,16 +560,83 @@ class PortfolioMetrics(_DeeplyImmutable):
 class ValuationResult(_DeeplyImmutable):
     account: AccountSnapshot
     metrics: PortfolioMetrics
+    positions: tuple[PositionSnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.account) is not AccountSnapshot:
             raise TypeError("account must be AccountSnapshot")
         if type(self.metrics) is not PortfolioMetrics:
             raise TypeError("metrics must be PortfolioMetrics")
+        positions = tuple(
+            position
+            for position in _typed_tuple(
+                self.positions,
+                PositionSnapshot,
+                "positions",
+            )
+        )
+        object.__setattr__(self, "positions", positions)
 
-    @property
-    def positions(self) -> tuple[PositionSnapshot, ...]:
-        return self.account.positions
+        balance_fields = (
+            "available_cash",
+            "restricted_short_proceeds",
+            "margin_loan",
+            "accrued_financing_cost",
+            "accrued_borrow_cost",
+        )
+        for field_name in balance_fields:
+            if getattr(self.account, field_name) != getattr(self.metrics, field_name):
+                raise ValueError(
+                    f"account.{field_name} does not match metrics.{field_name}"
+                )
+
+        if len(positions) != len(self.account.positions):
+            raise ValueError("positions length does not match account.positions")
+        identity_fields = ("symbol", "side", "quantity", "average_cost")
+        for index, (account_position, valued_position) in enumerate(
+            zip(self.account.positions, positions, strict=True)
+        ):
+            if valued_position.current_price is None:
+                raise ValueError(f"positions[{index}].current_price must be valued")
+            for field_name in identity_fields:
+                if getattr(account_position, field_name) != getattr(
+                    valued_position,
+                    field_name,
+                ):
+                    raise ValueError(
+                        f"positions[{index}].{field_name} does not match "
+                        f"account.positions[{index}].{field_name}"
+                    )
+
+        long_values: list[float] = []
+        short_values: list[float] = []
+        for index, position in enumerate(positions):
+            market_value = position.market_value
+            if market_value is None:
+                raise ValueError(f"positions[{index}].market_value is unavailable")
+            if position.side is PositionSide.LONG:
+                long_values.append(market_value)
+            else:
+                short_values.append(market_value)
+        long_market_value = _finite_derived_value(
+            sum(long_values, 0.0),
+            "long_market_value",
+        )
+        short_liability = _finite_derived_value(
+            sum(short_values, 0.0),
+            "short_liability",
+        )
+        if not _metric_matches(
+            self.metrics.long_market_value,
+            long_market_value,
+        ):
+            raise ValueError(
+                "positions long_market_value does not match metrics.long_market_value"
+            )
+        if not _metric_matches(self.metrics.short_liability, short_liability):
+            raise ValueError(
+                "positions short_liability does not match metrics.short_liability"
+            )
 
 
 @dataclass(frozen=True)
@@ -614,9 +681,11 @@ class TargetPosition(_DeeplyImmutable):
         _require_string(self.thesis_id, "thesis_id")
 
 
-def _require_positive_quantity(quantity: int) -> None:
-    if type(quantity) is not int or quantity <= 0:
-        raise ValueError("quantity must be a positive integer")
+def _require_positive_quantity(quantity: object) -> None:
+    if type(quantity) is not int:
+        raise TypeError("quantity must be an integer")
+    if quantity <= 0:
+        raise ValueError("quantity must be positive")
 
 
 @dataclass(frozen=True)

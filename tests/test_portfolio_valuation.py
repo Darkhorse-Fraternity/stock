@@ -138,9 +138,16 @@ class PortfolioValuationTests(unittest.TestCase):
         self.assertEqual(result.metrics.equity, 992.0)
 
     def test_position_contract_rejects_invalid_quantity_cost_and_valued_price(self):
-        for quantity in (0, -1, 1.5, True, "1"):
-            with self.subTest(field="quantity", value=quantity), self.assertRaises(
-                (TypeError, ValueError)
+        for quantity in (1.5, True, "1", None):
+            with self.subTest(field="quantity", value=quantity), self.assertRaisesRegex(
+                TypeError,
+                "integer",
+            ):
+                self._position(quantity=quantity)
+        for quantity in (0, -1):
+            with self.subTest(field="quantity", value=quantity), self.assertRaisesRegex(
+                ValueError,
+                "positive",
             ):
                 self._position(quantity=quantity)
         for average_cost in (0, -1, True, "100", math.nan, math.inf, -math.inf):
@@ -228,6 +235,151 @@ class PortfolioValuationTests(unittest.TestCase):
         for positions in ("AAPL", {"AAPL": position}, (object(),)):
             with self.subTest(positions=positions), self.assertRaises(TypeError):
                 self._account(positions=positions)
+
+    def test_valuation_result_rejects_metrics_from_another_account(self):
+        account = self._account(available_cash=100.0)
+        other_metrics = contracts.PortfolioMetrics(
+            available_cash=200.0,
+            restricted_short_proceeds=0.0,
+            margin_loan=0.0,
+            accrued_financing_cost=0.0,
+            accrued_borrow_cost=0.0,
+            long_market_value=0.0,
+            short_liability=0.0,
+            equity=200.0,
+            long_exposure_pct=0.0,
+            short_exposure_pct=0.0,
+            gross_exposure_pct=0.0,
+            net_exposure_pct=0.0,
+            margin_rate_pct=math.inf,
+        )
+
+        with self.assertRaisesRegex(ValueError, "available_cash"):
+            contracts.ValuationResult(account=account, metrics=other_metrics)
+
+    def test_valuation_result_checks_every_account_metric_balance_field(self):
+        account = self._account(available_cash=100.0)
+        metrics = valuation.value_account(account, {}).metrics
+        mismatches = {
+            "available_cash": 101.0,
+            "restricted_short_proceeds": 1.0,
+            "margin_loan": 1.0,
+            "accrued_financing_cost": 1.0,
+            "accrued_borrow_cost": 1.0,
+        }
+
+        for field_name, value in mismatches.items():
+            with self.subTest(field=field_name), self.assertRaisesRegex(
+                ValueError,
+                field_name,
+            ):
+                contracts.ValuationResult(
+                    account=self._account(**{field_name: value}),
+                    positions=(),
+                    metrics=metrics,
+                )
+
+    def test_valuation_result_copies_and_validates_valued_positions(self):
+        account = self._account(positions=(self._position(),))
+        valued = valuation.value_account(account, {"AAPL": 110.0})
+        source = list(valued.positions)
+
+        result = contracts.ValuationResult(
+            account=account,
+            positions=source,
+            metrics=valued.metrics,
+        )
+        source.clear()
+
+        self.assertIsInstance(result.positions, tuple)
+        self.assertEqual(len(result.positions), 1)
+        for positions in ("AAPL", {"AAPL": valued.positions[0]}, (object(),)):
+            with self.subTest(positions=positions), self.assertRaises(TypeError):
+                contracts.ValuationResult(
+                    account=account,
+                    positions=positions,
+                    metrics=valued.metrics,
+                )
+        with self.assertRaisesRegex(ValueError, "current_price|position"):
+            contracts.ValuationResult(
+                account=account,
+                positions=account.positions,
+                metrics=valued.metrics,
+            )
+
+    def test_valuation_result_matches_position_identity_in_stable_order(self):
+        account = self._account(
+            positions=(
+                self._position(symbol="AAPL"),
+                self._position(
+                    symbol="MSFT",
+                    side=contracts.PositionSide.SHORT,
+                ),
+            )
+        )
+        valued = valuation.value_account(account, {"AAPL": 110.0, "MSFT": 90.0})
+
+        mismatched_positions = (
+            tuple(reversed(valued.positions)),
+            (
+                self._position(symbol="OTHER", current_price=110.0),
+                valued.positions[1],
+            ),
+            (
+                self._position(
+                    symbol="AAPL",
+                    side=contracts.PositionSide.SHORT,
+                    current_price=110.0,
+                ),
+                valued.positions[1],
+            ),
+            (
+                self._position(symbol="AAPL", quantity=11, current_price=110.0),
+                valued.positions[1],
+            ),
+            (
+                self._position(symbol="AAPL", average_cost=101.0, current_price=110.0),
+                valued.positions[1],
+            ),
+        )
+        for positions in mismatched_positions:
+            with self.subTest(positions=positions), self.assertRaisesRegex(
+                ValueError,
+                "position",
+            ):
+                contracts.ValuationResult(
+                    account=account,
+                    positions=positions,
+                    metrics=valued.metrics,
+                )
+
+    def test_valuation_result_allows_old_account_price_but_checks_derived_values(self):
+        account = self._account(
+            positions=(self._position(current_price=90.0),)
+        )
+        current = valuation.value_account(account, {"AAPL": 110.0})
+        result = contracts.ValuationResult(
+            account=account,
+            positions=current.positions,
+            metrics=current.metrics,
+        )
+        self.assertEqual(result.positions[0].current_price, 110.0)
+
+        other_valuation = valuation.value_account(account, {"AAPL": 120.0})
+        with self.assertRaisesRegex(ValueError, "long_market_value"):
+            contracts.ValuationResult(
+                account=account,
+                positions=current.positions,
+                metrics=other_valuation.metrics,
+            )
+
+    def test_valuation_result_accepts_empty_account_and_positions(self):
+        account = self._account()
+        metrics = valuation.value_account(account, {}).metrics
+
+        result = contracts.ValuationResult(account=account, metrics=metrics)
+
+        self.assertEqual(result.positions, ())
 
     def test_metrics_contract_allows_only_the_defined_infinity_patterns(self):
         values = {

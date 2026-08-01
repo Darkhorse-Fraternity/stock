@@ -235,8 +235,11 @@ def value_account(
         net_exposure_pct=net_exposure_pct,
         margin_rate_pct=margin_rate_pct,
     )
-    valued_account = replace(account, positions=tuple(valued_positions))
-    return ValuationResult(account=valued_account, metrics=metrics)
+    return ValuationResult(
+        account=account,
+        positions=tuple(valued_positions),
+        metrics=metrics,
+    )
 
 
 __all__ = (
