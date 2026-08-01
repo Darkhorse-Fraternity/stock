@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from decimal import Decimal
 
 from ..pipeline import PipelineContractError, StageInput, StageOutput
 from .config import MarginPolicy
@@ -28,6 +29,14 @@ MARGIN_CALL = "MARGIN_CALL"
 
 class MarketPriceMissingError(ValueError):
     """Raised when margin projection lacks a valid current market price."""
+
+
+class IntentSemanticsError(ValueError):
+    """Raised when an intent cannot apply to the projected position state."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 class _ImmutableMarginValue:
@@ -65,6 +74,8 @@ class MarginAdmissionResult(_ImmutableMarginValue):
     buffer_threshold_pct: float
     current_metrics: PortfolioMetrics | None = None
     projected_metrics: PortfolioMetrics | None = None
+    projection_status: str = "COMPLETE"
+    risk_increasing: bool | None = None
 
     def __post_init__(self) -> None:
         if type(self.admitted) is not bool:
@@ -73,6 +84,10 @@ class MarginAdmissionResult(_ImmutableMarginValue):
             raise ValueError("reason must be a non-empty string or None")
         if self.state not in {NORMAL, REDUCE_ONLY, MARGIN_CALL}:
             raise ValueError(f"unsupported margin state: {self.state}")
+        if self.projection_status not in {"COMPLETE", "MARKET_PRICE_MISSING"}:
+            raise ValueError(f"unsupported projection_status: {self.projection_status}")
+        if type(self.risk_increasing) is not bool:
+            raise ValueError("risk_increasing must be a bool")
         for field_name in (
             "required_margin",
             "available_buying_power",
@@ -99,11 +114,38 @@ class MarginAdmissionResult(_ImmutableMarginValue):
             raise ValueError("an admitted margin result must not have a reason")
         if not self.admitted and self.reason is None:
             raise ValueError("a rejected margin result must have a reason")
-        if (self.current_metrics is None) != (self.projected_metrics is None):
-            raise ValueError(
-                "current_metrics and projected_metrics must be provided together"
-            )
-        if self.current_metrics is not None and self.projected_metrics is not None:
+        if self.projected_metrics is None:
+            if self.projection_status != "MARKET_PRICE_MISSING":
+                raise ValueError(
+                    "metrics-free result requires MARKET_PRICE_MISSING projection_status"
+                )
+            if self.state != REDUCE_ONLY:
+                raise ValueError("missing-price result must be REDUCE_ONLY")
+            if any(
+                getattr(self, field_name) != 0.0
+                for field_name in (
+                    "required_margin",
+                    "available_buying_power",
+                    "difference",
+                )
+            ):
+                raise ValueError("missing-price result amounts must be zero")
+            expected_admitted = not self.risk_increasing
+            if self.admitted != expected_admitted:
+                raise ValueError(
+                    "missing-price admission is inconsistent with risk_increasing"
+                )
+            expected_reason = None if expected_admitted else "MARKET_PRICE_MISSING"
+            if self.reason != expected_reason:
+                raise ValueError(
+                    "missing-price result reason is inconsistent with admission"
+                )
+            return
+        if self.current_metrics is None:
+            raise ValueError("projected_metrics requires current_metrics")
+        if self.projection_status != "COMPLETE":
+            raise ValueError("complete metrics require COMPLETE projection_status")
+        if self.current_metrics is not None:
             ratio = self.buffer_threshold_pct / 100.0
             projected_gross = (
                 self.projected_metrics.long_market_value
@@ -144,6 +186,22 @@ class MarginAdmissionResult(_ImmutableMarginValue):
             )
             if self.state != expected_state:
                 raise ValueError("state is inconsistent with projected_metrics")
+            if self.risk_increasing:
+                expected_admitted = expected_state == NORMAL
+                expected_reason = (
+                    None
+                    if expected_admitted
+                    else "MARGIN_CALL"
+                    if expected_state == MARGIN_CALL
+                    else "MARGIN_BUFFER_BREACH"
+                )
+            else:
+                expected_admitted = True
+                expected_reason = None
+            if self.admitted != expected_admitted or self.reason != expected_reason:
+                raise ValueError(
+                    "admission and reason are inconsistent with margin state"
+                )
 
 
 def _validate_policy(policy: object) -> tuple[MarginPolicy, float, float]:
@@ -182,26 +240,57 @@ def _validate_intent_semantics(
         else OrderSide.SELL
     )
     if intent.order_side is not expected_order_side:
-        raise ValueError("order_side is inconsistent with position side and effect")
+        raise IntentSemanticsError(
+            "INVALID_POSITION_EFFECT",
+            "order_side is inconsistent with position side and effect",
+        )
 
     existing = next(
         (position for position in account.positions if position.symbol == intent.symbol),
         None,
     )
     if existing is not None and existing.side is not intent.position_side:
-        raise ValueError("intent position side conflicts with the existing position")
+        raise IntentSemanticsError(
+            "POSITION_SIDE_MISMATCH",
+            "intent position side conflicts with the existing position",
+        )
     if intent.position_effect is PositionEffect.OPEN and existing is not None:
-        raise ValueError("OPEN intent requires no existing position")
+        raise IntentSemanticsError(
+            "INVALID_POSITION_EFFECT",
+            "OPEN intent requires no existing position",
+        )
     if intent.position_effect is PositionEffect.INCREASE and existing is None:
-        raise ValueError("INCREASE intent requires an existing position")
+        raise IntentSemanticsError(
+            "POSITION_NOT_FOUND",
+            "INCREASE intent requires an existing position",
+        )
     if intent.position_effect in {PositionEffect.REDUCE, PositionEffect.CLOSE}:
         if existing is None:
-            raise ValueError("risk-reducing intent requires an existing position")
+            raise IntentSemanticsError(
+                "POSITION_NOT_FOUND",
+                "risk-reducing intent requires an existing position",
+            )
         if intent.position_effect is PositionEffect.CLOSE:
-            if intent.quantity != existing.quantity:
-                raise ValueError("CLOSE quantity must equal the existing quantity")
-        elif intent.quantity >= existing.quantity:
-            raise ValueError("REDUCE quantity must be smaller than the existing quantity")
+            if intent.quantity > existing.quantity:
+                raise IntentSemanticsError(
+                    "POSITION_QUANTITY_EXCEEDED",
+                    "CLOSE quantity exceeds the existing quantity",
+                )
+            if intent.quantity < existing.quantity:
+                raise IntentSemanticsError(
+                    "INVALID_POSITION_EFFECT",
+                    "CLOSE quantity must equal the existing quantity; use REDUCE",
+                )
+        elif intent.quantity > existing.quantity:
+            raise IntentSemanticsError(
+                "POSITION_QUANTITY_EXCEEDED",
+                "REDUCE quantity exceeds the existing quantity",
+            )
+        elif intent.quantity == existing.quantity:
+            raise IntentSemanticsError(
+                "INVALID_POSITION_EFFECT",
+                "REDUCE quantity equals the existing quantity; use CLOSE",
+            )
     return existing
 
 
@@ -239,14 +328,36 @@ def _valuation_prices(
     }
 
 
+def _normalized_projected_margin_rate(
+    current: PortfolioMetrics,
+    projected_account: AccountSnapshot,
+    raw_prices: Mapping[str, object],
+) -> float:
+    """Preserve no-fee equity while normalizing binary price multiplication."""
+
+    gross = sum(
+        (
+            Decimal(str(_price_for(raw_prices, position.symbol)))
+            * position.quantity
+            for position in projected_account.positions
+        ),
+        Decimal(0),
+    )
+    if gross == 0:
+        return math.inf
+    return float(Decimal(str(current.equity)) / gross * Decimal(100))
+
+
 def _updated_positions(
     account: AccountSnapshot,
     intent: OrderIntent,
     existing: PositionSnapshot | None,
-    price: float,
+    price: float | None,
 ) -> tuple[PositionSnapshot, ...]:
     positions = list(account.positions)
     if intent.position_effect in {PositionEffect.OPEN, PositionEffect.INCREASE}:
+        if price is None:
+            raise RuntimeError("risk-increasing projection requires a market price")
         if existing is None:
             positions.append(
                 PositionSnapshot(
@@ -277,7 +388,7 @@ def _updated_positions(
         positions[positions.index(existing)] = replace(
             existing,
             quantity=existing.quantity - intent.quantity,
-            current_price=None,
+            current_price=(None if price is not None else existing.current_price),
         )
     return tuple(positions)
 
@@ -291,8 +402,16 @@ def project_account_for_intent(
 
     existing = _validate_intent_semantics(account, intent)
     raw_prices = _raw_prices(market_or_prices)
-    price = _price_for(raw_prices, intent.symbol)
-    notional = price * intent.quantity
+    try:
+        price = _price_for(raw_prices, intent.symbol)
+    except MarketPriceMissingError:
+        if intent.increases_risk:
+            raise
+        return replace(
+            account,
+            positions=_updated_positions(account, intent, existing, None),
+        )
+    notional = float(Decimal(str(price)) * intent.quantity)
     if not math.isfinite(notional):
         raise ValueError("intent notional must be finite")
 
@@ -336,21 +455,9 @@ def _margin_state(
     gross = metrics.long_market_value + metrics.short_liability
     if gross == 0:
         return NORMAL
-    below_maintenance = metrics.margin_rate_pct < maintenance_pct and not math.isclose(
-        metrics.margin_rate_pct,
-        maintenance_pct,
-        rel_tol=1e-12,
-        abs_tol=1e-12,
-    )
-    if metrics.equity <= 0 or below_maintenance:
+    if metrics.equity <= 0 or metrics.margin_rate_pct < maintenance_pct:
         return MARGIN_CALL
-    below_buffer = metrics.margin_rate_pct < buffer_threshold_pct and not math.isclose(
-        metrics.margin_rate_pct,
-        buffer_threshold_pct,
-        rel_tol=1e-12,
-        abs_tol=1e-12,
-    )
-    if below_buffer:
+    if metrics.margin_rate_pct < buffer_threshold_pct:
         return REDUCE_ONLY
     return NORMAL
 
@@ -369,6 +476,29 @@ def _amounts(
     return required, buying_power, difference
 
 
+def _missing_price_result(
+    intent: OrderIntent,
+    current: PortfolioMetrics | None,
+    maintenance: float,
+    threshold: float,
+) -> MarginAdmissionResult:
+    admitted = not intent.increases_risk
+    return MarginAdmissionResult(
+        admitted=admitted,
+        reason=None if admitted else "MARKET_PRICE_MISSING",
+        state=REDUCE_ONLY,
+        required_margin=0.0,
+        available_buying_power=0.0,
+        difference=0.0,
+        maintenance_margin_pct=maintenance,
+        buffer_threshold_pct=threshold,
+        current_metrics=current,
+        projected_metrics=None,
+        projection_status="MARKET_PRICE_MISSING",
+        risk_increasing=intent.increases_risk,
+    )
+
+
 def admit_margin(
     account: AccountSnapshot,
     intent: OrderIntent,
@@ -382,31 +512,27 @@ def admit_margin(
     raw_prices = _raw_prices(market_or_prices)
     try:
         current = value_account(account, _valuation_prices(account, raw_prices)).metrics
+    except MarketPriceMissingError:
+        current = None
+    try:
         projected_account = project_account_for_intent(account, intent, raw_prices)
+    except MarketPriceMissingError:
+        return _missing_price_result(intent, current, maintenance, threshold)
+    if current is None:
+        return _missing_price_result(intent, None, maintenance, threshold)
+    try:
         projected_prices = _valuation_prices(projected_account, raw_prices)
         projected = value_account(projected_account, projected_prices).metrics
-    except MarketPriceMissingError:
-        if not intent.increases_risk:
-            return MarginAdmissionResult(
-                admitted=True,
-                reason=None,
-                state=REDUCE_ONLY,
-                required_margin=0.0,
-                available_buying_power=0.0,
-                difference=0.0,
-                maintenance_margin_pct=maintenance,
-                buffer_threshold_pct=threshold,
-            )
-        return MarginAdmissionResult(
-            admitted=False,
-            reason="MARKET_PRICE_MISSING",
-            state=REDUCE_ONLY,
-            required_margin=0.0,
-            available_buying_power=0.0,
-            difference=0.0,
-            maintenance_margin_pct=maintenance,
-            buffer_threshold_pct=threshold,
+        projected = replace(
+            projected,
+            margin_rate_pct=_normalized_projected_margin_rate(
+                current,
+                projected_account,
+                raw_prices,
+            ),
         )
+    except MarketPriceMissingError:
+        return _missing_price_result(intent, current, maintenance, threshold)
 
     state = _margin_state(projected, maintenance, threshold)
     required, buying_power, difference = _amounts(current, projected, threshold)
@@ -426,6 +552,7 @@ def admit_margin(
         buffer_threshold_pct=threshold,
         current_metrics=current,
         projected_metrics=projected,
+        risk_increasing=intent.increases_risk,
     )
 
 
@@ -452,11 +579,13 @@ class MarginAdmissionStage:
     ) -> None:
         if type(account) is not AccountSnapshot:
             raise TypeError("account must be AccountSnapshot")
-        _validate_policy(policy)
+        _, maintenance, threshold = _validate_policy(policy)
         _raw_prices(market_or_prices)
         self._account = account
         self._market_or_prices = market_or_prices
         self._policy = policy
+        self._maintenance = maintenance
+        self._threshold = threshold
 
     def evaluate(self, stage_input: StageInput) -> StageOutput:
         matching = [
@@ -488,18 +617,36 @@ class MarginAdmissionStage:
                     self._market_or_prices,
                     self._policy,
                 )
+            except IntentSemanticsError as exc:
+                rejected.append(item)
+                diagnostics.append(
+                    {
+                        "intent_id": item.id,
+                        "symbol": item.symbol,
+                        "admitted": False,
+                        "reason": exc.reason,
+                        "state": REDUCE_ONLY,
+                        "required_margin": 0.0,
+                        "available_buying_power": 0.0,
+                        "difference": 0.0,
+                        "maintenance_margin_pct": self._maintenance,
+                        "buffer_threshold_pct": self._threshold,
+                        "projection_status": "INVALID_INTENT",
+                        "risk_increasing": item.increases_risk,
+                        "current_metrics": None,
+                        "projected_metrics": None,
+                    }
+                )
+                continue
             except (TypeError, ValueError) as exc:
                 raise PipelineContractError(str(exc)) from exc
             if result.admitted:
                 admitted.append(item)
-                try:
-                    projected_account = project_account_for_intent(
-                        projected_account,
-                        item,
-                        self._market_or_prices,
-                    )
-                except MarketPriceMissingError:
-                    pass
+                projected_account = project_account_for_intent(
+                    projected_account,
+                    item,
+                    self._market_or_prices,
+                )
             else:
                 rejected.append(item)
             diagnostics.append(
@@ -514,6 +661,8 @@ class MarginAdmissionStage:
                     "difference": result.difference,
                     "maintenance_margin_pct": result.maintenance_margin_pct,
                     "buffer_threshold_pct": result.buffer_threshold_pct,
+                    "projection_status": result.projection_status,
+                    "risk_increasing": result.risk_increasing,
                     "current_metrics": _metrics_fact(result.current_metrics),
                     "projected_metrics": _metrics_fact(result.projected_metrics),
                 }
@@ -533,6 +682,7 @@ __all__ = (
     "MARGIN_CALL",
     "NORMAL",
     "REDUCE_ONLY",
+    "IntentSemanticsError",
     "MarginAdmissionResult",
     "MarginAdmissionStage",
     "MarketPriceMissingError",

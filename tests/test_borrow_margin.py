@@ -370,16 +370,42 @@ class MarginBehaviorTests(unittest.TestCase):
                 self.assertAlmostEqual(result.projected_metrics.margin_rate_pct, cash)
 
     def test_economic_buffer_boundary_is_stable_across_binary_float_rounding(self):
-        result = margin.admit_margin(
-            account(cash=0.12),
-            intent(quantity=3),
-            {"L": 0.1},
+        cases = (
+            (intent(quantity=3), {"L": 0.1}),
+            (
+                intent("S", position_side=PositionSide.SHORT, quantity=3),
+                {"S": 0.1},
+            ),
+        )
+        for order, prices in cases:
+            with self.subTest(side=order.position_side):
+                result = margin.admit_margin(
+                    account(cash=0.12),
+                    order,
+                    prices,
+                    MarginPolicy(),
+                )
+
+                self.assertEqual(result.state, margin.NORMAL)
+                self.assertTrue(result.admitted)
+                self.assertEqual(result.difference, 0.0)
+
+    def test_public_projection_preserves_nextafter_threshold_strictness(self):
+        below_maintenance = margin.admit_margin(
+            account(cash=math.nextafter(30.0, 0.0)),
+            intent(),
+            {"L": 1.0},
+            MarginPolicy(),
+        )
+        below_buffer = margin.admit_margin(
+            account(cash=math.nextafter(40.0, 0.0)),
+            intent(),
+            {"L": 1.0},
             MarginPolicy(),
         )
 
-        self.assertEqual(result.state, margin.NORMAL)
-        self.assertTrue(result.admitted)
-        self.assertEqual(result.difference, 0.0)
+        self.assertEqual(below_maintenance.state, margin.MARGIN_CALL)
+        self.assertEqual(below_buffer.state, margin.REDUCE_ONLY)
 
     def test_risk_reduction_is_admitted_during_margin_call(self):
         original = account(
@@ -434,6 +460,58 @@ class MarginBehaviorTests(unittest.TestCase):
         ):
             with self.subTest(field=field_name), self.assertRaises(ValueError):
                 replace(result, **{field_name: math.inf})
+
+    def test_metrics_none_rejects_arbitrary_state_and_amounts(self):
+        with self.assertRaises(ValueError):
+            margin.MarginAdmissionResult(
+                admitted=True,
+                reason=None,
+                state=margin.NORMAL,
+                required_margin=999.0,
+                available_buying_power=888.0,
+                difference=777.0,
+                maintenance_margin_pct=30.0,
+                buffer_threshold_pct=40.0,
+                current_metrics=None,
+                projected_metrics=None,
+            )
+
+    def test_complete_metrics_rejects_admission_state_reason_forgery(self):
+        normal = margin.admit_margin(
+            account(cash=50.0), intent(), {"L": 1.0}, MarginPolicy()
+        )
+
+        with self.assertRaises(ValueError):
+            replace(
+                normal,
+                admitted=False,
+                reason="MARGIN_BUFFER_BREACH",
+            )
+
+    def test_nextafter_values_remain_strictly_below_margin_thresholds(self):
+        at_maintenance = margin.admit_margin(
+            account(cash=30.0), intent(), {"L": 1.0}, MarginPolicy()
+        ).projected_metrics
+        at_buffer = margin.admit_margin(
+            account(cash=40.0), intent(), {"L": 1.0}, MarginPolicy()
+        ).projected_metrics
+        below_maintenance = replace(
+            at_maintenance,
+            margin_rate_pct=math.nextafter(30.0, 0.0),
+        )
+        below_buffer = replace(
+            at_buffer,
+            margin_rate_pct=math.nextafter(40.0, 0.0),
+        )
+
+        self.assertEqual(
+            margin._margin_state(below_maintenance, 30.0, 40.0),
+            margin.MARGIN_CALL,
+        )
+        self.assertEqual(
+            margin._margin_state(below_buffer, 30.0, 40.0),
+            margin.REDUCE_ONLY,
+        )
 
     def test_long_buy_consumes_cash_then_creates_margin_loan_without_mutation(self):
         original = account(cash=39.0)
@@ -500,6 +578,114 @@ class MarginBehaviorTests(unittest.TestCase):
         self.assertEqual(increasing.reason, "MARKET_PRICE_MISSING")
         self.assertTrue(reducing.admitted)
         self.assertIsNone(reducing.reason)
+
+    def test_missing_price_result_shapes_are_exact_and_preserve_current_metrics(self):
+        reducing = margin.admit_margin(
+            account(cash=0.0, positions=(position(),), margin_loan=50.0),
+            intent(position_effect=PositionEffect.REDUCE, quantity=10),
+            {},
+            MarginPolicy(),
+        )
+        increasing = margin.admit_margin(
+            account(cash=100.0), intent(), {}, MarginPolicy()
+        )
+
+        self.assertEqual(reducing.projection_status, "MARKET_PRICE_MISSING")
+        self.assertFalse(reducing.risk_increasing)
+        self.assertTrue(reducing.admitted)
+        self.assertIsNone(reducing.reason)
+        self.assertEqual(reducing.state, margin.REDUCE_ONLY)
+        self.assertIsNone(reducing.current_metrics)
+        self.assertIsNone(reducing.projected_metrics)
+        self.assertEqual(
+            (
+                reducing.required_margin,
+                reducing.available_buying_power,
+                reducing.difference,
+            ),
+            (0.0, 0.0, 0.0),
+        )
+        self.assertTrue(
+            all(
+                math.copysign(1.0, value) == 1.0
+                for value in (
+                    reducing.required_margin,
+                    reducing.available_buying_power,
+                    reducing.difference,
+                )
+            )
+        )
+
+        self.assertEqual(increasing.projection_status, "MARKET_PRICE_MISSING")
+        self.assertTrue(increasing.risk_increasing)
+        self.assertFalse(increasing.admitted)
+        self.assertEqual(increasing.reason, "MARKET_PRICE_MISSING")
+        self.assertEqual(increasing.state, margin.REDUCE_ONLY)
+        self.assertIsNotNone(increasing.current_metrics)
+        self.assertIsNone(increasing.projected_metrics)
+        self.assertEqual(increasing.current_metrics.equity, 100.0)
+
+    def test_missing_price_result_rejects_each_nonconservative_mutation(self):
+        result = margin.admit_margin(
+            account(cash=0.0, positions=(position(),)),
+            intent(position_effect=PositionEffect.REDUCE, quantity=10),
+            {},
+            MarginPolicy(),
+        )
+        mutations = (
+            {"state": margin.NORMAL},
+            {"required_margin": 1.0},
+            {"available_buying_power": 1.0},
+            {"difference": 1.0},
+            {"projection_status": "COMPLETE"},
+            {"reason": "MARKET_PRICE_MISSING"},
+        )
+        for updates in mutations:
+            with self.subTest(updates=updates), self.assertRaises(ValueError):
+                replace(result, **updates)
+
+    def test_missing_price_projection_updates_quantity_without_balance_values(self):
+        cases = (
+            (
+                account(
+                    cash=7.0,
+                    positions=(position(quantity=100),),
+                    margin_loan=3.0,
+                    accrued_financing_cost=1.0,
+                ),
+                intent(position_effect=PositionEffect.REDUCE, quantity=60),
+            ),
+            (
+                account(
+                    cash=7.0,
+                    positions=(position("S", PositionSide.SHORT, quantity=100),),
+                    restricted_short_proceeds=100.0,
+                    margin_loan=3.0,
+                    accrued_borrow_cost=2.0,
+                ),
+                intent(
+                    "S",
+                    position_side=PositionSide.SHORT,
+                    position_effect=PositionEffect.REDUCE,
+                    quantity=60,
+                ),
+            ),
+        )
+        for original, reduction in cases:
+            with self.subTest(side=reduction.position_side):
+                projected = margin.project_account_for_intent(original, reduction, {})
+                self.assertEqual(projected.positions[0].quantity, 40)
+                for field_name in (
+                    "available_cash",
+                    "restricted_short_proceeds",
+                    "margin_loan",
+                    "accrued_financing_cost",
+                    "accrued_borrow_cost",
+                ):
+                    self.assertEqual(
+                        getattr(projected, field_name),
+                        getattr(original, field_name),
+                    )
 
     def test_valuation_overflow_is_not_mislabeled_as_missing_market_data(self):
         huge_position = position(quantity=10**308)
@@ -632,6 +818,122 @@ class AdmissionStageTests(unittest.TestCase):
         fact = {"kind": "order_intents", "items": ()}
         with self.assertRaises(PipelineContractError):
             PipelineRunner((stage,)).run(stage_input(fact, fact.copy()))
+
+    def test_missing_price_long_reductions_consume_remaining_quantity_in_order(self):
+        first = intent(position_effect=PositionEffect.REDUCE, quantity=60)
+        second = replace(first, id="intent-L-REDUCE-2")
+        stage = margin.MarginAdmissionStage(
+            account(cash=0.0, positions=(position(quantity=100),)),
+            {},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input({"kind": "order_intents", "items": (first, second)})
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (first,))
+        self.assertEqual(facts[1]["items"], (second,))
+        self.assertEqual(
+            [item["reason"] for item in facts[2]["items"]],
+            [None, "POSITION_QUANTITY_EXCEEDED"],
+        )
+
+    def test_missing_price_short_covers_consume_remaining_quantity_in_order(self):
+        first = intent(
+            "S",
+            position_side=PositionSide.SHORT,
+            position_effect=PositionEffect.REDUCE,
+            quantity=60,
+        )
+        second = replace(first, id="intent-S-REDUCE-2")
+        stage = margin.MarginAdmissionStage(
+            account(
+                cash=0.0,
+                positions=(position("S", PositionSide.SHORT, quantity=100),),
+                restricted_short_proceeds=100.0,
+            ),
+            {},
+            MarginPolicy(),
+        )
+
+        facts = PipelineRunner((stage,)).run(
+            stage_input({"kind": "order_intents", "items": (first, second)})
+        )[0].facts
+
+        self.assertEqual(facts[0]["items"], (first,))
+        self.assertEqual(facts[1]["items"], (second,))
+        self.assertEqual(facts[2]["items"][1]["reason"], "POSITION_QUANTITY_EXCEEDED")
+
+    def test_missing_price_close_must_match_remaining_quantity(self):
+        reduction = intent(position_effect=PositionEffect.REDUCE, quantity=60)
+        cases = (
+            (40, True, None),
+            (39, False, "INVALID_POSITION_EFFECT"),
+            (41, False, "POSITION_QUANTITY_EXCEEDED"),
+        )
+        for close_quantity, admitted, reason in cases:
+            close = replace(
+                intent(position_effect=PositionEffect.CLOSE, quantity=close_quantity),
+                id=f"intent-L-CLOSE-{close_quantity}",
+            )
+            stage = margin.MarginAdmissionStage(
+                account(cash=0.0, positions=(position(quantity=100),)),
+                {},
+                MarginPolicy(),
+            )
+            facts = PipelineRunner((stage,)).run(
+                stage_input(
+                    {"kind": "order_intents", "items": (reduction, close)}
+                )
+            )[0].facts
+
+            with self.subTest(close_quantity=close_quantity):
+                self.assertEqual(close in facts[0]["items"], admitted)
+                self.assertEqual(close in facts[1]["items"], not admitted)
+                self.assertEqual(facts[2]["items"][1]["reason"], reason)
+
+    def test_invalid_position_semantics_are_rejected_with_stable_codes(self):
+        cases = (
+            (
+                account(cash=0.0),
+                intent(position_effect=PositionEffect.REDUCE, quantity=1),
+                "POSITION_NOT_FOUND",
+            ),
+            (
+                account(cash=0.0, positions=(position(quantity=100),)),
+                intent(
+                    position_side=PositionSide.SHORT,
+                    position_effect=PositionEffect.REDUCE,
+                    quantity=1,
+                ),
+                "POSITION_SIDE_MISMATCH",
+            ),
+            (
+                account(cash=0.0, positions=(position(quantity=100),)),
+                intent(
+                    position_effect=PositionEffect.REDUCE,
+                    order_side=OrderSide.BUY,
+                    quantity=1,
+                ),
+                "INVALID_POSITION_EFFECT",
+            ),
+            (
+                account(cash=0.0, positions=(position(quantity=100),)),
+                intent(position_effect=PositionEffect.REDUCE, quantity=100),
+                "INVALID_POSITION_EFFECT",
+            ),
+        )
+        for original, invalid, expected_reason in cases:
+            stage = margin.MarginAdmissionStage(original, {}, MarginPolicy())
+            facts = PipelineRunner((stage,)).run(
+                stage_input({"kind": "order_intents", "items": (invalid,)})
+            )[0].facts
+
+            with self.subTest(expected_reason=expected_reason):
+                self.assertEqual(facts[0]["items"], ())
+                self.assertEqual(facts[1]["items"], (invalid,))
+                self.assertEqual(facts[2]["items"][0]["reason"], expected_reason)
 
 
 if __name__ == "__main__":
