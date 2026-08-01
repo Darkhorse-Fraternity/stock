@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -512,6 +513,7 @@ class CarryAccrualRecord(_DeeplyImmutable):
     accrual_date: date
     elapsed_days: int
     amount: float
+    symbol: str | None = None
 
     def __post_init__(self) -> None:
         _require_string(self.account_id, "account_id")
@@ -522,10 +524,15 @@ class CarryAccrualRecord(_DeeplyImmutable):
         if self.elapsed_days < 0:
             raise ValueError("elapsed_days must be nonnegative")
         _require_nonnegative_finite_number(self.amount, "amount")
+        if self.cost_type is CarryCostType.FINANCING:
+            if self.symbol is not None:
+                raise ValueError("FINANCING accrual must not have a symbol")
+        else:
+            _require_string(self.symbol, "symbol")
 
     @property
-    def idempotency_key(self) -> tuple[str, CarryCostType, date]:
-        return (self.account_id, self.cost_type, self.accrual_date)
+    def idempotency_key(self) -> tuple[str, CarryCostType, date, str | None]:
+        return (self.account_id, self.cost_type, self.accrual_date, self.symbol)
 
 
 @dataclass(frozen=True)
@@ -567,7 +574,7 @@ class AccountSnapshot(_DeeplyImmutable):
             CarryAccrualRecord,
             "carry_accruals",
         )
-        keys: set[tuple[str, CarryCostType, date]] = set()
+        keys: set[tuple[str, CarryCostType, date, str | None]] = set()
         for record in carry_accruals:
             if record.account_id != self.id:
                 raise ValueError("carry accrual account_id must match account id")
@@ -873,6 +880,97 @@ class OrderIntent(_DeeplyImmutable):
         )
 
 
+def stable_execution_intent_id(
+    *,
+    symbol: str,
+    position_side: PositionSide,
+    order_side: OrderSide,
+    position_effect: PositionEffect,
+    quantity: int,
+    reason: str,
+    created_snapshot_id: str,
+) -> str:
+    """Bind an execution-generated ID to every executable intent semantic."""
+
+    material = "|".join(
+        (
+            created_snapshot_id,
+            symbol,
+            position_side.value,
+            order_side.value,
+            position_effect.value,
+            str(quantity),
+            reason,
+        )
+    )
+    return "exec-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def stable_risk_intent_id(
+    snapshot_id: str,
+    position: PositionSnapshot,
+    reason: str,
+) -> str:
+    """Return the established stable ID for a position-level risk exit."""
+
+    material = "|".join(
+        (
+            snapshot_id,
+            position.symbol,
+            position.side.value,
+            str(position.quantity),
+            format(position.average_cost, ".17g"),
+            reason,
+        )
+    )
+    return "risk-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+
+
+def verify_order_intent_id(
+    intent: OrderIntent,
+    existing_position: PositionSnapshot | None = None,
+) -> bool:
+    """Verify execution or risk intent identity without trusting mutable context."""
+
+    if type(intent) is not OrderIntent:
+        raise TypeError("intent must be OrderIntent")
+    if (
+        existing_position is not None
+        and type(existing_position) is not PositionSnapshot
+    ):
+        raise TypeError("existing_position must be PositionSnapshot or None")
+    if intent.id.startswith("exec-"):
+        return intent.id == stable_execution_intent_id(
+            symbol=intent.symbol,
+            position_side=intent.position_side,
+            order_side=intent.order_side,
+            position_effect=intent.position_effect,
+            quantity=intent.quantity,
+            reason=intent.reason,
+            created_snapshot_id=intent.created_snapshot_id,
+        )
+    if not intent.id.startswith("risk-") or existing_position is None:
+        return False
+    expected_order_side = (
+        OrderSide.SELL
+        if existing_position.side is PositionSide.LONG
+        else OrderSide.BUY
+    )
+    return (
+        existing_position.symbol == intent.symbol
+        and existing_position.side is intent.position_side
+        and intent.order_side is expected_order_side
+        and intent.position_effect is PositionEffect.CLOSE
+        and intent.quantity == existing_position.quantity
+        and intent.id
+        == stable_risk_intent_id(
+            intent.created_snapshot_id,
+            existing_position,
+            intent.reason,
+        )
+    )
+
+
 @dataclass(frozen=True)
 class MarketSnapshot(_DeeplyImmutable):
     id: str
@@ -904,6 +1002,26 @@ class ExecutionFill(_DeeplyImmutable):
         _require_string(self.status, "status")
         if self.status not in {"FILLED", "PARTIAL"}:
             raise ValueError("status must be FILLED or PARTIAL")
+
+
+@dataclass(frozen=True)
+class OrderExecutionProgress(_DeeplyImmutable):
+    intent_id: str
+    filled_quantity: int
+    filled_notional: float
+    commission_charged: float
+    status: str
+
+    def __post_init__(self) -> None:
+        _require_string(self.intent_id, "intent_id")
+        _require_positive_quantity(self.filled_quantity)
+        _require_nonnegative_finite_number(self.filled_notional, "filled_notional")
+        _require_nonnegative_finite_number(
+            self.commission_charged,
+            "commission_charged",
+        )
+        if self.status not in {"PARTIAL", "FILLED"}:
+            raise ValueError("status must be PARTIAL or FILLED")
 
 
 @dataclass(frozen=True)
@@ -984,6 +1102,7 @@ _DEEPLY_IMMUTABLE_TYPES = (
     OrderIntent,
     MarketSnapshot,
     ExecutionFill,
+    OrderExecutionProgress,
     PortfolioEvent,
     DecisionBatch,
 )

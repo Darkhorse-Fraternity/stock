@@ -7,7 +7,7 @@ import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, DecimalException, ROUND_DOWN
 
 from ..market_adapters import get_market_adapter
 from ..markets import market_date, next_business_date
@@ -19,12 +19,15 @@ from .contracts import (
     ExecutionFill,
     MarketSnapshot,
     OrderIntent,
+    OrderExecutionProgress,
     OrderSide,
     PositionEffect,
     PositionSide,
     PositionSnapshot,
     PortfolioEvent,
     TargetPosition,
+    stable_execution_intent_id,
+    verify_order_intent_id,
 )
 from .margin import IntentSemanticsError, project_account_for_intent
 
@@ -148,35 +151,6 @@ class ExecutionDiagnostic:
 
 
 @dataclass(frozen=True)
-class OrderExecutionProgress:
-    intent_id: str
-    filled_quantity: int
-    filled_notional: float
-    commission_charged: float
-    status: str
-
-    def __post_init__(self) -> None:
-        if type(self.intent_id) is not str or not self.intent_id:
-            raise ValueError("intent_id must be a non-empty string")
-        if type(self.filled_quantity) is not int:
-            raise TypeError("filled_quantity must be an integer")
-        if self.filled_quantity <= 0:
-            raise ValueError("filled_quantity must be positive")
-        object.__setattr__(
-            self,
-            "filled_notional",
-            _finite_nonnegative(self.filled_notional, "filled_notional"),
-        )
-        object.__setattr__(
-            self,
-            "commission_charged",
-            _finite_nonnegative(self.commission_charged, "commission_charged"),
-        )
-        if self.status not in {"PARTIAL", "FILLED"}:
-            raise ValueError("status must be PARTIAL or FILLED")
-
-
-@dataclass(frozen=True)
 class ExecutionSimulationResult:
     account: AccountSnapshot
     fills: tuple[ExecutionFill, ...] = ()
@@ -209,12 +183,27 @@ class ExecutionSimulationResult:
 
 
 @dataclass(frozen=True)
+class CarryAccrualDiagnostic:
+    symbol: str | None
+    reason: str
+
+    def __post_init__(self) -> None:
+        if self.symbol is not None and (
+            type(self.symbol) is not str or not self.symbol
+        ):
+            raise ValueError("symbol must be a non-empty string or None")
+        if type(self.reason) is not str or not self.reason:
+            raise ValueError("reason must be a non-empty string")
+
+
+@dataclass(frozen=True)
 class CarryAccrualResult:
     account: AccountSnapshot
     financing_cost: float
     borrow_cost: float
     new_accruals: tuple[CarryAccrualRecord, ...] = ()
     events: tuple[PortfolioEvent, ...] = ()
+    diagnostics: tuple[CarryAccrualDiagnostic, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.account) is not AccountSnapshot:
@@ -223,10 +212,13 @@ class CarryAccrualResult:
         borrow = _finite_nonnegative(self.borrow_cost, "borrow_cost")
         records = tuple(self.new_accruals)
         events = tuple(self.events)
+        diagnostics = tuple(self.diagnostics)
         if any(type(item) is not CarryAccrualRecord for item in records):
             raise TypeError("new_accruals items must be CarryAccrualRecord")
         if any(type(item) is not PortfolioEvent for item in events):
             raise TypeError("events items must be PortfolioEvent")
+        if any(type(item) is not CarryAccrualDiagnostic for item in diagnostics):
+            raise TypeError("diagnostics items must be CarryAccrualDiagnostic")
         expected = {
             CarryCostType.FINANCING: financing,
             CarryCostType.BORROW: borrow,
@@ -245,6 +237,7 @@ class CarryAccrualResult:
         object.__setattr__(self, "borrow_cost", borrow)
         object.__setattr__(self, "new_accruals", records)
         object.__setattr__(self, "events", events)
+        object.__setattr__(self, "diagnostics", diagnostics)
 
 
 def _intent_id(
@@ -257,34 +250,24 @@ def _intent_id(
     reason: str,
     created_snapshot_id: str,
 ) -> str:
-    material = "|".join(
-        (
-            created_snapshot_id,
-            symbol,
-            position_side.value,
-            order_side.value,
-            position_effect.value,
-            str(quantity),
-            reason,
-        )
+    return stable_execution_intent_id(
+        symbol=symbol,
+        position_side=position_side,
+        order_side=order_side,
+        position_effect=position_effect,
+        quantity=quantity,
+        reason=reason,
+        created_snapshot_id=created_snapshot_id,
     )
-    return "exec-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
 
 
-def verify_intent_id(intent: OrderIntent) -> bool:
+def verify_intent_id(
+    intent: OrderIntent,
+    existing_position: PositionSnapshot | None = None,
+) -> bool:
     """Return whether an execution intent ID is bound to all intent semantics."""
 
-    if type(intent) is not OrderIntent:
-        raise TypeError("intent must be OrderIntent")
-    return intent.id == _intent_id(
-        symbol=intent.symbol,
-        position_side=intent.position_side,
-        order_side=intent.order_side,
-        position_effect=intent.position_effect,
-        quantity=intent.quantity,
-        reason=intent.reason,
-        created_snapshot_id=intent.created_snapshot_id,
-    )
+    return verify_order_intent_id(intent, existing_position)
 
 
 def intent_for_delta(
@@ -314,7 +297,11 @@ def intent_for_delta(
     if existing is not None and target is not None and existing.symbol != target.symbol:
         raise ValueError("existing and target symbols must match")
 
-    if existing is not None and (target is None or existing.side is not target.side):
+    if existing is not None and (
+        target is None
+        or existing.side is not target.side
+        or target_quantity == 0
+    ):
         side = existing.side
         effect = PositionEffect.CLOSE
         quantity = existing.quantity
@@ -421,6 +408,8 @@ def _validate_risk_intent(
     existing = existing_by_symbol.get(intent.symbol)
     if existing is None or existing.side is not intent.position_side:
         raise ValueError("risk intent must match an existing position")
+    if not verify_intent_id(intent, existing):
+        raise ValueError("risk intent ID does not match its semantics")
     if intent.position_effect is PositionEffect.CLOSE:
         if intent.quantity != existing.quantity:
             raise ValueError("risk CLOSE quantity must equal the existing position")
@@ -483,6 +472,16 @@ def plan_rebalance_intents(
                 equity,
             )
             if reason is not None:
+                if reason == "LOT_TOO_SMALL" and held is not None:
+                    intent = intent_for_delta(
+                        held,
+                        requested,
+                        target_quantity=0,
+                        created_snapshot_id=market.id,
+                    )
+                    if intent is not None:
+                        planned.append(intent)
+                    continue
                 diagnostics.append(PlanningDiagnostic(symbol, reason))
                 continue
             if calculated is None:
@@ -653,6 +652,14 @@ def _fill_price(
     quote: Mapping[str, object],
     policy: ExecutionPolicy,
 ) -> float | None:
+    references: list[float] = []
+    for field_name in ("bar_open", "price"):
+        if field_name not in quote:
+            continue
+        reference = _quote_number(quote, field_name, positive=True)
+        if reference is None:
+            return None
+        references.append(reference)
     base = _quote_number(quote, "bar_open", positive=True)
     if base is None:
         base = _quote_number(quote, "price", positive=True)
@@ -674,17 +681,26 @@ def _fill_price(
         return None
     if high is not None and low is not None and low > high:
         return None
-    slip = Decimal(str(policy.slippage_bps)) / Decimal(10_000)
-    price = Decimal(str(base)) * (
-        Decimal(1) + slip
-        if intent.order_side is OrderSide.BUY
-        else Decimal(1) - slip
-    )
-    if high is not None:
-        price = min(price, Decimal(str(high)))
-    if low is not None:
-        price = max(price, Decimal(str(low)))
-    rounded = float(price.quantize(Decimal("0.0001")))
+    if any(
+        (low is not None and reference < low)
+        or (high is not None and reference > high)
+        for reference in references
+    ):
+        return None
+    try:
+        slip = Decimal(str(policy.slippage_bps)) / Decimal(10_000)
+        price = Decimal(str(base)) * (
+            Decimal(1) + slip
+            if intent.order_side is OrderSide.BUY
+            else Decimal(1) - slip
+        )
+        if high is not None:
+            price = min(price, Decimal(str(high)))
+        if low is not None:
+            price = max(price, Decimal(str(low)))
+        rounded = float(price.quantize(Decimal("0.0001")))
+    except (ArithmeticError, DecimalException, OverflowError, ValueError):
+        return None
     return rounded if math.isfinite(rounded) and rounded > 0 else None
 
 
@@ -731,6 +747,7 @@ def simulate_fill(
     current_snapshot_id: str | None = None,
     previous_filled_notional: float = 0.0,
     commission_charged: float = 0.0,
+    existing_position: PositionSnapshot | None = None,
 ) -> ExecutionFill | None:
     """Simulate at most one paper fill, failing closed on invalid market data."""
 
@@ -738,6 +755,29 @@ def simulate_fill(
         raise TypeError("intent must be OrderIntent")
     if type(policy) is not ExecutionPolicy:
         raise TypeError("policy must be ExecutionPolicy")
+    if not verify_intent_id(intent, existing_position):
+        return None
+    return _simulate_fill_unchecked(
+        intent,
+        quote,
+        policy,
+        current_snapshot_id=current_snapshot_id,
+        previous_filled_notional=previous_filled_notional,
+        commission_charged=commission_charged,
+    )
+
+
+def _simulate_fill_unchecked(
+    intent: OrderIntent,
+    quote: Mapping[str, object] | None,
+    policy: ExecutionPolicy,
+    *,
+    current_snapshot_id: str | None = None,
+    previous_filled_notional: float = 0.0,
+    commission_charged: float = 0.0,
+) -> ExecutionFill | None:
+    """Fill an already-authenticated intent or an internal partial remainder."""
+
     previous_filled_notional = _finite_nonnegative(
         previous_filled_notional, "previous_filled_notional"
     )
@@ -754,28 +794,33 @@ def simulate_fill(
     volume = _quote_number(quote, "bar_volume", positive=True)
     if volume is None:
         return None
-    quantity = _fill_quantity(intent, volume, policy)
-    if quantity <= 0:
+    try:
+        quantity = _fill_quantity(intent, volume, policy)
+        if quantity <= 0:
+            return None
+        price = _fill_price(intent, quote, policy)
+        if price is None:
+            return None
+        notional = Decimal(str(price)) * quantity
+        if not notional.is_finite() or notional <= 0:
+            return None
+        fees = _fees(
+            intent,
+            notional,
+            policy,
+            previous_filled_notional=previous_filled_notional,
+            commission_charged=commission_charged,
+        )
+        return ExecutionFill(
+            intent_id=intent.id,
+            symbol=intent.symbol,
+            quantity=quantity,
+            price=price,
+            fees=fees,
+            status="FILLED" if quantity == intent.quantity else "PARTIAL",
+        )
+    except (ArithmeticError, DecimalException, OverflowError, ValueError):
         return None
-    price = _fill_price(intent, quote, policy)
-    if price is None:
-        return None
-    notional = Decimal(str(price)) * quantity
-    fees = _fees(
-        intent,
-        notional,
-        policy,
-        previous_filled_notional=previous_filled_notional,
-        commission_charged=commission_charged,
-    )
-    return ExecutionFill(
-        intent_id=intent.id,
-        symbol=intent.symbol,
-        quantity=quantity,
-        price=price,
-        fees=fees,
-        status="FILLED" if quantity == intent.quantity else "PARTIAL",
-    )
 
 
 def _unlock_long_positions(
@@ -950,9 +995,40 @@ def execute_intents(
         raise ValueError("prior_progress contains an unknown intent ID")
 
     current = _unlock_long_positions(account, market, policy)
+    initial_by_symbol = {item.symbol: item for item in current.positions}
+    closing_symbols = {
+        item.symbol
+        for item in resolved
+        if item.position_effect is PositionEffect.CLOSE
+        and item.symbol in initial_by_symbol
+        and verify_intent_id(item, initial_by_symbol[item.symbol])
+    }
+    blocked_reversal_ids = {
+        item.id
+        for item in resolved
+        if item.increases_risk and item.symbol in closing_symbols
+    }
     fills: list[ExecutionFill] = []
     diagnostics: list[ExecutionDiagnostic] = []
     for original in resolved:
+        if not verify_intent_id(original, initial_by_symbol.get(original.symbol)):
+            diagnostics.append(
+                ExecutionDiagnostic(
+                    original.id,
+                    original.symbol,
+                    "INVALID_INTENT_ID",
+                )
+            )
+            continue
+        if original.id in blocked_reversal_ids:
+            diagnostics.append(
+                ExecutionDiagnostic(
+                    original.id,
+                    original.symbol,
+                    "SAME_BATCH_REVERSAL_BLOCKED",
+                )
+            )
+            continue
         previous = progress_by_id.get(original.id)
         previously_filled = 0 if previous is None else previous.filled_quantity
         if previously_filled > original.quantity:
@@ -979,7 +1055,7 @@ def execute_intents(
             )
             continue
         quote = market.quotes.get(original.symbol)
-        fill = simulate_fill(
+        fill = _simulate_fill_unchecked(
             executable,
             quote if isinstance(quote, Mapping) else None,
             policy,
@@ -1167,7 +1243,7 @@ def _validate_carry_inputs(
     borrow_apr_by_symbol: Mapping[str, object] | None,
     estimated_borrow_apr_pct: object,
     cost_multiplier: object,
-) -> tuple[float, dict[str, float | None], float, float]:
+) -> tuple[float, dict[str, object], float, float]:
     if type(account) is not AccountSnapshot:
         raise TypeError("account must be AccountSnapshot")
     if type(as_of) is not date:
@@ -1182,13 +1258,11 @@ def _validate_carry_inputs(
         borrow_apr_by_symbol = {}
     if not isinstance(borrow_apr_by_symbol, Mapping):
         raise TypeError("borrow_apr_by_symbol must be a mapping")
-    rates: dict[str, float | None] = {}
+    rates: dict[str, object] = {}
     for symbol, rate in borrow_apr_by_symbol.items():
         if type(symbol) is not str or not symbol:
             raise ValueError("borrow APR symbol must be non-empty")
-        rates[symbol] = (
-            None if rate is None else _finite_nonnegative(rate, "borrow APR")
-        )
+        rates[symbol] = rate
     return financing, rates, estimated, multiplier
 
 
@@ -1196,14 +1270,15 @@ def _accrual_elapsed_days(
     account: AccountSnapshot,
     cost_type: CarryCostType,
     as_of: date,
+    symbol: str | None = None,
 ) -> int | None:
-    key = (account.id, cost_type, as_of)
+    key = (account.id, cost_type, as_of, symbol)
     if any(item.idempotency_key == key for item in account.carry_accruals):
         return None
     previous = [
         item.accrual_date
         for item in account.carry_accruals
-        if item.cost_type is cost_type
+        if item.cost_type is cost_type and item.symbol == symbol
     ]
     start = max(previous) if previous else account.occurred_at.date()
     elapsed = (as_of - start).days
@@ -1241,6 +1316,7 @@ def _carry_event(
             record.account_id,
             record.cost_type.value,
             record.accrual_date.isoformat(),
+            record.symbol or "",
         )
     )
     event_id = "carry-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
@@ -1251,6 +1327,7 @@ def _carry_event(
         data={
             "account_id": record.account_id,
             "cost_type": record.cost_type.value,
+            "symbol": record.symbol,
             "accrual_date": record.accrual_date.isoformat(),
             "elapsed_days": record.elapsed_days,
             "amount": record.amount,
@@ -1268,7 +1345,7 @@ def accrue_carry_costs(
     estimated_borrow_apr_pct: object = 8.0,
     cost_multiplier: object = 1.0,
 ) -> CarryAccrualResult:
-    """Accrue financing and borrow costs once per type/date using actual days."""
+    """Accrue financing per date and borrow per symbol/date using actual days."""
 
     financing_apr, borrow_rates, estimated_apr, multiplier = _validate_carry_inputs(
         account,
@@ -1284,6 +1361,7 @@ def accrue_carry_costs(
         raise TypeError("prices must be a mapping")
 
     new_records: list[CarryAccrualRecord] = []
+    diagnostics: list[CarryAccrualDiagnostic] = []
     amounts: dict[CarryCostType, float] = {
         CarryCostType.FINANCING: 0.0,
         CarryCostType.BORROW: 0.0,
@@ -1308,24 +1386,49 @@ def accrue_carry_costs(
         amounts[CarryCostType.FINANCING] = amount
         new_records.append(
             CarryAccrualRecord(
-                account.id,
-                CarryCostType.FINANCING,
-                as_of,
-                financing_days,
-                amount,
+                account_id=account.id,
+                cost_type=CarryCostType.FINANCING,
+                accrual_date=as_of,
+                elapsed_days=financing_days,
+                amount=amount,
             )
         )
 
-    borrow_days = _accrual_elapsed_days(account, CarryCostType.BORROW, as_of)
-    if borrow_days is not None:
-        borrow_cost = Decimal(0)
-        for held in account.positions:
-            if held.side is not PositionSide.SHORT:
-                continue
-            rate = borrow_rates.get(held.symbol)
-            effective_rate = estimated_apr if rate is None else rate
+    for held in sorted(account.positions, key=lambda item: item.symbol):
+        if held.side is not PositionSide.SHORT:
+            continue
+        borrow_days = _accrual_elapsed_days(
+            account,
+            CarryCostType.BORROW,
+            as_of,
+            held.symbol,
+        )
+        if borrow_days is None:
+            continue
+        raw_rate = borrow_rates.get(held.symbol)
+        try:
+            effective_rate = (
+                estimated_apr
+                if raw_rate is None
+                else _finite_nonnegative(raw_rate, "borrow APR")
+            )
+        except (TypeError, ValueError):
+            diagnostics.append(
+                CarryAccrualDiagnostic(held.symbol, "BORROW_RATE_INVALID")
+            )
+            continue
+        try:
             liability = _short_price(held, prices) * held.quantity
-            borrow_cost += (
+        except ValueError as exc:
+            reason = (
+                "SHORT_PRICE_MISSING"
+                if "missing" in str(exc)
+                else "SHORT_PRICE_INVALID"
+            )
+            diagnostics.append(CarryAccrualDiagnostic(held.symbol, reason))
+            continue
+        try:
+            borrow_cost = (
                 liability
                 * Decimal(str(effective_rate))
                 / Decimal(100)
@@ -1333,22 +1436,36 @@ def accrue_carry_costs(
                 / Decimal(365)
                 * Decimal(str(multiplier))
             )
-        amount = float(borrow_cost)
+            amount = float(borrow_cost)
+        except (ArithmeticError, DecimalException, OverflowError, ValueError):
+            diagnostics.append(
+                CarryAccrualDiagnostic(held.symbol, "BORROW_COST_INVALID")
+            )
+            continue
         if not math.isfinite(amount) or amount < 0:
-            raise ValueError("borrow cost must be finite and nonnegative")
-        amounts[CarryCostType.BORROW] = amount
+            diagnostics.append(
+                CarryAccrualDiagnostic(held.symbol, "BORROW_COST_INVALID")
+            )
+            continue
+        amounts[CarryCostType.BORROW] += amount
         new_records.append(
             CarryAccrualRecord(
-                account.id,
-                CarryCostType.BORROW,
-                as_of,
-                borrow_days,
-                amount,
+                account_id=account.id,
+                cost_type=CarryCostType.BORROW,
+                accrual_date=as_of,
+                elapsed_days=borrow_days,
+                amount=amount,
+                symbol=held.symbol,
             )
         )
 
     if not new_records:
-        return CarryAccrualResult(account, 0.0, 0.0)
+        return CarryAccrualResult(
+            account,
+            0.0,
+            0.0,
+            diagnostics=tuple(diagnostics),
+        )
     total = sum(amounts.values(), 0.0)
     if not math.isfinite(total):
         raise ValueError("carry cost total must be finite")
@@ -1376,6 +1493,7 @@ def accrue_carry_costs(
         amounts[CarryCostType.BORROW],
         tuple(new_records),
         events,
+        tuple(diagnostics),
     )
 
 

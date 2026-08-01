@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -23,6 +22,7 @@ from .contracts import (
     PositionSide,
     PositionSnapshot,
     freeze_immutable,
+    stable_risk_intent_id,
 )
 from .margin import project_account_for_intent
 from .valuation import ValuationError, value_account
@@ -407,17 +407,7 @@ def _stable_intent_id(
 ) -> str:
     if type(snapshot_id) is not str or not snapshot_id:
         raise RiskError("snapshot_id must be a non-empty string")
-    material = "|".join(
-        (
-            snapshot_id,
-            position.symbol,
-            position.side.value,
-            str(position.quantity),
-            format(float(position.average_cost), ".17g"),
-            reason,
-        )
-    )
-    return "risk-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:24]
+    return stable_risk_intent_id(snapshot_id, position, reason)
 
 
 def _close_intent(
