@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Mapping, Protocol
 
+from .borrow import BorrowSnapshot
 from .contracts import (
     DecisionBatch,
     EventCalendar,
@@ -27,7 +28,7 @@ class BorrowProvider(Protocol):
         self,
         symbols: tuple[str, ...],
         occurred_at: datetime,
-    ) -> Mapping[str, Mapping[str, Any]]: ...
+    ) -> BorrowSnapshot: ...
 
 
 class EventCalendarProvider(Protocol):
