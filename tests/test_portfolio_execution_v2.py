@@ -19,6 +19,7 @@ from stock_recommender.portfolio_engine.contracts import (
     TargetPosition,
 )
 from stock_recommender.portfolio_engine.risk import evaluate_position_risk
+from stock_recommender.markets import market_date
 from stock_recommender.parameters import default_portfolio_config
 from stock_recommender.pipeline import PipelineContractError, PipelineRunner, StageInput
 
@@ -575,6 +576,34 @@ class AccountExecutionTests(unittest.TestCase):
         self.assertEqual(closed.account.margin_loan, 0.0)
         self.assertEqual(closed.account.available_cash, 50.0)
 
+    def test_fee_only_margin_loan_gets_financing_lifecycle_and_accrues(self):
+        policy = replace(
+            self._zero_cost_policy("us", participation=100.0),
+            minimum_commission=5.0,
+        )
+        intent = execution.intent_for_delta(
+            None,
+            target("L"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        filled = execution.execute_intents(
+            account(cash=1_000.0),
+            (intent,),
+            self._market("market-2", NOW, "L", 100.0),
+            policy,
+        )
+
+        self.assertEqual(filled.account.margin_loan, 5.0)
+        self.assertIsNotNone(filled.account.financing_lifecycle)
+        carry = execution.accrue_carry_costs(
+            filled.account,
+            as_of=market_date(NOW, "us") + timedelta(days=1),
+            financing_apr_pct=3_650.0,
+        )
+        self.assertEqual(carry.financing_cost, 0.5)
+        self.assertEqual(carry.new_accruals[0].elapsed_days, 1)
+
     def test_cn_t_plus_one_blocks_risk_exit_until_next_business_date(self):
         shanghai = ZoneInfo("Asia/Shanghai")
         friday = datetime(2026, 7, 31, 10, 0, tzinfo=shanghai)
@@ -907,6 +936,7 @@ class AccountExecutionTests(unittest.TestCase):
             "position_side": PositionSide.LONG,
             "order_side": OrderSide.BUY,
             "intent_quantity": 10,
+            "execution_policy_fingerprint": progress.execution_policy_fingerprint,
             "fills": progress.fills,
         }
         for aggregate_name in ("commission_charged", "filled_notional"):
@@ -928,6 +958,100 @@ class AccountExecutionTests(unittest.TestCase):
                     progress.fills[0],
                     **{field_name: forged_value},
                 )
+
+    def test_resigned_claimed_fees_cannot_waive_partial_commission(self):
+        policy = replace(
+            self._zero_cost_policy("us", participation=100.0),
+            minimum_commission=5.0,
+        )
+        intent = execution.intent_for_delta(
+            None,
+            target("A"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        first = execution.execute_intents(
+            account(cash=2_000.0),
+            (intent,),
+            self._market(
+                "market-2",
+                NOW + timedelta(minutes=5),
+                "A",
+                100.0,
+                volume=4,
+            ),
+            policy,
+        )
+        original_fill = first.progress[0].fills[0]
+        forged_values = {
+            "intent_id": original_fill.intent_id,
+            "symbol": original_fill.symbol,
+            "position_side": original_fill.position_side,
+            "order_side": original_fill.order_side,
+            "snapshot_id": original_fill.snapshot_id,
+            "occurred_at": original_fill.occurred_at,
+            "quantity": original_fill.quantity,
+            "price": original_fill.price,
+            "fees": 999.0,
+            "commission": 999.0,
+            "status": original_fill.status,
+        }
+        forged_fill = domain_contracts.ExecutionProgressFill(
+            id=domain_contracts.stable_execution_progress_fill_id(
+                **forged_values
+            ),
+            **forged_values,
+        )
+        forged_progress = replace(first.progress[0], fills=(forged_fill,))
+
+        with self.assertRaisesRegex(ValueError, "commission|fees"):
+            execution.execute_intents(
+                first.account,
+                (intent,),
+                self._market(
+                    "market-3",
+                    NOW + timedelta(minutes=10),
+                    "A",
+                    100.0,
+                    volume=6,
+                ),
+                policy,
+                prior_progress=(forged_progress,),
+            )
+
+    def test_partial_progress_rejects_execution_policy_change(self):
+        policy = replace(
+            self._zero_cost_policy("us", participation=100.0),
+            minimum_commission=5.0,
+        )
+        intent = execution.intent_for_delta(
+            None,
+            target("A"),
+            target_quantity=10,
+            created_snapshot_id="market-1",
+        )
+        first = execution.execute_intents(
+            account(cash=2_000.0),
+            (intent,),
+            self._market("market-2", NOW, "A", 100.0, volume=4),
+            policy,
+        )
+        changed = replace(policy, commission_rate_pct=1.0)
+
+        with self.assertRaisesRegex(ValueError, "policy"):
+            execution.execute_intents(
+                first.account,
+                (intent,),
+                self._market(
+                    "market-3",
+                    NOW + timedelta(minutes=5),
+                    "A",
+                    100.0,
+                    volume=6,
+                ),
+                changed,
+                prior_progress=first.progress,
+            )
 
     def test_execution_rotates_carry_lifecycles_only_after_full_exit(self):
         policy = self._zero_cost_policy("us", participation=100.0)
@@ -1159,6 +1283,9 @@ class AccountExecutionTests(unittest.TestCase):
             position_side=PositionSide.LONG,
             order_side=OrderSide.BUY,
             intent_quantity=1,
+            execution_policy_fingerprint=execution.execution_policy_fingerprint(
+                self._zero_cost_policy()
+            ),
             fills=(progress_fill,),
         )
         self.assertIs(type(progress), domain_contracts.OrderExecutionProgress)

@@ -87,6 +87,32 @@ class ExecutionPolicy:
             raise ValueError("max_bar_participation_pct must be in (0, 100]")
 
 
+_EXECUTION_POLICY_FINGERPRINT_VERSION = "execution-policy-v1"
+
+
+def execution_policy_fingerprint(policy: ExecutionPolicy) -> str:
+    """Bind resumable execution progress to every fee and fill convention."""
+
+    if type(policy) is not ExecutionPolicy:
+        raise TypeError("policy must be ExecutionPolicy")
+    material = "\x1f".join(
+        (
+            _EXECUTION_POLICY_FINGERPRINT_VERSION,
+            policy.market,
+            str(policy.lot_size),
+            "1" if policy.same_day_sell else "0",
+            format(policy.commission_rate_pct, ".17g"),
+            format(policy.minimum_commission, ".17g"),
+            format(policy.stamp_duty_rate_pct, ".17g"),
+            format(policy.transfer_fee_rate_pct, ".17g"),
+            format(policy.slippage_bps, ".17g"),
+            format(policy.max_bar_participation_pct, ".17g"),
+        )
+    )
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"{_EXECUTION_POLICY_FINGERPRINT_VERSION}:{digest}"
+
+
 def execution_policy(market: object, config: Mapping[str, object]) -> ExecutionPolicy:
     """Resolve fees and lot/session rules through the existing market adapter."""
 
@@ -713,10 +739,9 @@ def _fees(
     policy: ExecutionPolicy,
     *,
     previous_filled_notional: float,
-    commission_charged: float,
 ) -> float:
     previous = Decimal(str(previous_filled_notional))
-    charged = Decimal(str(commission_charged))
+    charged = _commission_entitlement(previous, policy)
     cumulative = previous + notional
     commission = max(
         Decimal(str(policy.minimum_commission)),
@@ -742,6 +767,76 @@ def _fees(
     return 0.0 if result == 0.0 else result
 
 
+def _commission_entitlement(
+    cumulative_notional: Decimal,
+    policy: ExecutionPolicy,
+) -> Decimal:
+    if cumulative_notional <= 0:
+        return Decimal(0)
+    return max(
+        Decimal(str(policy.minimum_commission)),
+        cumulative_notional
+        * Decimal(str(policy.commission_rate_pct))
+        / Decimal(100),
+    )
+
+
+def _canonical_progress_notional(progress: OrderExecutionProgress) -> Decimal:
+    return sum(
+        (
+            Decimal(str(fill.price)) * fill.quantity
+            for fill in progress.fills
+        ),
+        Decimal(0),
+    )
+
+
+def _validate_progress_cost_history(
+    progress: OrderExecutionProgress,
+    policy: ExecutionPolicy,
+) -> None:
+    """Audit claims against canonical fill facts; claims never grant entitlement."""
+
+    cumulative_notional = Decimal(0)
+    for fill in progress.fills:
+        prior_commission = _commission_entitlement(cumulative_notional, policy)
+        fill_notional = Decimal(str(fill.price)) * fill.quantity
+        cumulative_notional += fill_notional
+        expected_commission = float(
+            _commission_entitlement(cumulative_notional, policy)
+            - prior_commission
+        )
+        transfer = (
+            fill_notional
+            * Decimal(str(policy.transfer_fee_rate_pct))
+            / Decimal(100)
+        )
+        stamp = (
+            fill_notional
+            * Decimal(str(policy.stamp_duty_rate_pct))
+            / Decimal(100)
+            if fill.order_side is OrderSide.SELL
+            else Decimal(0)
+        )
+        expected_fees = expected_commission + float(transfer + stamp)
+        if not math.isclose(
+            fill.commission,
+            expected_commission,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError(
+                "prior progress commission does not match canonical fill facts"
+            )
+        if not math.isclose(
+            fill.fees,
+            expected_fees,
+            rel_tol=1e-12,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("prior progress fees do not match canonical fill facts")
+
+
 def simulate_fill(
     intent: OrderIntent,
     quote: Mapping[str, object] | None,
@@ -749,7 +844,6 @@ def simulate_fill(
     *,
     current_snapshot_id: str | None = None,
     previous_filled_notional: float = 0.0,
-    commission_charged: float = 0.0,
     existing_position: PositionSnapshot | None = None,
 ) -> ExecutionFill | None:
     """Simulate at most one paper fill, failing closed on invalid market data."""
@@ -766,7 +860,6 @@ def simulate_fill(
         policy,
         current_snapshot_id=current_snapshot_id,
         previous_filled_notional=previous_filled_notional,
-        commission_charged=commission_charged,
     )
 
 
@@ -777,15 +870,11 @@ def _simulate_fill_unchecked(
     *,
     current_snapshot_id: str | None = None,
     previous_filled_notional: float = 0.0,
-    commission_charged: float = 0.0,
 ) -> ExecutionFill | None:
     """Fill an already-authenticated intent or an internal partial remainder."""
 
     previous_filled_notional = _finite_nonnegative(
         previous_filled_notional, "previous_filled_notional"
-    )
-    commission_charged = _finite_nonnegative(
-        commission_charged, "commission_charged"
     )
     if current_snapshot_id is not None:
         if type(current_snapshot_id) is not str or not current_snapshot_id:
@@ -812,7 +901,6 @@ def _simulate_fill_unchecked(
             notional,
             policy,
             previous_filled_notional=previous_filled_notional,
-            commission_charged=commission_charged,
         )
         return ExecutionFill(
             intent_id=intent.id,
@@ -1076,6 +1164,7 @@ def _fill_failure_reason(
 def _validate_prior_progress_binding(
     intent: OrderIntent,
     progress: OrderExecutionProgress,
+    policy: ExecutionPolicy,
 ) -> None:
     if progress.intent_id != intent.id:
         raise ValueError("prior progress intent_id does not match intent")
@@ -1087,6 +1176,9 @@ def _validate_prior_progress_binding(
         raise ValueError("prior progress order side does not match intent")
     if progress.intent_quantity != intent.quantity:
         raise ValueError("prior progress quantity does not match intent")
+    if progress.execution_policy_fingerprint != execution_policy_fingerprint(policy):
+        raise ValueError("prior progress execution policy does not match current policy")
+    _validate_progress_cost_history(progress, policy)
     if progress.filled_quantity > intent.quantity:
         raise ValueError("prior progress exceeds intent quantity")
     if progress.filled_quantity == intent.quantity:
@@ -1165,13 +1257,14 @@ def execute_intents(
         raise ValueError("prior_progress contains an unknown intent ID")
 
     current = _unlock_long_positions(account, market, policy)
+    policy_fingerprint = execution_policy_fingerprint(policy)
     initial_by_symbol = {item.symbol: item for item in current.positions}
     identity_position_by_id: dict[str, PositionSnapshot | None] = {}
     valid_intent_ids: set[str] = set()
     for item in resolved:
         previous = progress_by_id.get(item.id)
         if previous is not None:
-            _validate_prior_progress_binding(item, previous)
+            _validate_prior_progress_binding(item, previous, policy)
         identity_position = _identity_position_for_progress(
             item,
             initial_by_symbol.get(item.symbol),
@@ -1241,17 +1334,21 @@ def execute_intents(
             )
             continue
         quote = market.quotes.get(original.symbol)
+        prior_notional_decimal = (
+            Decimal(0)
+            if previous is None
+            else _canonical_progress_notional(previous)
+        )
+        prior_commission_decimal = _commission_entitlement(
+            prior_notional_decimal,
+            policy,
+        )
         fill = _simulate_fill_unchecked(
             executable,
             quote if isinstance(quote, Mapping) else None,
             policy,
             current_snapshot_id=market.id,
-            previous_filled_notional=(
-                0.0 if previous is None else previous.filled_notional
-            ),
-            commission_charged=(
-                0.0 if previous is None else previous.commission_charged
-            ),
+            previous_filled_notional=float(prior_notional_decimal),
         )
         if fill is None:
             diagnostics.append(
@@ -1301,13 +1398,6 @@ def execute_intents(
                 )
             )
             continue
-        current = _apply_accrual_lifecycles(
-            before_fill,
-            current,
-            original,
-            market,
-            policy,
-        )
         current = _apply_position_sellability(
             before_fill,
             current,
@@ -1317,23 +1407,23 @@ def execute_intents(
             policy,
         )
         current = _charge_fee(current, fill.fees)
+        current = _apply_accrual_lifecycles(
+            before_fill,
+            current,
+            original,
+            market,
+            policy,
+        )
         current = replace(current, occurred_at=market.occurred_at)
         fills.append(fill)
-        prior_notional = 0.0 if previous is None else previous.filled_notional
-        prior_commission = 0.0 if previous is None else previous.commission_charged
-        notional = float(Decimal(str(fill.price)) * fill.quantity)
-        cumulative_notional = prior_notional + notional
-        required_commission = max(
-            Decimal(str(policy.minimum_commission)),
-            Decimal(str(cumulative_notional))
-            * Decimal(str(policy.commission_rate_pct))
-            / Decimal(100),
+        cumulative_notional_decimal = (
+            prior_notional_decimal
+            + Decimal(str(fill.price)) * fill.quantity
         )
-        cumulative_commission = max(
-            Decimal(str(prior_commission)),
-            required_commission,
+        incremental_commission = float(
+            _commission_entitlement(cumulative_notional_decimal, policy)
+            - prior_commission_decimal
         )
-        incremental_commission = float(cumulative_commission) - prior_commission
         progress_fill_values = {
             "intent_id": original.id,
             "symbol": original.symbol,
@@ -1357,6 +1447,7 @@ def execute_intents(
             position_side=original.position_side,
             order_side=original.order_side,
             intent_quantity=original.quantity,
+            execution_policy_fingerprint=policy_fingerprint,
             fills=(
                 *(previous.fills if previous is not None else ()),
                 progress_fill,
@@ -1755,6 +1846,7 @@ __all__ = (
     "PlanningDiagnostic",
     "RebalanceIntentStage",
     "execution_policy",
+    "execution_policy_fingerprint",
     "execute_intents",
     "accrue_carry_costs",
     "intent_for_delta",

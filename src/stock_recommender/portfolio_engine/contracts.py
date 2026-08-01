@@ -1134,6 +1134,7 @@ class OrderExecutionProgress(_DeeplyImmutable):
     position_side: PositionSide
     order_side: OrderSide
     intent_quantity: int
+    execution_policy_fingerprint: str
     fills: tuple[ExecutionProgressFill, ...]
     position_average_cost: float | None = None
 
@@ -1143,6 +1144,10 @@ class OrderExecutionProgress(_DeeplyImmutable):
         _require_enum(self.position_side, PositionSide, "position_side")
         _require_enum(self.order_side, OrderSide, "order_side")
         _require_positive_quantity(self.intent_quantity)
+        _require_string(
+            self.execution_policy_fingerprint,
+            "execution_policy_fingerprint",
+        )
         fills = _typed_tuple(self.fills, ExecutionProgressFill, "fills")
         if not fills:
             raise ValueError("fills must not be empty")
