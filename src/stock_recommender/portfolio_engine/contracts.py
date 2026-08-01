@@ -64,10 +64,58 @@ def _deep_freeze(value: Any) -> Any:
     return _deep_freeze_value(value, set())
 
 
+def _assert_deeply_immutable_enum_value(member: Enum) -> None:
+    """Reject Enum members whose original value graph contains mutable data."""
+
+    owner_name = type(member).__name__
+
+    def visit(value: Any, active: set[int]) -> None:
+        if value is None or type(value) in {
+            bool,
+            int,
+            float,
+            str,
+            bytes,
+            date,
+            datetime,
+        }:
+            return
+        if isinstance(value, Enum):
+            identity = id(value)
+            if identity in active:
+                raise TypeError(f"Enum {owner_name} contains a cyclic Enum value")
+            active.add(identity)
+            try:
+                visit(value.value, active)
+            finally:
+                active.remove(identity)
+            return
+        if type(value) in {tuple, frozenset}:
+            identity = id(value)
+            if identity in active:
+                raise TypeError(f"Enum {owner_name} contains a cyclic value")
+            active.add(identity)
+            try:
+                for item in value:
+                    visit(item, active)
+            finally:
+                active.remove(identity)
+            return
+        raise TypeError(
+            f"Enum {owner_name} has mutable or unsupported value type: "
+            f"{type(value).__name__}"
+        )
+
+    visit(member.value, {id(member)})
+
+
 def _deep_freeze_value(value: Any, active: set[int]) -> Any:
+    if isinstance(value, Enum):
+        _assert_deeply_immutable_enum_value(value)
+        return value
     if value is None or isinstance(
         value,
-        (bool, int, float, str, bytes, Enum, date, datetime, _DeeplyImmutable),
+        (bool, int, float, str, bytes, date, datetime, _DeeplyImmutable),
     ):
         return value
     if isinstance(value, (bytearray, memoryview)):

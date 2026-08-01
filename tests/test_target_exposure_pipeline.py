@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
+from enum import Enum
 
 from stock_recommender.pipeline import (
     PipelineContractError,
@@ -104,6 +105,14 @@ def stage_input(*facts):
 class MutableLeaf:
     def __init__(self, value="mutable"):
         self.value = value
+
+
+class MutableEnum(Enum):
+    VALUE = []
+
+
+class DeepImmutableEnum(Enum):
+    VALUE = ("safe", frozenset({1, 2}))
 
 
 class TargetNettingTests(unittest.TestCase):
@@ -509,6 +518,14 @@ class ExposureAllocationTests(unittest.TestCase):
                 rejections=({"reason": "INVALID", "value": MutableLeaf()},)
             )
 
+    def test_diagnostic_rejects_enum_with_mutable_value(self):
+        with self.assertRaisesRegex(TypeError, "MutableEnum"):
+            ExposureDiagnostic(
+                rejections=(
+                    {"reason": "INVALID", "value": MutableEnum.VALUE},
+                )
+            )
+
 
 class TargetExposureStageTests(unittest.TestCase):
     def test_stages_emit_versioned_target_and_diagnostic_facts(self):
@@ -792,6 +809,48 @@ class PortfolioContractDeepcopyTests(unittest.TestCase):
                 thesis_id="thesis-1",
                 facts={mutable_key: "value"},
             )
+
+    def test_signal_facts_reject_enum_with_mutable_value(self):
+        with self.assertRaisesRegex(TypeError, "MutableEnum"):
+            SignalCandidate(
+                symbol="AAPL",
+                side=PositionSide.LONG,
+                score=0.9,
+                requested_weight_pct=10.0,
+                model_id="long-v1",
+                thesis_id="thesis-1",
+                facts={"value": MutableEnum.VALUE},
+            )
+
+    def test_deeply_immutable_enum_values_remain_supported(self):
+        candidate = SignalCandidate(
+            symbol="AAPL",
+            side=PositionSide.LONG,
+            score=0.9,
+            requested_weight_pct=10.0,
+            model_id="long-v1",
+            thesis_id="thesis-1",
+            facts={
+                "side": PositionSide.LONG,
+                "nested": DeepImmutableEnum.VALUE,
+            },
+        )
+        diagnostic = ExposureDiagnostic(
+            rejections=(
+                {
+                    "reason": "SAFE",
+                    "side": PositionSide.LONG,
+                    "nested": DeepImmutableEnum.VALUE,
+                },
+            )
+        )
+
+        self.assertIs(candidate.facts["side"], PositionSide.LONG)
+        self.assertIs(candidate.facts["nested"], DeepImmutableEnum.VALUE)
+        self.assertIs(
+            diagnostic.rejections[0]["nested"],
+            DeepImmutableEnum.VALUE,
+        )
 
 
 if __name__ == "__main__":
