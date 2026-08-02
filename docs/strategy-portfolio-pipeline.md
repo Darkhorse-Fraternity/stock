@@ -110,7 +110,9 @@ Hermes 可通过以下环境变量同步三个现有任务：
 
 ## PostgreSQL 迁移与隔离集成测试
 
-`PostgresLedgerStore` 是可选适配器，生产 JSON 账本不依赖 Psycopg。PostgreSQL 仍保存同一份严格 canonical ledger graph，并用事务、行锁和数据库主键 `(strategy_id, run_key)` 保证跨进程幂等。策略表现读取仍返回 `PortfolioPerformanceLedgerView`，不向服务层暴露数据库 JSON。
+`PostgresLedgerStore` 是独立的可选适配器，不继承 JSON 或内存账本；生产 JSON 部署也不依赖 Psycopg。PostgreSQL 把 canonical 事实拆分到 14 张规范化表：账户、持仓、借券与融资生命周期、已提交批次、订单意图、执行进度、成交、持仓风险事实与更新、结算更新、费用计提、事件和 revision 迁移。`batch_payload` 只用于精确重放已提交批次，当前账户、开放订单和策略表现都从类型化关系表重建，不保存或读取整份 `ledger_state`。
+
+每次提交在一个数据库事务内完成：先对策略账户行 `FOR UPDATE`，再检查来源快照和 revision，写入 canonical 事实，最后更新当前账户。数据库主键 `(strategy_id, run_key)` 与逐类事实唯一键共同保证跨进程幂等；同一 run/request 的不同事实必须只有一个提交成功，另一方得到明确冲突。策略表现读取仍返回 `PortfolioPerformanceLedgerView`，不向服务层暴露 SQL 或 JSON 存储细节。
 
 迁移前先执行 preflight：确认目标 PostgreSQL 版本和容量、校验连接账户只拥有目标应用 schema 的权限、检查当前 JSON 账本完整性，并分别对应用目录、策略配置和组合账本创建带时间戳的备份。先在空的预演 schema 执行建表和全量校验；只有 preflight 全部通过才允许 apply。schema 与表标识符必须使用 Psycopg `Identifier`，不得拼接用户输入。
 
@@ -125,6 +127,8 @@ env STOCK_AGENT_TEST_DATABASE_URL="$STOCK_AGENT_TEST_DATABASE_URL" \
   tests.test_month_long_short_integration -v
 ```
 
-不设置 `STOCK_AGENT_TEST_DATABASE_URL` 时测试必须明确显示 `requires Docker PostgreSQL` 并跳过，不能伪装成已验证。一个月集成场景固定重放 22 个 session，逐日比较 PostgreSQL Paper 与内存回测的 canonical event、fill、position 和 NAV 指纹，并覆盖缺失/撤销借券、逼空、部分成交、融资费、借券费、保证金缓冲和强制风控。
+不设置 `STOCK_AGENT_TEST_DATABASE_URL` 时测试必须明确显示 `requires Docker PostgreSQL` 并跳过，不能伪装成已验证。一个月集成场景固定重放 22 个 session；回测和 Paper 只共享行情、借券与策略输入，各自通过独立 orchestration 路径运行。测试逐日比较已提交批次、订单、执行进度、成交、风险、结算、费用、事件、持仓和完整 NAV 指纹，并覆盖缺失/撤销借券、逼空、部分成交、融资费、借券费、保证金缓冲和强制风控。
+
+隔离测试还会在运行前后计算所有非测试用户表的定义哈希、行数和无序行内容哈希，要求三者完全一致，并确认临时测试 schema 数量归零。双连接并发用例同时验证重复批次只写一份事实、冲突批次只有一个赢家，不能用单进程锁代替数据库约束。
 
 apply 失败或发布后校验失败时立即停止写入，保留失败现场用于诊断；从迁移前的时间戳备份恢复应用目录、策略配置和组合账本，再校验原 JSON 账本及现有 `LONG_ONLY` 策略可读。不得用空账本覆盖生产账本，也不得在未验证备份可恢复前删除旧数据。
