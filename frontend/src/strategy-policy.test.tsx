@@ -22,13 +22,34 @@ function draft(mode: ExposureMode = "LONG_ONLY"): StrategyConfig {
 
 function Harness({ market = "us", confirm = vi.fn(() => true), save, run = vi.fn() }: { market?: "cn" | "us"; confirm?: () => boolean; save: (payload: StrategyConfig) => Promise<ConfigPayload>; run?: () => void }) {
   const [config, setConfig] = useState(() => draft())
-  const flow = useStrategySaveFlow({ config, market, confirm, save, onSaved: (payload) => setConfig(payload.config) })
+  const [generation, setGeneration] = useState(0)
+  const [dirty, setDirty] = useState(false)
+  const editMode = (mode: ExposureMode) => {
+    setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, mode } }))
+    setGeneration((current) => current + 1)
+    setDirty(true)
+  }
+  const flow = useStrategySaveFlow({
+    config,
+    market,
+    confirm,
+    draftGeneration: generation,
+    save,
+    onSaved: (payload, reconciliation) => {
+      if (!reconciliation.draftChanged) {
+        setConfig(payload.config)
+        setDirty(false)
+      } else {
+        setConfig((current) => ({ ...current, revision: payload.config.revision, updated_at: payload.config.updated_at }))
+      }
+    },
+  })
   return <>
-    <button onClick={() => setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, mode: "LONG_SHORT" } }))}>short</button>
-    <button onClick={() => setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, mode: "LONG_ONLY" } }))}>long</button>
+    <button onClick={() => editMode("LONG_SHORT")}>short</button>
+    <button onClick={() => editMode("LONG_ONLY")}>long</button>
     <button onClick={() => void flow.save()}>save</button>
     <button onClick={() => void flow.beforeRun().then(run).catch(() => undefined)}>run</button>
-    <output>{config.exposure_policy.mode}</output>
+    <output data-dirty={dirty}>{config.exposure_policy.mode}</output>
   </>
 }
 
@@ -80,13 +101,26 @@ describe("strategy policy save flow", () => {
     expect(save.mock.calls[0][0].exposure_policy.mode).toBe("LONG_ONLY")
   })
 
-  it("sends the latest draft and keeps an in-flight payload immutable", async () => {
-    let release!: () => void
-    const save = vi.fn((payload: StrategyConfig) => new Promise<ConfigPayload>((resolve) => { release = () => resolve(response(payload)) }))
-    act(() => root.render(<Harness save={save} />))
-    await click("short"); await click("save"); await click("long")
+  it("preserves an edit made during save, rejects a stale run, and sends the new draft next", async () => {
+    const releases: Array<() => void> = []
+    const run = vi.fn()
+    const save = vi.fn((payload: StrategyConfig) => new Promise<ConfigPayload>((resolve) => {
+      releases.push(() => resolve(response({ ...payload, revision: payload.revision + 1, updated_at: "2026-08-02T13:00:00Z" })))
+    }))
+    act(() => root.render(<Harness save={save} run={run} />))
+    await click("short"); await click("save"); await click("long"); await click("run")
     expect(save.mock.calls[0][0].exposure_policy.mode).toBe("LONG_SHORT")
-    await act(async () => release())
+    await act(async () => releases[0]())
+    expect(document.querySelector("output")?.textContent).toBe("LONG_ONLY")
+    expect(document.querySelector("output")?.getAttribute("data-dirty")).toBe("true")
+    expect(run).not.toHaveBeenCalled()
+
+    await click("save")
+    expect(save).toHaveBeenCalledTimes(2)
+    expect(save.mock.calls[1][0].exposure_policy.mode).toBe("LONG_ONLY")
+    await act(async () => releases[1]())
+    expect(document.querySelector("output")?.textContent).toBe("LONG_ONLY")
+    expect(document.querySelector("output")?.getAttribute("data-dirty")).toBe("false")
   })
 
   it("keeps empty and non-finite values invalid, then clamps a committed boundary", async () => {
@@ -107,5 +141,16 @@ describe("strategy policy save flow", () => {
       input.dispatchEvent(new FocusEvent("focusout", { bubbles: true }))
     })
     expect(onCommit).toHaveBeenLastCalledWith(150)
+  })
+
+  it.each([
+    ["最多持仓", "0", 1, 10, 1],
+    ["维持保证金率", "0", 0.01, 100, 0.01],
+    ["成本压力倍数", "0.5", 1, 100, 1],
+    ["空头风控阈值", "0", 0.01, 100, 0.01],
+    ["事件禁入窗口", "-1", 0, 252, 0],
+    ["20日波动率", "1001", 0.01, 1000, 1000],
+  ])("uses the backend boundary for %s", (_label, raw, minimum, maximum, expected) => {
+    expect(parseBoundedNumber(raw, minimum, maximum)).toEqual({ value: expected, error: null })
   })
 })

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 
 import type { ConfigPayload, ExposureMode, StrategyConfig } from "@/lib/api"
 
@@ -23,23 +23,32 @@ export function needsPolicyTransitionConfirmation(
 export function useStrategySaveFlow({
   config,
   market,
+  draftGeneration = 0,
   confirm = () => window.confirm(transitionMessage),
   save,
   onSaved,
 }: {
   config: StrategyConfig
   market: "cn" | "us"
+  draftGeneration?: number
   confirm?: () => boolean
   save: (payload: StrategyConfig) => Promise<ConfigPayload>
-  onSaved?: (payload: ConfigPayload) => void
+  onSaved?: (payload: ConfigPayload, reconciliation: { draftChanged: boolean; savedGeneration: number }) => void
 }) {
   const baselineRef = useRef<ExposureMode>(config.exposure_policy.mode)
-  const pendingRef = useRef<Promise<ConfigPayload | null> | null>(null)
+  const latestGenerationRef = useRef(draftGeneration)
+  const pendingRef = useRef<Promise<{ payload: ConfigPayload; draftChanged: boolean } | null> | null>(null)
   const [isPending, setIsPending] = useState(false)
+
+  useEffect(() => {
+    latestGenerationRef.current = draftGeneration
+  }, [draftGeneration])
+
   const execute = useCallback(() => {
     if (pendingRef.current) return pendingRef.current
     const operation = (async () => {
       const payload = snapshotStrategyConfig(config, market)
+      const savedGeneration = draftGeneration
       if (
         needsPolicyTransitionConfirmation(
           baselineRef.current,
@@ -51,9 +60,10 @@ export function useStrategySaveFlow({
       }
       setIsPending(true)
       const result = await save(payload)
+      const draftChanged = latestGenerationRef.current !== savedGeneration
       baselineRef.current = result.config.exposure_policy.mode
-      onSaved?.(result)
-      return result
+      onSaved?.(result, { draftChanged, savedGeneration })
+      return { payload: result, draftChanged }
     })()
     pendingRef.current = operation
     const clearPending = () => {
@@ -62,19 +72,25 @@ export function useStrategySaveFlow({
     }
     void operation.then(clearPending, clearPending)
     return operation
-  }, [config, confirm, market, onSaved, save])
+  }, [config, confirm, draftGeneration, market, onSaved, save])
+
+  const saveCurrent = useCallback(async () => {
+    const result = await execute()
+    return result?.payload ?? null
+  }, [execute])
 
   const beforeRun = useCallback(async () => {
     const result = await execute()
     if (!result) throw new Error("SAVE_CANCELLED")
-    return result
+    if (result.draftChanged) throw new Error("SAVE_REQUIRES_RESAVE")
+    return result.payload
   }, [execute])
 
   const commitBaseline = useCallback((mode: ExposureMode) => {
     baselineRef.current = mode
   }, [])
 
-  return { save: execute, beforeRun, isPending, commitBaseline }
+  return { save: saveCurrent, beforeRun, isPending, commitBaseline }
 }
 
 export function parseBoundedNumber(

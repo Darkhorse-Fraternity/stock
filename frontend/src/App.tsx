@@ -693,7 +693,7 @@ function PortfolioSettings({ portfolio, allocation, strategyId, market, onChange
   )
 }
 
-function PolicyNumberField({ label, value, maximum, suffix = "%", disabled = false, step = 1, onChange }: { label: string; value: number; maximum: number; suffix?: string; disabled?: boolean; step?: number; onChange: (value: number) => void }) {
+function PolicyNumberField({ label, value, minimum = 0, maximum, suffix = "%", disabled = false, step = 1, onChange }: { label: string; value: number; minimum?: number; maximum: number; suffix?: string; disabled?: boolean; step?: number; onChange: (value: number) => void }) {
   return (
     <label className={cn("grid gap-2 border-l-2 border-slate-200 bg-slate-50/65 px-3 py-3", disabled && "opacity-50")}>
       <span className="flex items-start justify-between gap-3 text-xs">
@@ -701,7 +701,7 @@ function PolicyNumberField({ label, value, maximum, suffix = "%", disabled = fal
         <span className="shrink-0 font-mono text-[10px] text-muted-foreground">系统上限 {maximum}{suffix}</span>
       </span>
       <span className="flex items-center gap-2">
-        <PolicyNumberInput key={`${label}-${value}`} label={label} value={value} minimum={0} maximum={maximum} step={step} disabled={disabled} inputClassName="h-9 w-full rounded-md border border-input bg-transparent px-3 text-right font-mono text-sm tabular-nums shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onCommit={onChange} />
+        <PolicyNumberInput key={`${label}-${value}`} label={label} value={value} minimum={minimum} maximum={maximum} step={step} disabled={disabled} inputClassName="h-9 w-full rounded-md border border-input bg-transparent px-3 text-right font-mono text-sm tabular-nums shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onCommit={onChange} />
         <span className="min-w-8 text-xs text-muted-foreground">{suffix}</span>
       </span>
     </label>
@@ -760,7 +760,7 @@ function LongShortPolicySettings({ market, exposure, margin, short, onExposureCh
         <div>
           <h4 className="mb-3 font-mono text-[11px] font-semibold tracking-[0.12em] text-muted-foreground">EXPOSURE LIMITS</h4>
           <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-            <PolicyNumberField label="最多持仓" value={exposure.max_positions} maximum={10} suffix="只" onChange={exposureField("max_positions")} />
+            <PolicyNumberField label="最多持仓" value={exposure.max_positions} minimum={1} maximum={10} suffix="只" onChange={exposureField("max_positions")} />
             <PolicyNumberField label="总敞口" value={exposure.max_gross_exposure_pct} maximum={150} onChange={exposureField("max_gross_exposure_pct")} />
             <PolicyNumberField label="净敞口" value={exposure.max_net_exposure_pct} maximum={120} onChange={exposureField("max_net_exposure_pct")} />
             <PolicyNumberField label="多头敞口" value={exposure.max_long_exposure_pct} maximum={120} onChange={exposureField("max_long_exposure_pct")} />
@@ -773,11 +773,11 @@ function LongShortPolicySettings({ market, exposure, margin, short, onExposureCh
         <div>
           <h4 className="mb-3 font-mono text-[11px] font-semibold tracking-[0.12em] text-muted-foreground">MARGIN &amp; CARRY</h4>
           <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-            <PolicyNumberField label="维持保证金率" value={margin.maintenance_margin_pct} maximum={100} onChange={marginField("maintenance_margin_pct")} />
+            <PolicyNumberField label="维持保证金率" value={margin.maintenance_margin_pct} minimum={0.01} maximum={100} onChange={marginField("maintenance_margin_pct")} />
             <PolicyNumberField label="清算缓冲" value={margin.liquidation_buffer_pct} maximum={100} onChange={marginField("liquidation_buffer_pct")} />
             <PolicyNumberField label="融资年化" value={margin.financing_apr_pct} maximum={100} step={0.1} onChange={marginField("financing_apr_pct")} />
             <PolicyNumberField disabled={shortDisabled} label="借券年化估算" value={short.estimated_borrow_apr_pct} maximum={100} step={0.1} onChange={shortField("estimated_borrow_apr_pct")} />
-            <PolicyNumberField disabled={shortDisabled} label="成本压力倍数" value={short.cost_stress_multiplier} maximum={100} suffix="×" step={0.1} onChange={shortField("cost_stress_multiplier")} />
+            <PolicyNumberField disabled={shortDisabled} label="成本压力倍数" value={short.cost_stress_multiplier} minimum={1} maximum={100} suffix="×" step={0.1} onChange={shortField("cost_stress_multiplier")} />
           </div>
         </div>
 
@@ -787,13 +787,13 @@ function LongShortPolicySettings({ market, exposure, margin, short, onExposureCh
             {shortDisabled && <span className="text-xs text-muted-foreground">切换到 LONG_SHORT 后可配置</span>}
           </div>
           <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
-            <PolicyNumberField disabled={shortDisabled} label="空头止损" value={short.stop_loss_pct} maximum={100} step={0.5} onChange={shortField("stop_loss_pct")} />
-            <PolicyNumberField disabled={shortDisabled} label="追踪止盈激活" value={short.trailing_activation_pct} maximum={100} step={0.5} onChange={shortField("trailing_activation_pct")} />
-            <PolicyNumberField disabled={shortDisabled} label="追踪反弹退出" value={short.trailing_rebound_pct} maximum={100} step={0.5} onChange={shortField("trailing_rebound_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="空头止损" value={short.stop_loss_pct} minimum={0.01} maximum={100} step={0.5} onChange={shortField("stop_loss_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="追踪止盈激活" value={short.trailing_activation_pct} minimum={0.01} maximum={100} step={0.5} onChange={shortField("trailing_activation_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="追踪反弹退出" value={short.trailing_rebound_pct} minimum={0.01} maximum={100} step={0.5} onChange={shortField("trailing_rebound_pct")} />
             <PolicyNumberField disabled={shortDisabled} label="事件禁入窗口" value={short.event_blackout_sessions} maximum={252} suffix="场" onChange={shortField("event_blackout_sessions")} />
-            <PolicyNumberField disabled={shortDisabled} label="逼空单日涨幅" value={short.squeeze_rise_pct} maximum={100} step={0.5} onChange={shortField("squeeze_rise_pct")} />
-            <PolicyNumberField disabled={shortDisabled} label="逼空量比" value={short.squeeze_volume_ratio} maximum={100} suffix="×" step={0.1} onChange={shortField("squeeze_volume_ratio")} />
-            <PolicyNumberField disabled={shortDisabled} label="20日波动率" value={short.maximum_volatility_20d_pct} maximum={1000} step={1} onChange={shortField("maximum_volatility_20d_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="逼空单日涨幅" value={short.squeeze_rise_pct} minimum={0.01} maximum={100} step={0.5} onChange={shortField("squeeze_rise_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="逼空量比" value={short.squeeze_volume_ratio} minimum={0.01} maximum={100} suffix="×" step={0.1} onChange={shortField("squeeze_volume_ratio")} />
+            <PolicyNumberField disabled={shortDisabled} label="20日波动率" value={short.maximum_volatility_20d_pct} minimum={0.01} maximum={1000} step={1} onChange={shortField("maximum_volatility_20d_pct")} />
           </div>
           <div className="mt-3 grid gap-2 md:grid-cols-3">
             {([
@@ -901,43 +901,49 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("all")
   const [search, setSearch] = useState("")
   const [dirty, setDirty] = useState(false)
+  const [draftGeneration, setDraftGeneration] = useState(0)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [deliverySync, setDeliverySync] = useState<ConfigPayload["delivery_sync"] | null>(initialData.delivery_sync || null)
   const [dataSourceStatus, setDataSourceStatus] = useState(initialData.us_market_data)
 
+  const markDirty = () => {
+    setDirty(true)
+    setDraftGeneration((current) => current + 1)
+  }
+
   const updateParameter = (id: string, patch: Partial<Parameter>) => {
     setParameters((current) => current.map((item) => item.id === id ? { ...item, ...patch, effective: (patch.enabled ?? item.enabled) && item.status !== "planned" } : item))
-    setDirty(true)
+    markDirty()
   }
 
   const updateDelivery = (patch: Partial<ReportDelivery>) => {
     setConfig((current) => ({ ...current, delivery: { ...current.delivery, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const updatePortfolio = (patch: Partial<PortfolioConfig>) => {
     setConfig((current) => ({ ...current, portfolio: { ...current.portfolio, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const updateAllocation = (patch: Partial<AllocationConfig>) => {
     setConfig((current) => ({ ...current, allocation: { ...current.allocation, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const updateExposurePolicy = (patch: Partial<ExposurePolicy>) => {
     setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const updateMarginPolicy = (patch: Partial<MarginPolicy>) => {
     setConfig((current) => ({ ...current, margin_policy: { ...current.margin_policy, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const updateShortPolicy = (patch: Partial<ShortPolicy>) => {
     setConfig((current) => ({ ...current, short_policy: { ...current.short_policy, ...patch } }))
-    setDirty(true)
+    markDirty()
   }
 
   const activeCount = parameters.filter((item) => item.enabled).length
@@ -970,16 +976,28 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const saveFlow = useStrategySaveFlow({
     config: { ...config, parameters: states },
     market: marketCode,
+    draftGeneration,
     save: (payload) => saveStrategy(config.id!, payload),
-    onSaved: (payload) => {
-      setParameters(payload.parameters)
-      setConfig(payload.config)
+    onSaved: (payload, reconciliation) => {
+      if (reconciliation.draftChanged) {
+        setConfig((current) => ({
+          ...current,
+          id: payload.config.id,
+          revision: payload.config.revision,
+          lifecycle: payload.config.lifecycle,
+          created_at: payload.config.created_at,
+          updated_at: payload.config.updated_at,
+        }))
+      } else {
+        setParameters(payload.parameters)
+        setConfig(payload.config)
+        setDirty(false)
+      }
       setDeliverySync(payload.delivery_sync || null)
       setDataSourceStatus(payload.us_market_data)
-      setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
-      toast.success("策略配置已保存", { description: isActive ? payload.delivery_sync?.message || "下一次选股会读取这份策略" : "启用策略后生效" })
+      toast.success("策略配置已保存", { description: reconciliation.draftChanged ? "保存期间有新的修改，请再次保存后再运行" : isActive ? payload.delivery_sync?.message || "下一次选股会读取这份策略" : "启用策略后生效" })
       if (payload.delivery_sync?.status === "error") toast.error("报告推送同步失败", { description: payload.delivery_sync.message })
     },
   })
@@ -1032,7 +1050,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
       const update = draft.updates.find((candidate) => candidate.id === item.id)
       return update ? { ...item, enabled: true, value: update.value, effective: item.status !== "planned" } : item
     }))
-    setDirty(true)
+    markDirty()
     toast.success(`已应用 ${draft.updates.length} 项草案`, { description: "检查后点击保存参数" })
   }
 

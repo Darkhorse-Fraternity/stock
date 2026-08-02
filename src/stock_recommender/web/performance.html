@@ -45,6 +45,12 @@
     .risk-cell strong { display: block; margin-top: 5px; font-size: 19px; overflow-wrap: anywhere; }
     .runtime { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; padding: 16px 28px; border-bottom: 1px solid var(--line); background: #f8fbfd; }
     .runtime-detail { color: var(--muted); overflow-wrap: anywhere; }
+    .chart-area { display: grid; grid-template-columns: 290px minmax(0, 1fr); border-bottom: 1px solid var(--line); }
+    .chart-copy { padding: 22px 24px; border-right: 1px solid var(--line); background: #fbfdfe; }
+    .chart-copy p, .risk-copy p { color: inherit; font-size: 12px; }
+    .chart { min-width: 0; padding: 18px 22px; }
+    .chart svg { display: block; width: 100%; height: auto; max-height: 220px; }
+    .quote-error { margin-top: 8px; padding: 8px 10px; color: #8f2834; border-left: 3px solid var(--red); background: #fff1f2; overflow-wrap: anywhere; }
     .tabs { display: flex; gap: 4px; padding: 16px 22px; overflow-x: auto; border-bottom: 1px solid var(--line); background: var(--paper); }
     [role="tab"] { flex: 0 0 auto; padding: 9px 13px; border: 0; color: var(--muted); font: inherit; white-space: nowrap; cursor: pointer; background: transparent; }
     [role="tab"][aria-selected="true"] { color: white; background: var(--ink); }
@@ -60,7 +66,13 @@
     .side.short { color: var(--green); border-color: #a8d5c6; background: #eaf7f2; }
     .events { padding: 0 22px; }
     .event { display: grid; grid-template-columns: 175px 170px minmax(0, 1fr); gap: 18px; padding: 15px 0; border-bottom: 1px solid #dde5eb; }
+    .event.risk { border-left: 3px solid var(--red); padding-left: 12px; }
+    .event.highlight { background: #fff4d6; outline: 2px solid #d69a16; outline-offset: -2px; }
+    .event-data { max-width: 100%; margin: 8px 0 0; padding: 8px; overflow: auto; color: var(--muted); font: 11px/1.45 inherit; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--paper); }
     .type { color: var(--blue); font-weight: 700; }
+    .up { color: var(--red); }
+    .down { color: var(--green); }
+    footer { display: flex; justify-content: space-between; gap: 18px; padding: 18px 22px; color: var(--muted); font-size: 11px; border-top: 1px solid var(--line); }
     .empty, .loading, .error { padding: 70px 24px; color: var(--muted); text-align: center; overflow-wrap: anywhere; }
     .error { color: var(--red); }
     @media (max-width: 760px) {
@@ -68,6 +80,8 @@
       header { flex-direction: column; }
       .metrics { grid-template-columns: 1fr 1fr; }
       .runtime { grid-template-columns: 1fr; }
+      .chart-area { grid-template-columns: 1fr; }
+      .chart-copy { border-right: 0; border-bottom: 1px solid var(--line); }
       .metric { padding: 20px 16px; }
       .metric:nth-child(2) { border-right: 0; }
       .risk-ledger { grid-template-columns: 1fr 1fr; }
@@ -76,12 +90,13 @@
       .risk-cell:nth-child(odd) { border-left: 1px solid var(--line); }
       .risk-cell strong { white-space: normal; overflow-wrap: anywhere; }
       .event { grid-template-columns: 1fr; gap: 3px; }
+      footer { flex-direction: column; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
     }
   </style>
-  <script type="module" crossorigin src="/assets/performance-DXALPCdO.js"></script>
+  <script type="module" crossorigin src="/assets/performance-BQOeqB5D.js"></script>
   <link rel="modulepreload" crossorigin href="/assets/modulepreload-polyfill-B5Qt9EMX.js">
 </head>
 <body>
