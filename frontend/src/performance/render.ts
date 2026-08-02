@@ -77,7 +77,7 @@ const summaryNullableNumberFields = [
 const markets = ["cn", "us"] as const
 const exposureModes = ["LONG_ONLY", "LONG_LEVERAGED", "LONG_SHORT"] as const
 const riskLevels = ["NORMAL", "MEDIUM", "WARNING", "DERISK", "DE_RISKING", "BREACHED", "MANUAL_HALT", "INSOLVENT_HALT", "REDUCE_ONLY", "MARGIN_CALL"] as const
-const tradingModes = ["RUNNING", "ENTRY_BLOCKED", "EXIT_ONLY", "COVER_ONLY", "MANUAL_HALT", "INSOLVENT_HALT", "REDUCE_ONLY", "MARGIN_CALL"] as const
+const navTradingModes = ["RUNNING", "ENTRY_BLOCKED", "REDUCE_ONLY", "HALTED"] as const
 const positionSides = ["LONG", "SHORT"] as const
 const positionModes = ["NORMAL", "COVER_ONLY"] as const
 const borrowSources = ["strategy_estimate", "unavailable"] as const
@@ -121,11 +121,14 @@ export function parseStrategyPerformancePayload(input: unknown): StrategyPerform
     nullableText(strategy[field], `strategy.${field}`)
   }
   nullableLiteral(strategy.risk_level, riskLevels, "strategy.risk_level")
-  nullableLiteral(strategy.trading_mode, tradingModes, "strategy.trading_mode")
+  nullableLiteral(strategy.trading_mode, exposureModes, "strategy.trading_mode")
   nullableFinite(strategy.target_exposure_pct, "strategy.target_exposure_pct")
   if (strategy.market_regime !== null) record(strategy.market_regime, "strategy.market_regime")
   const exposurePolicy = record(strategy.exposure_policy, "strategy.exposure_policy")
   literal(exposurePolicy.mode, exposureModes, "strategy.exposure_policy.mode")
+  if (strategy.trading_mode !== null && strategy.trading_mode !== exposurePolicy.mode) {
+    throw new TypeError("strategy.trading_mode mismatch")
+  }
   const marginPolicy = record(strategy.margin_policy, "strategy.margin_policy")
   literal(marginPolicy.accrual_mode, ["DAILY"], "strategy.margin_policy.accrual_mode")
   record(strategy.short_policy, "strategy.short_policy")
@@ -161,7 +164,7 @@ export function parseStrategyPerformancePayload(input: unknown): StrategyPerform
     for (const field of ["nav", "cash", "market_value", "cumulative_return_pct"] as const) finite(point[field], `${path}.${field}`)
     nullableFinite(point.drawdown_pct, `${path}.drawdown_pct`)
     nullableLiteral(point.risk_level, riskLevels, `${path}.risk_level`)
-    nullableLiteral(point.trading_mode, tradingModes, `${path}.trading_mode`)
+    nullableLiteral(point.trading_mode, navTradingModes, `${path}.trading_mode`)
   })
   list(payload.positions, "positions").forEach((item, index) => {
     const path = `positions[${index}]`
@@ -240,6 +243,7 @@ const translations: Record<string, string> = {
   WARNING: "回撤预警", DERISK: "强制降仓", DE_RISKING: "强制降仓", BREACHED: "人工暂停",
   RUNNING: "运行中", ENTRY_BLOCKED: "禁止开仓", EXIT_ONLY: "只减仓", MANUAL_HALT: "已暂停",
   INSOLVENT_HALT: "资不抵债暂停", REDUCE_ONLY: "仅减仓", BUY: "买入", SELL: "卖出",
+  HALTED: "已暂停",
   OPEN: "开仓", INCREASE: "加仓", REDUCE: "减仓", CLOSE: "平仓", ENTRY: "入场", EXIT: "退出",
   strategy_estimate: "策略估算", unavailable: "不可用", market_regime: "市场状态",
   absolute_momentum: "绝对动量",

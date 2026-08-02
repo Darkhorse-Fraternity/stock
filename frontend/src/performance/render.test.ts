@@ -70,7 +70,7 @@ const fixture = {
     benchmark_name: "S&P 500",
     market_regime: { state: "RISK_ON", label: "强势", target_exposure_pct: 100 },
     risk_level: "NORMAL",
-    trading_mode: "RUNNING",
+    trading_mode: "LONG_SHORT",
     target_exposure_pct: 100,
     exposure_policy: { mode: "LONG_SHORT", max_positions: 10, max_gross_exposure_pct: 150, max_net_exposure_pct: 120, max_long_exposure_pct: 120, max_short_exposure_pct: 30, max_long_position_pct: 15, max_short_position_pct: 5 },
     margin_policy: { maintenance_margin_pct: 30, liquidation_buffer_pct: 10, financing_apr_pct: 6, accrual_mode: "DAILY" },
@@ -156,7 +156,8 @@ describe("strategy performance runtime", () => {
   it("consumes the exact admin serializer contract fixture", () => {
     const parsed = parseStrategyPerformancePayload(adminContractFixture)
     expect(parsed.orders[0].key).toBe("order-key-1")
-    expect(parsed.positions[0].borrow_rate_source).toBe("strategy_estimate")
+    expect(parsed.strategy.trading_mode).toBe("LONG_ONLY")
+    expect(parsed.positions[0].borrow_rate_source).toBe("unavailable")
     expect(parsed.closed_trades[0].reason).toBe("STOP_LOSS")
     expect(parsed.events[0].data).toEqual({ margin_rate_pct: 24, action: "COVER_ONLY" })
     expect(parsed.runtime.last_pipeline_market_regime).toEqual({ state: "RISK_ON" })
@@ -191,6 +192,38 @@ describe("strategy performance runtime", () => {
     const valid = structuredClone(fixture) as unknown as Record<string, unknown>
     mutate((valid.positions as unknown[])[0] as Record<string, unknown>)
     expect(parseStrategyPerformancePayload(valid).positions[0].side).toBe(side)
+  })
+
+  it.each(["LONG_ONLY", "LONG_LEVERAGED", "LONG_SHORT", null])("accepts backend strategy trading mode %s", (mode) => {
+    const payload = structuredClone(fixture) as unknown as Record<string, unknown>
+    const strategy = payload.strategy as Record<string, unknown>
+    strategy.trading_mode = mode
+    if (mode !== null) (strategy.exposure_policy as Record<string, unknown>).mode = mode
+    expect(parseStrategyPerformancePayload(payload).strategy.trading_mode).toBe(mode)
+  })
+
+  it.each(["RUNNING", "FLAT"])("rejects non-exposure strategy trading mode %s", (mode) => {
+    const payload = structuredClone(fixture) as unknown as Record<string, unknown>
+    ;(payload.strategy as Record<string, unknown>).trading_mode = mode
+    expect(() => parseStrategyPerformancePayload(payload)).toThrow(/strategy\.trading_mode/)
+  })
+
+  it("rejects strategy trading mode that differs from exposure mode", () => {
+    const payload = structuredClone(fixture) as unknown as Record<string, unknown>
+    ;(payload.strategy as Record<string, unknown>).trading_mode = "LONG_ONLY"
+    expect(() => parseStrategyPerformancePayload(payload)).toThrow(/mismatch/)
+  })
+
+  it.each(["RUNNING", "ENTRY_BLOCKED", "REDUCE_ONLY", "HALTED", null])("accepts NAV runtime trading state %s", (mode) => {
+    const payload = structuredClone(fixture) as unknown as Record<string, unknown>
+    ;((payload.nav_history as unknown[])[0] as Record<string, unknown>).trading_mode = mode
+    expect(parseStrategyPerformancePayload(payload).nav_history[0].trading_mode).toBe(mode)
+  })
+
+  it.each(["LONG_ONLY", "MANUAL_HALT"])("rejects invalid NAV runtime trading state %s", (mode) => {
+    const payload = structuredClone(fixture) as unknown as Record<string, unknown>
+    ;((payload.nav_history as unknown[])[0] as Record<string, unknown>).trading_mode = mode
+    expect(() => parseStrategyPerformancePayload(payload)).toThrow(/nav_history\[0\]\.trading_mode/)
   })
 
   it.each([

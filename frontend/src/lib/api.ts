@@ -170,7 +170,7 @@ export interface PortfolioPerformanceStrategy {
   benchmark_name: string | null
   market_regime: PerformanceJsonObject | null
   risk_level: string | null
-  trading_mode: string | null
+  trading_mode: ExposureMode | null
   target_exposure_pct: number | null
   exposure_policy: ExposurePolicy
   margin_policy: MarginPolicy
@@ -248,7 +248,7 @@ export interface PortfolioPerformanceNavPoint {
   cumulative_return_pct: number
   drawdown_pct: number | null
   risk_level: string | null
-  trading_mode: string | null
+  trading_mode: "RUNNING" | "ENTRY_BLOCKED" | "REDUCE_ONLY" | "HALTED" | null
   source: string
 }
 

@@ -15,15 +15,15 @@
     "signal_model": "factor_rank_v1",
     "signal_time": "09:30",
     "signal_data_cutoff": "previous_trading_day_close",
-    "allocation_model": "trend_breadth_v1",
+    "allocation_model": "equal_weight",
     "benchmark_symbol": "SPY",
     "benchmark_name": "S&P 500",
     "market_regime": { "state": "RISK_ON", "label": "强势", "target_exposure_pct": 100.0 },
     "risk_level": "NORMAL",
-    "trading_mode": "RUNNING",
+    "trading_mode": "LONG_ONLY",
     "target_exposure_pct": 100.0,
     "exposure_policy": {
-      "mode": "LONG_SHORT",
+      "mode": "LONG_ONLY",
       "max_positions": 10,
       "max_gross_exposure_pct": 150.0,
       "max_net_exposure_pct": 120.0,
@@ -116,19 +116,19 @@
       "exit_distance_pct": -4.0,
       "market_value": 118.0,
       "average_cost": 120.0,
-      "position_side": "SHORT",
-      "side": "SHORT",
-      "position_mode": "COVER_ONLY",
-      "borrow_rate_pct": 3.25,
-      "borrow_rate_source": "strategy_estimate",
-      "borrow_rate_estimated": true,
-      "margin_used": 35.4
+      "position_side": "LONG",
+      "side": "LONG",
+      "position_mode": "NORMAL",
+      "borrow_rate_pct": null,
+      "borrow_rate_source": "unavailable",
+      "borrow_rate_estimated": false,
+      "margin_used": 0.0
     }
   ],
   "orders": [
     {
       "id": "order-1",
-      "side": "SELL",
+      "side": "BUY",
       "symbol": "AAPL",
       "name": "Apple",
       "quantity": 5,
@@ -141,7 +141,7 @@
       "commission_charged": 1.0,
       "fees_charged": 1.5,
       "strategy_revision": 2,
-      "position_side": "SHORT",
+      "position_side": "LONG",
       "position_effect": "OPEN",
       "key": "order-key-1",
       "control_epoch": 1,
@@ -170,6 +170,6 @@
   "market_label": "美股",
   "currency": "USD",
   "currency_symbol": "$",
-  "config": { "initial_cash": 100.0 },
+  "config": { "initial_cash": 100.0, "benchmark_symbol": "SPY", "benchmark_name": "S&P 500" },
   "allocation": { "model": "equal_weight" }
 }

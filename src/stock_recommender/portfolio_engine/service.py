@@ -1578,7 +1578,9 @@ class PortfolioEngine:
                 * 100.0,
                 drawdown_pct=None,
                 risk_level=source.risk_level,
-                trading_mode=source.trading_mode,
+                # Exposure mode belongs to strategy metadata. No persisted runtime
+                # trading state exists for this valuation mark, so keep it unknown.
+                trading_mode=None,
                 source=request.valuation_source,
             )
         )

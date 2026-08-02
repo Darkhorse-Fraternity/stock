@@ -26,13 +26,13 @@ from stock_recommender.portfolio_engine.contracts import (
     PerformanceOrder,
     PerformancePosition,
     PerformanceRuntime,
-    PerformanceStrategySource,
     PerformanceSummary,
     PositionSide,
     PositionSnapshot,
     StrategyPerformanceProjection,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
+from stock_recommender.portfolio_runtime import _performance_source
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
@@ -186,60 +186,62 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
 
     def test_admin_serializer_preserves_service_economics_without_recalculation(self):
         now = datetime(2026, 8, 2, 12, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
-        source = PerformanceStrategySource(
-            id="strategy-serializer",
-            name="serializer",
-            revision=2,
-            stage="paper",
-            market="us",
-            market_label="美股",
-            currency="USD",
-            currency_symbol="$",
-            initial_cash=100.0,
-            max_positions=10,
-            signal_model="factor_rank_v1",
-            signal_time="09:30",
-            signal_data_cutoff="previous_trading_day_close",
-            allocation_model="trend_breadth_v1",
-            benchmark_symbol="SPY",
-            benchmark_name="S&P 500",
-            market_regime={"state": "RISK_ON", "label": "强势", "target_exposure_pct": 100.0},
-            risk_level="NORMAL",
-            trading_mode="RUNNING",
-            target_exposure_pct=100.0,
-            exposure_policy={
-                "mode": "LONG_SHORT",
-                "max_positions": 10,
-                "max_gross_exposure_pct": 150.0,
-                "max_net_exposure_pct": 120.0,
-                "max_long_exposure_pct": 120.0,
-                "max_short_exposure_pct": 30.0,
-                "max_long_position_pct": 15.0,
-                "max_short_position_pct": 5.0,
-            },
-            margin_policy={
-                "maintenance_margin_pct": 30.0,
-                "liquidation_buffer_pct": 10.0,
-                "financing_apr_pct": 6.0,
-                "accrual_mode": "DAILY",
-            },
-            short_policy={
-                "signal_model": "inverse_rank_v1",
-                "require_shortable": True,
-                "require_easy_to_borrow": True,
-                "estimated_borrow_apr_pct": 3.0,
-                "cost_stress_multiplier": 2.0,
-                "block_on_borrow_data_missing": True,
-                "stop_loss_pct": 8.0,
-                "trailing_activation_pct": 10.0,
-                "trailing_rebound_pct": 5.0,
-                "event_blackout_sessions": 2,
-                "squeeze_rise_pct": 8.0,
-                "squeeze_volume_ratio": 2.0,
-                "maximum_volatility_20d_pct": 80.0,
-            },
-            config={"initial_cash": 100.0},
-            allocation={"model": "equal_weight"},
+        source = _performance_source(
+            {
+                "id": "strategy-serializer",
+                "name": "serializer",
+                "revision": 2,
+                "lifecycle": {"stage": "paper"},
+                "parameters": {"market": {"enabled": True, "value": "us"}},
+                "signal": {
+                    "model": "factor_rank_v1",
+                    "run_time": "09:30",
+                    "data_cutoff": "previous_trading_day_close",
+                },
+                "portfolio": {
+                    "initial_cash": 100.0,
+                    "benchmark_symbol": "SPY",
+                    "benchmark_name": "S&P 500",
+                },
+                "allocation": {"model": "equal_weight"},
+                "market_regime": {
+                    "state": "RISK_ON",
+                    "label": "强势",
+                    "target_exposure_pct": 100.0,
+                },
+                "risk_level": "NORMAL",
+                "exposure_policy": {
+                    "mode": "LONG_ONLY",
+                    "max_positions": 10,
+                    "max_gross_exposure_pct": 150.0,
+                    "max_net_exposure_pct": 120.0,
+                    "max_long_exposure_pct": 120.0,
+                    "max_short_exposure_pct": 30.0,
+                    "max_long_position_pct": 15.0,
+                    "max_short_position_pct": 5.0,
+                },
+                "margin_policy": {
+                    "maintenance_margin_pct": 30.0,
+                    "liquidation_buffer_pct": 10.0,
+                    "financing_apr_pct": 6.0,
+                    "accrual_mode": "DAILY",
+                },
+                "short_policy": {
+                    "signal_model": "inverse_rank_v1",
+                    "require_shortable": True,
+                    "require_easy_to_borrow": True,
+                    "estimated_borrow_apr_pct": 3.0,
+                    "cost_stress_multiplier": 2.0,
+                    "block_on_borrow_data_missing": True,
+                    "stop_loss_pct": 8.0,
+                    "trailing_activation_pct": 10.0,
+                    "trailing_rebound_pct": 5.0,
+                    "event_blackout_sessions": 2,
+                    "squeeze_rise_pct": 8.0,
+                    "squeeze_volume_ratio": 2.0,
+                    "maximum_volatility_20d_pct": 80.0,
+                },
+            }
         )
         projection = StrategyPerformanceProjection(
             generated_at=now,
@@ -333,19 +335,19 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                     exit_distance_pct=-4.0,
                     market_value=118.0,
                     average_cost=120.0,
-                    position_side="SHORT",
-                    side="SHORT",
-                    position_mode="COVER_ONLY",
-                    borrow_rate_pct=3.25,
-                    borrow_rate_source="strategy_estimate",
-                    borrow_rate_estimated=True,
-                    margin_used=35.4,
+                    position_side="LONG",
+                    side="LONG",
+                    position_mode="NORMAL",
+                    borrow_rate_pct=None,
+                    borrow_rate_source="unavailable",
+                    borrow_rate_estimated=False,
+                    margin_used=0.0,
                 ),
             ),
             orders=(
                 PerformanceOrder(
                     id="order-1",
-                    side="SELL",
+                    side="BUY",
                     symbol="AAPL",
                     name="Apple",
                     quantity=5,
@@ -358,7 +360,7 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                     commission_charged=1.0,
                     fees_charged=1.5,
                     strategy_revision=2,
-                    position_side="SHORT",
+                    position_side="LONG",
                     position_effect="OPEN",
                     key="order-key-1",
                     control_epoch=1,
@@ -457,7 +459,14 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 "data",
             },
         )
-        self.assertEqual(payload["config"], {"initial_cash": 100.0})
+        self.assertEqual(
+            payload["config"],
+            {
+                "initial_cash": 100.0,
+                "benchmark_symbol": "SPY",
+                "benchmark_name": "S&P 500",
+            },
+        )
         self.assertEqual(payload["allocation"], {"model": "equal_weight"})
 
         for method, path in (("do_PUT", "/api/config"), ("do_POST", "/api/config/reset")):
@@ -510,6 +519,12 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["nav"], 123_456.0)
         self.assertEqual(payload["summary"]["cash"], 123_456.0)
         self.assertEqual(payload["summary"]["max_positions"], 10)
+        self.assertEqual(payload["strategy"]["trading_mode"], "LONG_ONLY")
+        self.assertEqual(
+            payload["strategy"]["trading_mode"],
+            payload["strategy"]["exposure_policy"]["mode"],
+        )
+        self.assertIsNone(payload["nav_history"][-1]["trading_mode"])
         self.assertIn("策略表现 · Stock Agent", page)
         module_path = re.search(r'src="(/assets/performance-[^"]+\.js)"', page)
         self.assertIsNotNone(module_path)
