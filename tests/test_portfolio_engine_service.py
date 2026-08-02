@@ -310,6 +310,11 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             self.assertIsNone(projection.summary.realized_pnl)
             self.assertIsNone(projection.summary.closed_trade_count)
             self.assertIsNone(projection.summary.win_rate_pct)
+            self.assertFalse(projection.runtime.availability.complete)
+            self.assertEqual(
+                projection.runtime.availability.reason,
+                projection.history_availability.lifecycle.reason,
+            )
 
             empty_store = JsonLedgerStore(Path(temporary) / "empty.json")
             empty_store.create_account(account())
@@ -319,6 +324,7 @@ class PortfolioEngineServiceTests(unittest.TestCase):
 
         self.assertTrue(empty_projection.history_availability.lifecycle.complete)
         self.assertTrue(empty_projection.history_availability.nav.complete)
+        self.assertTrue(empty_projection.runtime.availability.complete)
         self.assertEqual(empty_projection.summary.realized_pnl, 0.0)
         self.assertEqual(empty_projection.summary.closed_trade_count, 0)
         self.assertIsNone(empty_projection.summary.win_rate_pct)

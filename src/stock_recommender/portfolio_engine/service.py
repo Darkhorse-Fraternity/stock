@@ -158,51 +158,87 @@ def _report_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
-def _performance_runtime(view: object) -> PerformanceRuntime:
+def _performance_runtime(
+    view: object,
+    *,
+    lifecycle_complete: bool | None = None,
+    lifecycle_reason: str | None = None,
+) -> PerformanceRuntime:
+    effective_complete = (
+        bool(getattr(view, "lifecycle_complete", True))
+        if lifecycle_complete is None
+        else lifecycle_complete
+    )
+    effective_reason = lifecycle_reason or getattr(view, "lifecycle_reason", None)
+
+    def apply_lifecycle(runtime: PerformanceRuntime) -> PerformanceRuntime:
+        if effective_complete:
+            return runtime
+        return replace(
+            runtime,
+            availability=PerformanceHistoryAvailability(
+                complete=False,
+                source="v2_ledger",
+                reason=(
+                    effective_reason
+                    or runtime.availability.reason
+                    or "canonical portfolio lifecycle is incomplete"
+                ),
+            ),
+        )
+
     completed_events = [event for event in view.events if event.type == "PIPELINE_COMPLETED"]
     if not completed_events:
         if view.batches:
-            return PerformanceRuntime(
-                availability=PerformanceHistoryAvailability(
-                    complete=False,
-                    source="v2_ledger",
-                    reason=(
-                        "canonical pipeline completion event and run identity "
-                        "are unavailable for persisted DecisionBatch history"
+            return apply_lifecycle(
+                PerformanceRuntime(
+                    availability=PerformanceHistoryAvailability(
+                        complete=False,
+                        source="v2_ledger",
+                        reason=(
+                            "canonical pipeline completion event and run identity "
+                            "are unavailable for persisted DecisionBatch history"
+                        ),
                     ),
-                ),
+                )
             )
         if not getattr(view, "lifecycle_complete", True):
-            return PerformanceRuntime(
-                availability=PerformanceHistoryAvailability(
-                    complete=False,
-                    source="v2_ledger",
-                    reason="canonical pipeline runtime history is incomplete",
-                ),
+            return apply_lifecycle(
+                PerformanceRuntime(
+                    availability=PerformanceHistoryAvailability(
+                        complete=False,
+                        source="v2_ledger",
+                        reason="canonical pipeline runtime history is incomplete",
+                    ),
+                )
             )
-        return PerformanceRuntime()
+        return apply_lifecycle(PerformanceRuntime())
     event = max(completed_events, key=lambda item: item.occurred_at)
     raw_run_key = event.data.get("run_key")
     run_key = raw_run_key if type(raw_run_key) is str and raw_run_key else None
     if run_key is None:
-        return PerformanceRuntime(
-            last_successful_pipeline_at=event.occurred_at,
-            availability=PerformanceHistoryAvailability(
-                complete=False,
-                source="v2_ledger",
-                reason="PIPELINE_COMPLETED event has no canonical run key",
-            ),
+        return apply_lifecycle(
+            PerformanceRuntime(
+                last_successful_pipeline_at=event.occurred_at,
+                availability=PerformanceHistoryAvailability(
+                    complete=False,
+                    source="v2_ledger",
+                    reason="PIPELINE_COMPLETED event has no canonical run key",
+                ),
+            )
         )
     batch = next((item for item in view.batches if item.run_key == run_key), None)
     if batch is None:
-        return PerformanceRuntime(
-            last_successful_pipeline_at=event.occurred_at,
-            last_successful_pipeline_run_id=run_key,
-            availability=PerformanceHistoryAvailability(
-                complete=False,
-                source="v2_ledger",
-                reason="pipeline DecisionBatch is unavailable",
-            ),
+        return apply_lifecycle(
+            PerformanceRuntime(
+                last_successful_pipeline_at=event.occurred_at,
+                last_successful_pipeline_run_id=run_key,
+                availability=PerformanceHistoryAvailability(
+                    complete=False,
+                    source="v2_ledger",
+                    reason="pipeline DecisionBatch is unavailable",
+                ),
+            )
         )
     stages = tuple(
         {
@@ -246,22 +282,24 @@ def _performance_runtime(view: object) -> PerformanceRuntime:
         )
         if value is None
     ]
-    return PerformanceRuntime(
-        last_successful_pipeline_at=event.occurred_at,
-        last_successful_pipeline_run_id=run_key,
-        last_pipeline_admitted=admitted,
-        last_pipeline_stages=stages,
-        last_pipeline_market_regime=market_regime,
-        last_pipeline_data_quality=data_quality,
-        availability=PerformanceHistoryAvailability(
-            complete=not missing,
-            source="v2_ledger",
-            reason=(
-                "canonical pipeline metadata unavailable: " + ", ".join(missing)
-                if missing
-                else None
+    return apply_lifecycle(
+        PerformanceRuntime(
+            last_successful_pipeline_at=event.occurred_at,
+            last_successful_pipeline_run_id=run_key,
+            last_pipeline_admitted=admitted,
+            last_pipeline_stages=stages,
+            last_pipeline_market_regime=market_regime,
+            last_pipeline_data_quality=data_quality,
+            availability=PerformanceHistoryAvailability(
+                complete=not missing,
+                source="v2_ledger",
+                reason=(
+                    "canonical pipeline metadata unavailable: " + ", ".join(missing)
+                    if missing
+                    else None
+                ),
             ),
-        ),
+        )
     )
 
 
@@ -1396,7 +1434,11 @@ class PortfolioEngine:
             quote_error=request.quote_error,
             strategy=source,
             summary=summary,
-            runtime=_performance_runtime(view),
+            runtime=_performance_runtime(
+                view,
+                lifecycle_complete=lifecycle_complete,
+                lifecycle_reason=lifecycle_reason,
+            ),
             nav_history=tuple(nav_history),
             positions=tuple(positions),
             orders=tuple(orders[:100]),
