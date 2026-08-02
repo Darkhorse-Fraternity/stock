@@ -7,6 +7,7 @@ optional dependency so JSON-only production deployments are unaffected.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from dataclasses import replace
 from datetime import datetime
@@ -91,6 +92,22 @@ def _schema_name(value: str) -> str:
     if value.startswith("pg_") or value == "information_schema":
         raise ValueError("system PostgreSQL schemas are not ledger targets")
     return value
+
+
+def _begin_read_snapshot(connection: Any) -> None:
+    connection.execute(
+        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+    )
+
+
+def _intent_definition_fingerprint(intent: OrderIntent) -> str:
+    encoded = json.dumps(
+        _intent_to_json(intent),
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _public_ordinal(item: Any, items: tuple, *, fact_kind: str) -> int | None:
@@ -239,6 +256,17 @@ _DDL = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS {schema}.order_intent_definitions (
+        strategy_id TEXT NOT NULL REFERENCES {schema}.accounts(strategy_id)
+            ON DELETE CASCADE,
+        intent_id TEXT NOT NULL,
+        intent_fingerprint TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        PRIMARY KEY (strategy_id, intent_id),
+        UNIQUE (strategy_id, intent_id, intent_fingerprint)
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS {schema}.order_intents (
         strategy_id TEXT NOT NULL,
         intent_id TEXT NOT NULL,
@@ -256,10 +284,13 @@ _DDL = (
         created_market_at TIMESTAMPTZ NOT NULL,
         cancelled_revision INTEGER,
         payload JSONB NOT NULL,
-        PRIMARY KEY (strategy_id, intent_id),
+        PRIMARY KEY (strategy_id, run_key, intent_id),
         UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
+        FOREIGN KEY (strategy_id, intent_id)
+            REFERENCES {schema}.order_intent_definitions(strategy_id, intent_id)
+            ON DELETE RESTRICT,
         FOREIGN KEY (strategy_id)
             REFERENCES {schema}.accounts(strategy_id) ON DELETE CASCADE
     )
@@ -279,7 +310,8 @@ _DDL = (
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
         FOREIGN KEY (strategy_id, intent_id)
-            REFERENCES {schema}.order_intents(strategy_id, intent_id) ON DELETE CASCADE
+            REFERENCES {schema}.order_intent_definitions(strategy_id, intent_id)
+            ON DELETE RESTRICT
     )
     """,
     """
@@ -301,12 +333,13 @@ _DDL = (
         commission DOUBLE PRECISION NOT NULL,
         status TEXT NOT NULL,
         payload JSONB NOT NULL,
-        PRIMARY KEY (strategy_id, progress_fill_id),
+        PRIMARY KEY (strategy_id, run_key, progress_fill_id),
         UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
         FOREIGN KEY (strategy_id, intent_id)
-            REFERENCES {schema}.order_intents(strategy_id, intent_id) ON DELETE CASCADE
+            REFERENCES {schema}.order_intent_definitions(strategy_id, intent_id)
+            ON DELETE RESTRICT
     )
     """,
     """
@@ -322,7 +355,7 @@ _DDL = (
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
         occurred_at TIMESTAMPTZ NOT NULL,
-        PRIMARY KEY (strategy_id, fact_id),
+        PRIMARY KEY (strategy_id, run_key, fact_id),
         UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
@@ -333,6 +366,7 @@ _DDL = (
     """
     CREATE TABLE IF NOT EXISTS {schema}.position_risk_updates (
         strategy_id TEXT NOT NULL,
+        run_key TEXT NOT NULL,
         fact_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
         side TEXT NOT NULL,
@@ -341,9 +375,9 @@ _DDL = (
         trailing_active BOOLEAN NOT NULL,
         position_mode TEXT NOT NULL,
         payload JSONB NOT NULL,
-        PRIMARY KEY (strategy_id, fact_id),
-        FOREIGN KEY (strategy_id, fact_id)
-            REFERENCES {schema}.position_risk_facts(strategy_id, fact_id)
+        PRIMARY KEY (strategy_id, run_key, fact_id),
+        FOREIGN KEY (strategy_id, run_key, fact_id)
+            REFERENCES {schema}.position_risk_facts(strategy_id, run_key, fact_id)
             ON DELETE CASCADE
     )
     """,
@@ -369,6 +403,7 @@ _DDL = (
     """,
     """
     CREATE TABLE IF NOT EXISTS {schema}.carry_accruals (
+        carry_ordinal BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
         strategy_id TEXT NOT NULL,
         accrual_id TEXT NOT NULL,
         run_key TEXT,
@@ -382,8 +417,8 @@ _DDL = (
         amount DOUBLE PRECISION NOT NULL,
         symbol TEXT,
         payload JSONB NOT NULL,
-        PRIMARY KEY (strategy_id, accrual_id),
-        UNIQUE (strategy_id, cost_type, lifecycle_id, accrual_date, symbol),
+        UNIQUE (strategy_id, run_key, accrual_id),
+        UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
         FOREIGN KEY (strategy_id)
@@ -403,8 +438,8 @@ _DDL = (
         event_type TEXT NOT NULL,
         occurred_at TIMESTAMPTZ NOT NULL,
         payload JSONB NOT NULL,
-        PRIMARY KEY (strategy_id, event_id),
-        UNIQUE (event_ordinal),
+        PRIMARY KEY (event_ordinal),
+        UNIQUE (strategy_id, run_key, event_id),
         UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
@@ -536,7 +571,7 @@ class PostgresLedgerStore:
             ).format(schema, schema),
             (strategy_id,),
         )
-        carry = tuple(
+        carry_occurrences = tuple(
             CarryAccrualRecord(
                 account_id=item[0],
                 cost_type=CarryCostType(item[1]),
@@ -548,6 +583,13 @@ class PostgresLedgerStore:
             )
             for item in cursor.fetchall()
         )
+        carry_by_key = {}
+        for item in carry_occurrences:
+            previous = carry_by_key.get(item.idempotency_key)
+            if previous is not None and previous != item:
+                raise LedgerError("conflicting carry accrual occurrence")
+            carry_by_key.setdefault(item.idempotency_key, item)
+        carry = tuple(carry_by_key.values())
         account = AccountSnapshot(
             id=row[0],
             strategy_id=strategy_id,
@@ -682,6 +724,8 @@ class PostgresLedgerStore:
                         """
                         INSERT INTO {}.accounts VALUES
                         (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        ON CONFLICT DO NOTHING
+                        RETURNING strategy_id
                         """
                     ).format(schema),
                     (
@@ -698,6 +742,20 @@ class PostgresLedgerStore:
                         account.snapshot_id,
                     ),
                 )
+                if cursor.fetchone() is None:
+                    try:
+                        existing = self._load_account_cursor(
+                            cursor, account.strategy_id
+                        )
+                    except KeyError as exc:
+                        raise LedgerError(
+                            "account creation collision with different persistent content"
+                        ) from exc
+                    if existing != account:
+                        raise LedgerError(
+                            "account creation collision with different persistent content"
+                        )
+                    return existing
                 self._write_current_account(cursor, account)
                 carry_keys = [item.idempotency_key for item in account.carry_accruals]
                 if len(set(carry_keys)) != len(carry_keys):
@@ -776,6 +834,7 @@ class PostgresLedgerStore:
             raise ValueError("strategy_id must be a non-empty string")
         psycopg, _sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
+            _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 return self._load_account_cursor(cursor, strategy_id)
 
@@ -784,21 +843,37 @@ class PostgresLedgerStore:
         schema = sql.Identifier(self.schema)
         cursor.execute(
             sql.SQL(
-                "SELECT i.payload, i.cancelled_revision "
+                "SELECT i.payload, i.cancelled_revision,"
+                "d.intent_fingerprint,d.payload "
                 "FROM {}.order_intents AS i JOIN {}.committed_runs AS r "
                 "ON r.strategy_id=i.strategy_id AND r.run_key=i.run_key "
+                "JOIN {}.order_intent_definitions AS d "
+                "ON d.strategy_id=i.strategy_id AND d.intent_id=i.intent_id "
                 "WHERE i.strategy_id=%s ORDER BY r.commit_ordinal,"
                 "i.ordinal,i.intent_id"
-            ).format(schema, schema),
+            ).format(schema, schema, schema),
             (strategy_id,),
         )
         intent_rows = cursor.fetchall()
-        intents = tuple(_intent_from_json(item[0]) for item in intent_rows)
+        intent_occurrences = tuple(_intent_from_json(item[0]) for item in intent_rows)
+        for intent, item in zip(intent_occurrences, intent_rows):
+            if (
+                item[2] != _intent_definition_fingerprint(intent)
+                or item[3] != item[0]
+            ):
+                raise LedgerError("order intent definition differs from occurrence")
         active_ids = {
             intent.id
-            for intent, row in zip(intents, intent_rows)
+            for intent, row in zip(intent_occurrences, intent_rows)
             if row[1] is None
         }
+        intents_by_id = {}
+        for intent in intent_occurrences:
+            previous = intents_by_id.get(intent.id)
+            if previous is not None and previous != intent:
+                raise LedgerError(f"conflicting intent ID: {intent.id}")
+            intents_by_id.setdefault(intent.id, intent)
+        intents = tuple(intents_by_id.values())
         cursor.execute(
             sql.SQL(
                 """
@@ -841,7 +916,16 @@ class PostgresLedgerStore:
             ).format(schema),
             (strategy_id,),
         )
-        events = tuple(_event_from_json(item[0]) for item in cursor.fetchall())
+        event_occurrences = tuple(
+            _event_from_json(item[0]) for item in cursor.fetchall()
+        )
+        events_by_id = {}
+        for event in event_occurrences:
+            previous = events_by_id.get(event.id)
+            if previous is not None and previous != event:
+                raise LedgerError(f"conflicting event ID: {event.id}")
+            events_by_id.setdefault(event.id, event)
+        events = tuple(events_by_id.values())
         return intents, progress, open_intents, open_progress, events
 
     def _load_normalized_batch_cursor(self, cursor: Any, row: tuple) -> DecisionBatch:
@@ -888,14 +972,17 @@ class PostgresLedgerStore:
         cursor.execute(
             sql.SQL(
                 """
-                SELECT ordinal,batch_ordinal,intent_id,strategy_revision,symbol,
-                       position_side,order_side,position_effect,quantity,reason,
-                       created_snapshot_id,created_market_at,payload
-                FROM {}.order_intents
-                WHERE strategy_id=%s AND run_key=%s
-                ORDER BY ordinal
+                SELECT i.ordinal,i.batch_ordinal,i.intent_id,i.strategy_revision,
+                       i.symbol,i.position_side,i.order_side,i.position_effect,
+                       i.quantity,i.reason,i.created_snapshot_id,i.created_market_at,
+                       i.payload,d.intent_fingerprint,d.payload
+                FROM {}.order_intents AS i
+                JOIN {}.order_intent_definitions AS d
+                  ON d.strategy_id=i.strategy_id AND d.intent_id=i.intent_id
+                WHERE i.strategy_id=%s AND i.run_key=%s
+                ORDER BY i.ordinal
                 """
-            ).format(schema),
+            ).format(schema, schema),
             key,
         )
         intent_rows = tuple(cursor.fetchall())
@@ -904,7 +991,7 @@ class PostgresLedgerStore:
         intent_public = []
         for item in intent_rows:
             intent = _intent_from_json(item[12])
-            if item[12] != _intent_to_json(intent) or (
+            occurrence_columns = (
                 intent.id,
                 strategy_revision,
                 intent.symbol,
@@ -915,7 +1002,13 @@ class PostgresLedgerStore:
                 intent.reason,
                 intent.created_snapshot_id,
                 intent.created_market_at,
-            ) != item[2:12]:
+            )
+            if (
+                item[12] != _intent_to_json(intent)
+                or item[13] != _intent_definition_fingerprint(intent)
+                or item[14] != item[12]
+                or occurrence_columns != item[2:12]
+            ):
                 raise LedgerError("order_intents columns differ from payload")
             intents.append(intent)
             intent_public.append((item[1], intent))
@@ -995,7 +1088,8 @@ class PostgresLedgerStore:
                        u.trough_price,u.trailing_active,u.position_mode,u.payload
                 FROM {}.position_risk_facts AS f
                 JOIN {}.position_risk_updates AS u
-                  ON u.strategy_id=f.strategy_id AND u.fact_id=f.fact_id
+                  ON u.strategy_id=f.strategy_id AND u.run_key=f.run_key
+                 AND u.fact_id=f.fact_id
                 WHERE f.strategy_id=%s AND f.run_key=%s
                 ORDER BY f.ordinal
                 """
@@ -1201,6 +1295,7 @@ class PostgresLedgerStore:
     def load_view(self, strategy_id: str) -> PortfolioLedgerView:
         psycopg, _sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
+            _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 account = self._load_account_cursor(cursor, strategy_id)
                 _all_intents, _all_progress, intents, progress, events = (
@@ -1219,6 +1314,7 @@ class PostgresLedgerStore:
     ) -> PortfolioPerformanceLedgerView:
         psycopg, sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
+            _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 account = self._load_account_cursor(cursor, strategy_id)
                 intents, progress, _open, _open_progress, events = (
@@ -1238,6 +1334,7 @@ class PostgresLedgerStore:
     def list_accounts(self) -> tuple[AccountSnapshot, ...]:
         psycopg, sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
+            _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 cursor.execute(
                     sql.SQL("SELECT strategy_id FROM {}.accounts ORDER BY strategy_id").format(
@@ -1258,6 +1355,7 @@ class PostgresLedgerStore:
     ) -> DecisionBatch | None:
         psycopg, sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
+            _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 cursor.execute(
                     sql.SQL(
@@ -1435,7 +1533,10 @@ class PostgresLedgerStore:
                 cursor.execute(
                     sql.SQL(
                         """
-                        SELECT request_fingerprint,batch_fingerprint
+                        SELECT strategy_id,run_key,commit_ordinal,strategy_revision,
+                               source_snapshot_id,result_snapshot_id,market_snapshot_id,
+                               request_fingerprint,batch_fingerprint,metadata_payload,
+                               batch_payload
                         FROM {}.committed_runs
                         WHERE strategy_id=%s AND run_key=%s
                         """
@@ -1445,9 +1546,14 @@ class PostgresLedgerStore:
                 existing_run = cursor.fetchone()
                 if existing_run is not None:
                     if (
-                        existing_run[0] != batch.request_fingerprint
-                        or existing_run[1] != fingerprint
+                        existing_run[7] != batch.request_fingerprint
+                        or existing_run[8] != fingerprint
                     ):
+                        raise LedgerError(
+                            "run_key was already committed with different facts"
+                        )
+                    committed = self._load_normalized_batch_cursor(cursor, existing_run)
+                    if canonical_graph(committed) != canonical_graph(batch):
                         raise LedgerError(
                             "run_key was already committed with different facts"
                         )
@@ -1594,7 +1700,6 @@ class PostgresLedgerStore:
                 (strategy_id,event_id,run_key,strategy_revision,ordinal,
                  batch_ordinal,source_kind,event_type,occurred_at,payload)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (strategy_id,event_id) DO NOTHING
                 """
             ).format(sql.Identifier(self.schema)),
             (
@@ -1626,6 +1731,41 @@ class PostgresLedgerStore:
         intents, _fills, progress, updates, settlement_updates, accruals = (
             canonical_facts
         )
+        for intent in intents:
+            payload = _intent_to_json(intent)
+            definition_fingerprint = _intent_definition_fingerprint(intent)
+            cursor.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {}.order_intent_definitions
+                    (strategy_id,intent_id,intent_fingerprint,payload)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (strategy_id,intent_id) DO NOTHING
+                    RETURNING intent_id
+                    """
+                ).format(schema),
+                (
+                    batch.strategy_id,
+                    intent.id,
+                    definition_fingerprint,
+                    Jsonb(payload),
+                ),
+            )
+            if cursor.fetchone() is None:
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT intent_fingerprint,payload
+                        FROM {}.order_intent_definitions
+                        WHERE strategy_id=%s AND intent_id=%s
+                        FOR SHARE
+                        """
+                    ).format(schema),
+                    (batch.strategy_id, intent.id),
+                )
+                existing_definition = cursor.fetchone()
+                if existing_definition != (definition_fingerprint, payload):
+                    raise LedgerError(f"conflicting intent ID: {intent.id}")
         for ordinal, intent in enumerate(intents):
             cursor.execute(
                 sql.SQL(
@@ -1636,7 +1776,6 @@ class PostgresLedgerStore:
                      reason,created_snapshot_id,created_market_at,
                      cancelled_revision,payload)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s)
-                    ON CONFLICT (strategy_id,intent_id) DO NOTHING
                     """
                 ).format(schema),
                 (
@@ -1746,13 +1885,14 @@ class PostgresLedgerStore:
                 sql.SQL(
                     """
                     INSERT INTO {}.position_risk_updates
-                    (strategy_id,fact_id,symbol,side,peak_price,trough_price,
+                    (strategy_id,run_key,fact_id,symbol,side,peak_price,trough_price,
                      trailing_active,position_mode,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """
                 ).format(schema),
                 (
                     batch.strategy_id,
+                    batch.run_key,
                     fact.fact_id,
                     update.symbol,
                     update.side.value,
@@ -1815,7 +1955,6 @@ class PostgresLedgerStore:
                      account_id,cost_type,
                      lifecycle_id,accrual_date,elapsed_days,amount,symbol,payload)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (strategy_id,accrual_id) DO NOTHING
                     """
                 ).format(schema),
                 (

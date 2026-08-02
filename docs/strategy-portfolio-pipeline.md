@@ -110,7 +110,7 @@ Hermes 可通过以下环境变量同步三个现有任务：
 
 ## PostgreSQL 迁移与隔离集成测试
 
-`PostgresLedgerStore` 是独立的可选适配器，不继承 JSON 或内存账本；生产 JSON 部署也不依赖 Psycopg。PostgreSQL 把 canonical 事实拆分到 14 张规范化表：账户、持仓、借券与融资生命周期、已提交批次、订单意图、执行进度、成交、持仓风险事实与更新、结算更新、费用计提、事件和 revision 迁移。`batch_payload` 只是审计副本，不是读取权威；当前账户、开放订单、已提交批次和策略表现都从类型化关系表重建，不保存或读取整份 `ledger_state`。
+`PostgresLedgerStore` 是独立的可选适配器，不继承 JSON 或内存账本；生产 JSON 部署也不依赖 Psycopg。PostgreSQL 把 canonical 事实拆分到 15 张规范化表：账户、持仓、借券与融资生命周期、已提交批次、订单意图定义、每 run 的订单意图 occurrence、执行进度、成交、持仓风险事实与更新、结算更新、费用计提、事件和 revision 迁移。订单意图定义以 `(strategy_id, intent_id)` 全局唯一并校验 payload fingerprint，occurrence 以 `(strategy_id, run_key, intent_id)` 标识，因此同一 canonical intent 可以被多个 run 完整引用，内容冲突仍会 fail-closed。`batch_payload` 只是审计副本，不是读取权威；当前账户、开放订单、已提交批次和策略表现都从类型化关系表重建，不保存或读取整份 `ledger_state`。所有需要多条查询重建结果的公开只读入口都在 `REPEATABLE READ READ ONLY` 事务中运行，避免账户、facts 与批次来自不同数据库快照。
 
 读取已提交批次时，适配器用 `committed_runs` 元数据及各事实表的 ordinal 重建完整 `DecisionBatch`，再将 canonical graph 和 fingerprint 与审计副本及已存指纹逐项核对。任何事实缺行、多行、ordinal 断裂、列与 payload 不一致或审计副本被修改都会 fail-closed。批次事件通过 `source_kind` 区分原始事件与账本派生事件：前者还原到 `DecisionBatch.events`，后者只进入 ledger event view。
 

@@ -55,6 +55,7 @@ from stock_recommender.portfolio_engine.contracts import (
 from stock_recommender.portfolio_engine.ledger import (
     InMemoryLedgerStore,
     JsonLedgerStore,
+    LedgerError,
     _batch_fingerprint,
     _canonical_batch_facts,
     _carry_to_json,
@@ -980,6 +981,7 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             "borrow_lifecycles",
             "financing_lifecycles",
             "committed_runs",
+            "order_intent_definitions",
             "order_intents",
             "execution_progress",
             "fills",
@@ -1024,6 +1026,87 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             for table in required_tables - {"accounts"}:
                 self.assertIn("FOREIGN KEY", by_table.get(table, set()), table)
             self.assertIn("UNIQUE", by_table.get("committed_runs", set()))
+
+    def test_intent_definition_registry_enforces_relationships_and_conflicts(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-normalized-authority",
+                strategy_id="normalized-authority",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                snapshot_id="normalized-authority-bootstrap",
+            )
+            store.create_account(account)
+            batch = _simple_filled_batch(account)
+            store.commit(batch)
+
+            import psycopg
+            from psycopg import sql
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                relationships = {
+                    row[0]
+                    for row in connection.execute(
+                        """
+                        SELECT tc.table_name
+                        FROM information_schema.table_constraints AS tc
+                        JOIN information_schema.constraint_column_usage AS ccu
+                          ON ccu.constraint_schema=tc.constraint_schema
+                         AND ccu.constraint_name=tc.constraint_name
+                        WHERE tc.constraint_schema=%s
+                          AND tc.constraint_type='FOREIGN KEY'
+                          AND ccu.table_name='order_intent_definitions'
+                        """,
+                        (schema,),
+                    ).fetchall()
+                }
+                self.assertEqual(
+                    relationships,
+                    {"order_intents", "execution_progress", "fills"},
+                )
+                with self.assertRaises(psycopg.errors.ForeignKeyViolation):
+                    connection.execute(
+                        sql.SQL(
+                            "DELETE FROM {}.order_intent_definitions "
+                            "WHERE strategy_id=%s AND intent_id=%s"
+                        ).format(sql.Identifier(schema)),
+                        (batch.strategy_id, batch.intents[0].id),
+                    )
+                connection.rollback()
+
+            current = store.load(batch.strategy_id)
+            conflict = _simple_batch(
+                current,
+                run_key="intent-definition-conflict",
+                intent_id=batch.intents[0].id,
+                market_snapshot_id="intent-definition-conflict-market",
+            )
+            conflict = replace(
+                conflict,
+                intents=(replace(conflict.intents[0], quantity=2),),
+            )
+            with self.assertRaisesRegex(LedgerError, "conflicting intent ID"):
+                store.commit(conflict)
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                definition_count = connection.execute(
+                    sql.SQL(
+                        "SELECT COUNT(*) FROM {}.order_intent_definitions "
+                        "WHERE strategy_id=%s AND intent_id=%s"
+                    ).format(sql.Identifier(schema)),
+                    (batch.strategy_id, batch.intents[0].id),
+                ).fetchone()[0]
+                occurrence_count = connection.execute(
+                    sql.SQL(
+                        "SELECT COUNT(*) FROM {}.order_intents "
+                        "WHERE strategy_id=%s AND intent_id=%s"
+                    ).format(sql.Identifier(schema)),
+                    (batch.strategy_id, batch.intents[0].id),
+                ).fetchone()[0]
+            self.assertEqual(definition_count, 1)
+            self.assertEqual(occurrence_count, 1)
 
     def test_create_load_and_typed_views_round_trip_current_account(self):
         with isolated_postgres_schema(DATABASE_URL) as schema:
@@ -1098,6 +1181,395 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                 (financed, empty),
             )
 
+    def test_same_market_snapshot_repeated_canonical_intents_are_per_run_facts(self):
+        strategy_id = "repeated-canonical-intents"
+        strategy = long_short_strategy(strategy_id)
+        market = _market(0)
+        analyzed_rows = tuple({"symbol": symbol} for symbol in SYMBOLS)
+        event_calendar = {symbol: None for symbol in SYMBOLS}
+
+        def exercise(store):
+            store.create_account(
+                AccountSnapshot(
+                    id=f"account-{strategy_id}",
+                    strategy_id=strategy_id,
+                    strategy_revision=1,
+                    occurred_at=START,
+                    available_cash=100_000.0,
+                    snapshot_id=f"bootstrap-{strategy_id}",
+                )
+            )
+            engine = PortfolioEngine(
+                signal_registry={
+                    "month-long-v1": FixedSignals(
+                        "month-long-v1",
+                        PositionSide.LONG,
+                        tuple(f"L{index}" for index in range(8)),
+                    ),
+                    "month-short-v1": FixedSignals(
+                        "month-short-v1", PositionSide.SHORT, ("S0", "S1")
+                    ),
+                },
+                ledger_store=store,
+            )
+            batches = []
+            for index in range(2):
+                batches.append(
+                    engine.plan_and_commit(
+                        PlanRequest(
+                            run_key=f"same-market-run-{index}",
+                            strategy=strategy,
+                            account=store.load(strategy_id),
+                            analyzed_rows=analyzed_rows,
+                            market=market,
+                            borrow=_borrow(0),
+                            event_calendar=event_calendar,
+                        )
+                    )
+                )
+            self.assertTrue(batches[0].intents)
+            self.assertEqual(
+                tuple(item.id for item in batches[0].intents),
+                tuple(item.id for item in batches[1].intents),
+            )
+            loaded = tuple(
+                store.load_committed_batch(
+                    strategy_id, batch.run_key, batch.request_fingerprint
+                )
+                for batch in batches
+            )
+            self.assertTrue(all(item is not None for item in loaded))
+            performance = store.load_performance_view(strategy_id)
+            self.assertEqual(len(performance.batches), 2)
+            return batches, loaded, performance
+
+        with TemporaryDirectory() as temp_dir:
+            memory_result = exercise(
+                InMemoryLedgerStore(Path(temp_dir) / "repeated-intents.lock")
+            )
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            postgres_result = exercise(
+                self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            )
+
+        memory_batches, memory_loaded, memory_performance = memory_result
+        postgres_batches, postgres_loaded, postgres_performance = postgres_result
+        self.assertEqual(
+            tuple(canonical_graph(item) for item in postgres_batches),
+            tuple(canonical_graph(item) for item in memory_batches),
+        )
+        self.assertEqual(
+            tuple(canonical_graph(item) for item in postgres_loaded),
+            tuple(canonical_graph(item) for item in memory_loaded),
+        )
+        self.assertEqual(
+            tuple(canonical_graph(item) for item in postgres_performance.batches),
+            tuple(canonical_graph(item) for item in memory_performance.batches),
+        )
+
+    def test_repeated_event_and_carry_ids_are_preserved_in_each_run(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-repeated-carry",
+                strategy_id="repeated-carry",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                margin_loan=100.0,
+                financing_lifecycle=AccrualLifecycle(
+                    id="financing-repeated-carry",
+                    started_on=START.date(),
+                ),
+                snapshot_id="repeated-carry-bootstrap",
+            )
+            store.create_account(account)
+            accrual = CarryAccrualRecord(
+                account_id=account.id,
+                cost_type=CarryCostType.FINANCING,
+                accrual_date=(START + timedelta(days=1)).date(),
+                elapsed_days=1,
+                amount=2.0,
+                lifecycle_id=account.financing_lifecycle.id,
+            )
+            event = PortfolioEvent(
+                id="repeated-financing-event",
+                type="FINANCING_COST_ACCRUED",
+                occurred_at=START + timedelta(days=1),
+                data={
+                    "account_id": account.id,
+                    "cost_type": "FINANCING",
+                    "lifecycle_id": accrual.lifecycle_id,
+                    "symbol": None,
+                    "accrual_date": accrual.accrual_date.isoformat(),
+                    "elapsed_days": accrual.elapsed_days,
+                    "amount": accrual.amount,
+                },
+            )
+            batches = []
+            for index in range(2):
+                current = store.load(account.strategy_id)
+                batch = DecisionBatch(
+                    run_key=f"repeated-carry-run-{index}",
+                    strategy_id=account.strategy_id,
+                    strategy_revision=1,
+                    portfolio_snapshot_id=current.snapshot_id,
+                    market_snapshot_id="repeated-carry-market",
+                    request_fingerprint=f"repeated-carry-request-{index}",
+                    events=(event,),
+                    carry_accruals=(accrual,),
+                )
+                store.commit(batch)
+                batches.append(batch)
+
+            loaded = tuple(
+                store.load_committed_batch(
+                    account.strategy_id, batch.run_key, batch.request_fingerprint
+                )
+                for batch in batches
+            )
+            self.assertEqual(
+                tuple(item.events for item in loaded), ((event,), (event,))
+            )
+            self.assertEqual(
+                tuple(item.carry_accruals for item in loaded),
+                ((accrual,), (accrual,)),
+            )
+            self.assertEqual(
+                len(store.load_performance_view(account.strategy_id).batches),
+                2,
+            )
+
+    def test_idempotent_commit_retry_revalidates_normalized_facts(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-retry-validation",
+                strategy_id="retry-validation",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                snapshot_id="retry-validation-bootstrap",
+            )
+            store.create_account(account)
+            batch = _simple_batch(
+                account,
+                run_key="retry-validation-run",
+                intent_id="retry-validation-intent",
+                market_snapshot_id="retry-validation-market",
+            )
+            store.commit(batch)
+
+            import psycopg
+            from psycopg import sql
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                connection.execute(
+                    sql.SQL(
+                        "UPDATE {}.order_intents SET payload=jsonb_set("
+                        "payload,'{{quantity}}','2'::jsonb) "
+                        "WHERE strategy_id=%s AND run_key=%s"
+                    ).format(sql.Identifier(schema)),
+                    (account.strategy_id, batch.run_key),
+                )
+
+            with self.assertRaises(LedgerError):
+                store.commit(batch)
+
+    def test_concurrent_create_account_is_idempotent_and_fail_closed(self):
+        import psycopg
+
+        class BarrierCursor:
+            def __init__(self, cursor, barrier):
+                self._cursor = cursor
+                self._barrier = barrier
+                self._await_missing_account = False
+
+            def __enter__(self):
+                self._cursor.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._cursor.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+
+            def execute(self, query, params=None):
+                self._await_missing_account = (
+                    "SELECT strategy_id FROM" in str(query)
+                    and "accounts" in str(query)
+                    and "FOR UPDATE" in str(query)
+                )
+                self._cursor.execute(query, params)
+                return self
+
+            def fetchone(self):
+                row = self._cursor.fetchone()
+                if self._await_missing_account and row is None:
+                    self._barrier.wait(timeout=5)
+                return row
+
+        class BarrierConnection:
+            def __init__(self, connection, barrier):
+                self._connection = connection
+                self._barrier = barrier
+
+            def __enter__(self):
+                self._connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._connection.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self._connection, name)
+
+            def cursor(self, *args, **kwargs):
+                return BarrierCursor(
+                    self._connection.cursor(*args, **kwargs), self._barrier
+                )
+
+        def run_pair(stores, accounts):
+            barrier = threading.Barrier(2)
+            results = []
+            errors = []
+            real_connect = psycopg.connect
+
+            def synchronized_connect(*args, **kwargs):
+                connection = real_connect(*args, **kwargs)
+                connection.execute("SET lock_timeout = '5s'")
+                connection.execute("SET statement_timeout = '8s'")
+                return BarrierConnection(connection, barrier)
+
+            def create(store, account):
+                try:
+                    results.append(store.create_account(account))
+                except Exception as error:  # captured for cross-thread assertion
+                    errors.append(error)
+
+            with patch("psycopg.connect", side_effect=synchronized_connect):
+                threads = tuple(
+                    threading.Thread(target=create, args=(store, account))
+                    for store, account in zip(stores, accounts)
+                )
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=10)
+                self.assertTrue(all(not thread.is_alive() for thread in threads))
+            return results, errors
+
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            stores = tuple(
+                self.PostgresLedgerStore(DATABASE_URL, schema=schema) for _ in range(2)
+            )
+            same = AccountSnapshot(
+                id="account-concurrent-same",
+                strategy_id="concurrent-same",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                snapshot_id="concurrent-same-bootstrap",
+            )
+            results, errors = run_pair(stores, (same, same))
+            self.assertEqual(errors, [])
+            self.assertEqual(results, [same, same])
+            self.assertEqual(stores[0].load(same.strategy_id), same)
+
+            first = replace(
+                same,
+                id="account-concurrent-conflict",
+                strategy_id="concurrent-conflict",
+                snapshot_id="concurrent-conflict-bootstrap-a",
+            )
+            second = replace(
+                first,
+                available_cash=2_000.0,
+                snapshot_id="concurrent-conflict-bootstrap-b",
+            )
+            results, errors = run_pair(stores, (first, second))
+            self.assertEqual(len(results), 1)
+            self.assertEqual(len(errors), 1)
+            self.assertIsInstance(errors[0], LedgerError)
+            self.assertIn(
+                stores[0].load(first.strategy_id),
+                (first, second),
+            )
+
+    def test_performance_view_uses_one_database_snapshot(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            reader = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            writer = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-consistent-read",
+                strategy_id="consistent-read",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                snapshot_id="consistent-read-bootstrap",
+            )
+            reader.create_account(account)
+            batch = _simple_batch(
+                account,
+                run_key="consistent-read-run",
+                intent_id="consistent-read-intent",
+                market_snapshot_id="consistent-read-market",
+            )
+
+            account_read = threading.Event()
+            write_finished = threading.Event()
+            original_load_account = reader._load_account_cursor
+            views = []
+            errors = []
+
+            def load_account_then_pause(cursor, strategy_id):
+                loaded = original_load_account(cursor, strategy_id)
+                account_read.set()
+                if not write_finished.wait(timeout=8):
+                    raise AssertionError("writer did not finish before read timeout")
+                return loaded
+
+            reader._load_account_cursor = load_account_then_pause
+
+            def read_view():
+                try:
+                    views.append(reader.load_performance_view(account.strategy_id))
+                except Exception as error:  # captured for cross-thread assertion
+                    errors.append(error)
+
+            def commit_after_account_read():
+                try:
+                    if not account_read.wait(timeout=8):
+                        raise AssertionError("reader did not reach account barrier")
+                    writer.commit(batch)
+                except Exception as error:  # captured for cross-thread assertion
+                    errors.append(error)
+                finally:
+                    write_finished.set()
+
+            threads = (
+                threading.Thread(target=read_view),
+                threading.Thread(target=commit_after_account_read),
+            )
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(errors, [])
+            self.assertEqual(len(views), 1)
+
+            committed = writer.load(account.strategy_id)
+            observed = (views[0].account.snapshot_id, len(views[0].batches))
+            self.assertIn(
+                observed,
+                {
+                    (account.snapshot_id, 0),
+                    (committed.snapshot_id, 1),
+                },
+            )
+
     def test_normalized_fact_rows_are_required_to_rebuild_batches(self):
         mutations = {
             "missing_fact": (
@@ -1131,7 +1603,7 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                 FROM {}.order_intents
                 WHERE strategy_id=%s AND run_key=%s
                 """,
-                ("double_schema",),
+                ("double_schema", "extra_definition"),
             ),
             "audit_payload": (
                 "UPDATE {}.committed_runs SET batch_payload='{{}}'::jsonb "
@@ -1209,6 +1681,25 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                     if "double_schema" in options:
                         identifiers.append(sql.Identifier(schema))
                     with psycopg.connect(DATABASE_URL) as connection:
+                        if "extra_definition" in options:
+                            connection.execute(
+                                sql.SQL(
+                                    """
+                                    INSERT INTO {}.order_intent_definitions
+                                    (strategy_id,intent_id,intent_fingerprint,payload)
+                                    SELECT strategy_id,'normalized-authority-extra',
+                                           'tampered-extra-definition',
+                                           jsonb_set(payload,'{{id}}',to_jsonb(
+                                               'normalized-authority-extra'::text))
+                                    FROM {}.order_intents
+                                    WHERE strategy_id=%s AND run_key=%s
+                                    """
+                                ).format(
+                                    sql.Identifier(schema),
+                                    sql.Identifier(schema),
+                                ),
+                                (account.strategy_id, batch.run_key),
+                            )
                         connection.execute(
                             sql.SQL(statement).format(*identifiers),
                             (account.strategy_id, batch.run_key),
