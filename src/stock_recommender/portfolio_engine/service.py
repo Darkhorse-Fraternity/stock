@@ -161,6 +161,25 @@ def _report_number(value: object) -> float | None:
 def _performance_runtime(view: object) -> PerformanceRuntime:
     completed_events = [event for event in view.events if event.type == "PIPELINE_COMPLETED"]
     if not completed_events:
+        if view.batches:
+            return PerformanceRuntime(
+                availability=PerformanceHistoryAvailability(
+                    complete=False,
+                    source="v2_ledger",
+                    reason=(
+                        "canonical pipeline completion event and run identity "
+                        "are unavailable for persisted DecisionBatch history"
+                    ),
+                ),
+            )
+        if not getattr(view, "lifecycle_complete", True):
+            return PerformanceRuntime(
+                availability=PerformanceHistoryAvailability(
+                    complete=False,
+                    source="v2_ledger",
+                    reason="canonical pipeline runtime history is incomplete",
+                ),
+            )
         return PerformanceRuntime()
     event = max(completed_events, key=lambda item: item.occurred_at)
     raw_run_key = event.data.get("run_key")

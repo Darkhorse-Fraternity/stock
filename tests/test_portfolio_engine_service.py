@@ -236,6 +236,31 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertIsNone(unavailable.last_pipeline_market_regime)
         self.assertIsNone(unavailable.last_pipeline_data_quality)
 
+        missing_completion = service._performance_runtime(
+            SimpleNamespace(
+                events=(),
+                batches=(batch,),
+                lifecycle_complete=True,
+            )
+        )
+        self.assertFalse(missing_completion.availability.complete)
+        self.assertEqual(missing_completion.availability.source, "v2_ledger")
+        self.assertIn(
+            "canonical pipeline completion",
+            missing_completion.availability.reason,
+        )
+        self.assertIsNone(missing_completion.last_successful_pipeline_at)
+        self.assertIsNone(missing_completion.last_successful_pipeline_run_id)
+        self.assertIsNone(missing_completion.last_pipeline_admitted)
+        self.assertIsNone(missing_completion.last_pipeline_stages)
+        self.assertIsNone(missing_completion.last_pipeline_market_regime)
+        self.assertIsNone(missing_completion.last_pipeline_data_quality)
+
+        fresh = service._performance_runtime(
+            SimpleNamespace(events=(), batches=(), lifecycle_complete=True)
+        )
+        self.assertTrue(fresh.availability.complete)
+
     def test_performance_lifecycle_requires_fills_to_explain_current_positions(self):
         source = contracts.PerformanceStrategySource(
             id="strategy-us",
