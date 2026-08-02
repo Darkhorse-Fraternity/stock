@@ -1653,6 +1653,334 @@ class PortfolioLedgerView(_DeeplyImmutable):
         object.__setattr__(self, "recent_events", events)
 
 
+@dataclass(frozen=True)
+class PortfolioPerformanceLedgerView(_DeeplyImmutable):
+    """Canonical lifecycle facts exposed only to read-only performance services."""
+
+    account: AccountSnapshot
+    intents: tuple[OrderIntent, ...] = ()
+    execution_progress: tuple[OrderExecutionProgress, ...] = ()
+    events: tuple[PortfolioEvent, ...] = ()
+    batches: tuple[DecisionBatch, ...] = ()
+    lifecycle_complete: bool = True
+    lifecycle_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.account) is not AccountSnapshot:
+            raise TypeError("account must be AccountSnapshot")
+        intents = _typed_tuple(self.intents, OrderIntent, "intents")
+        progress = _typed_tuple(
+            self.execution_progress,
+            OrderExecutionProgress,
+            "execution_progress",
+        )
+        events = _typed_tuple(self.events, PortfolioEvent, "events")
+        batches = _typed_tuple(self.batches, DecisionBatch, "batches")
+        if type(self.lifecycle_complete) is not bool:
+            raise TypeError("lifecycle_complete must be a boolean")
+        if self.lifecycle_reason is not None:
+            _require_string(self.lifecycle_reason, "lifecycle_reason")
+        intent_ids = {item.id for item in intents}
+        if len(intent_ids) != len(intents):
+            raise ValueError("performance intents must have unique IDs")
+        if self.lifecycle_complete and any(
+            item.intent_id not in intent_ids for item in progress
+        ):
+            raise ValueError("performance progress must refer to a known intent")
+        object.__setattr__(self, "intents", intents)
+        object.__setattr__(self, "execution_progress", progress)
+        object.__setattr__(self, "events", events)
+        object.__setattr__(self, "batches", batches)
+
+
+@dataclass(frozen=True)
+class PerformanceHistoryAvailability(_DeeplyImmutable):
+    complete: bool
+    source: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.complete) is not bool:
+            raise TypeError("complete must be a boolean")
+        _require_string(self.source, "source")
+        if self.reason is not None:
+            _require_string(self.reason, "reason")
+
+
+@dataclass(frozen=True)
+class PerformanceHistoryStatus(_DeeplyImmutable):
+    nav: PerformanceHistoryAvailability
+    lifecycle: PerformanceHistoryAvailability
+
+    def __post_init__(self) -> None:
+        if type(self.nav) is not PerformanceHistoryAvailability:
+            raise TypeError("nav must be PerformanceHistoryAvailability")
+        if type(self.lifecycle) is not PerformanceHistoryAvailability:
+            raise TypeError("lifecycle must be PerformanceHistoryAvailability")
+
+
+@dataclass(frozen=True)
+class PerformanceStrategySource(_DeeplyImmutable):
+    """Validated strategy/report metadata supplied explicitly to the engine."""
+
+    id: str
+    name: str
+    revision: int
+    stage: str
+    market: str
+    market_label: str
+    currency: str
+    currency_symbol: str
+    initial_cash: float
+    max_positions: int
+    signal_model: str | None = None
+    signal_time: str | None = None
+    signal_data_cutoff: str | None = None
+    allocation_model: str | None = None
+    benchmark_symbol: str | None = None
+    benchmark_name: str | None = None
+    market_regime: Mapping[str, Any] | None = None
+    risk_level: str | None = None
+    trading_mode: str | None = None
+    target_exposure_pct: float | None = None
+    config: Mapping[str, Any] = field(default_factory=dict)
+    allocation: Mapping[str, Any] = field(default_factory=dict)
+    symbol_names: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for field_name in (
+            "id",
+            "name",
+            "stage",
+            "market",
+            "market_label",
+            "currency",
+            "currency_symbol",
+        ):
+            _require_string(getattr(self, field_name), field_name)
+        _require_integer(self.revision, "revision")
+        _require_positive_finite_number(self.initial_cash, "initial_cash")
+        _require_integer(self.max_positions, "max_positions")
+        if self.max_positions <= 0:
+            raise ValueError("max_positions must be positive")
+        for field_name in (
+            "signal_model",
+            "signal_time",
+            "signal_data_cutoff",
+            "allocation_model",
+            "benchmark_symbol",
+            "benchmark_name",
+            "risk_level",
+            "trading_mode",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_string(value, field_name)
+        if self.target_exposure_pct is not None:
+            _require_finite_number(self.target_exposure_pct, "target_exposure_pct")
+        if self.market_regime is not None:
+            _require_mapping(self.market_regime, "market_regime")
+            object.__setattr__(self, "market_regime", _deep_freeze(self.market_regime))
+        for field_name in ("config", "allocation", "symbol_names"):
+            value = getattr(self, field_name)
+            _require_mapping(value, field_name)
+            object.__setattr__(self, field_name, _deep_freeze(value))
+
+
+@dataclass(frozen=True)
+class PerformanceProjectionRequest(_DeeplyImmutable):
+    strategy: PerformanceStrategySource
+    market: MarketSnapshot
+    generated_at: datetime
+    valuation_source: str
+    quote_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.strategy) is not PerformanceStrategySource:
+            raise TypeError("strategy must be PerformanceStrategySource")
+        if type(self.market) is not MarketSnapshot:
+            raise TypeError("market must be MarketSnapshot")
+        _require_datetime(self.generated_at, "generated_at")
+        _require_string(self.valuation_source, "valuation_source")
+        if self.quote_error is not None:
+            _require_string(self.quote_error, "quote_error")
+
+
+@dataclass(frozen=True)
+class PerformanceSummary(_DeeplyImmutable):
+    initial_cash: float
+    nav: float
+    cash: float
+    reserved_cash: float
+    market_value: float
+    cumulative_return_pct: float
+    maximum_drawdown_pct: float | None
+    realized_pnl: float | None
+    unrealized_pnl: float
+    position_count: int
+    max_positions: int
+    target_exposure_pct: float | None
+    closed_trade_count: int
+    win_rate_pct: float | None
+
+
+@dataclass(frozen=True)
+class PerformanceRuntime(_DeeplyImmutable):
+    last_successful_pipeline_at: datetime | None = None
+    last_successful_pipeline_run_id: str | None = None
+    last_pipeline_admitted: int | None = None
+    last_pipeline_stages: tuple[Mapping[str, Any], ...] = ()
+    last_pipeline_data_quality: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.last_successful_pipeline_at is not None:
+            _require_datetime(self.last_successful_pipeline_at, "last_successful_pipeline_at")
+        if self.last_successful_pipeline_run_id is not None:
+            _require_string(self.last_successful_pipeline_run_id, "last_successful_pipeline_run_id")
+        if self.last_pipeline_admitted is not None:
+            _require_integer(self.last_pipeline_admitted, "last_pipeline_admitted")
+        stages = _mapping_tuple(self.last_pipeline_stages, "last_pipeline_stages")
+        _require_mapping(self.last_pipeline_data_quality, "last_pipeline_data_quality")
+        object.__setattr__(self, "last_pipeline_stages", stages)
+        object.__setattr__(
+            self,
+            "last_pipeline_data_quality",
+            _deep_freeze(self.last_pipeline_data_quality),
+        )
+
+
+@dataclass(frozen=True)
+class PerformanceNavPoint(_DeeplyImmutable):
+    at: datetime
+    nav: float
+    source: str
+
+
+@dataclass(frozen=True)
+class PerformancePosition(_DeeplyImmutable):
+    slot_id: int
+    name: str
+    symbol: str
+    first_entry_price: float | None
+    first_entry_at: datetime | None
+    current_price: float
+    day_change_pct: float | None
+    return_pct: float
+    unrealized_pnl: float
+    weight_pct: float
+    quantity: int
+    sellable_quantity: int | None
+    trailing_active: bool
+    signal_invalid_days: int | None
+    exit_distance_pct: float | None
+    market_value: float
+    average_cost: float
+    position_side: str
+
+
+@dataclass(frozen=True)
+class PerformanceOrder(_DeeplyImmutable):
+    id: str
+    side: str
+    symbol: str
+    name: str
+    quantity: int
+    filled_quantity: int
+    status: str
+    reason: str
+    created_at: datetime
+    updated_at: datetime
+    filled_notional: float
+    commission_charged: float
+    fees_charged: float
+    strategy_revision: int
+    position_side: str
+    position_effect: str
+
+
+@dataclass(frozen=True)
+class PerformanceClosedTrade(_DeeplyImmutable):
+    id: str
+    name: str
+    symbol: str
+    entry_price: float
+    exit_price: float
+    quantity: int
+    realized_pnl: float
+    return_pct: float
+    reason: str
+    closed_at: datetime
+    strategy_revision: int
+    position_side: str
+
+
+@dataclass(frozen=True)
+class PerformanceEventView(_DeeplyImmutable):
+    id: str
+    type: str
+    occurred_at: datetime
+    message: str
+    strategy_revision: int
+    data: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        _require_mapping(self.data, "data")
+        object.__setattr__(self, "data", _deep_freeze(self.data))
+
+
+@dataclass(frozen=True)
+class StrategyPerformanceProjection(_DeeplyImmutable):
+    generated_at: datetime
+    quote_error: str | None
+    strategy: PerformanceStrategySource
+    summary: PerformanceSummary
+    runtime: PerformanceRuntime
+    nav_history: tuple[PerformanceNavPoint, ...]
+    positions: tuple[PerformancePosition, ...]
+    orders: tuple[PerformanceOrder, ...]
+    closed_trades: tuple[PerformanceClosedTrade, ...]
+    events: tuple[PerformanceEventView, ...]
+    history_availability: PerformanceHistoryStatus
+
+    def __post_init__(self) -> None:
+        _require_datetime(self.generated_at, "generated_at")
+        if self.quote_error is not None:
+            _require_string(self.quote_error, "quote_error")
+        if type(self.strategy) is not PerformanceStrategySource:
+            raise TypeError("strategy must be PerformanceStrategySource")
+        if type(self.summary) is not PerformanceSummary:
+            raise TypeError("summary must be PerformanceSummary")
+        if type(self.runtime) is not PerformanceRuntime:
+            raise TypeError("runtime must be PerformanceRuntime")
+        if type(self.history_availability) is not PerformanceHistoryStatus:
+            raise TypeError("history_availability must be PerformanceHistoryStatus")
+        object.__setattr__(
+            self,
+            "nav_history",
+            _typed_tuple(self.nav_history, PerformanceNavPoint, "nav_history"),
+        )
+        object.__setattr__(
+            self,
+            "positions",
+            _typed_tuple(self.positions, PerformancePosition, "positions"),
+        )
+        object.__setattr__(
+            self,
+            "orders",
+            _typed_tuple(self.orders, PerformanceOrder, "orders"),
+        )
+        object.__setattr__(
+            self,
+            "closed_trades",
+            _typed_tuple(self.closed_trades, PerformanceClosedTrade, "closed_trades"),
+        )
+        object.__setattr__(
+            self,
+            "events",
+            _typed_tuple(self.events, PerformanceEventView, "events"),
+        )
+
+
 _DEEPLY_IMMUTABLE_TYPES = (
     AccrualLifecycle,
     PositionSnapshot,
@@ -1676,4 +2004,17 @@ _DEEPLY_IMMUTABLE_TYPES = (
     ProcessRequest,
     PortfolioSnapshot,
     PortfolioLedgerView,
+    PortfolioPerformanceLedgerView,
+    PerformanceHistoryAvailability,
+    PerformanceHistoryStatus,
+    PerformanceStrategySource,
+    PerformanceProjectionRequest,
+    PerformanceSummary,
+    PerformanceRuntime,
+    PerformanceNavPoint,
+    PerformancePosition,
+    PerformanceOrder,
+    PerformanceClosedTrade,
+    PerformanceEventView,
+    StrategyPerformanceProjection,
 )

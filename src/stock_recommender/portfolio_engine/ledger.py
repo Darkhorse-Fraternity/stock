@@ -32,6 +32,7 @@ from .contracts import (
     OrderSide,
     PortfolioEvent,
     PortfolioLedgerView,
+    PortfolioPerformanceLedgerView,
     RevisionTransition,
     PositionEffect,
     PositionRiskUpdate,
@@ -2419,6 +2420,81 @@ class JsonLedgerStore:
                     sorted(progress, key=lambda item: item.intent_id)
                 ),
                 recent_events=events,
+            )
+
+    def load_performance_view(self, strategy_id: str) -> PortfolioPerformanceLedgerView:
+        """Return complete typed facts available for lifecycle performance reads."""
+
+        if type(strategy_id) is not str or not strategy_id:
+            raise ValueError("strategy_id must be a non-empty string")
+        with _PROCESS_LOCK, transaction_guard((self.path,)):
+            store = self._read_store_payload()
+            try:
+                payload = _require_mapping(store["accounts"][strategy_id], "account")
+            except KeyError as exc:
+                raise KeyError(f"portfolio account not found: {strategy_id}") from exc
+            account = decode_account_snapshot(payload)
+            open_intents = tuple(
+                _intent_from_json(item)
+                for item in _require_list(payload["open_intents"], "account.open_intents")
+            )
+            progress = tuple(
+                _progress_from_json(item)
+                for item in _require_list(
+                    payload["execution_progress"],
+                    "account.execution_progress",
+                )
+            )
+            events = tuple(
+                _event_from_json(item)
+                for item in _require_list(payload["events"], "account.events")
+            )
+            committed = _require_list(
+                payload["committed_batches"],
+                "account.committed_batches",
+            )
+            results = _require_list(payload["run_results"], "account.run_results")
+            batches = tuple(
+                _batch_from_canonical_json(
+                    _require_mapping(item, "account.run_results.item")["batch"]
+                )
+                for item in results
+            )
+            intents_by_id: dict[str, OrderIntent] = {}
+            lifecycle_complete = len(batches) == len(committed)
+            reason = (
+                None
+                if lifecycle_complete
+                else "one or more committed runs have no replayable DecisionBatch"
+            )
+            for intent in (
+                *(item for batch in batches for item in batch.intents),
+                *open_intents,
+            ):
+                existing = intents_by_id.get(intent.id)
+                if existing is not None and existing != intent:
+                    raise LedgerSchemaError(
+                        "performance lifecycle contains conflicting intent IDs"
+                    )
+                intents_by_id[intent.id] = intent
+            if any(item.intent_id not in intents_by_id for item in progress):
+                lifecycle_complete = False
+                reason = "execution progress exists without a replayable order intent"
+            return PortfolioPerformanceLedgerView(
+                account=account,
+                intents=tuple(
+                    sorted(intents_by_id.values(), key=lambda item: item.created_market_at)
+                ),
+                execution_progress=tuple(
+                    sorted(
+                        progress,
+                        key=lambda item: item.fills[-1].occurred_at,
+                    )
+                ),
+                events=events,
+                batches=tuple(sorted(batches, key=lambda item: item.run_key)),
+                lifecycle_complete=lifecycle_complete,
+                lifecycle_reason=reason,
             )
 
     def list_accounts(self) -> tuple[AccountSnapshot, ...]:

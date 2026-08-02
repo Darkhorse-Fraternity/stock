@@ -26,11 +26,24 @@ from .contracts import (
     DecisionBatch,
     MarketSnapshot,
     OrderIntent,
+    PerformanceClosedTrade,
+    PerformanceEventView,
+    PerformanceHistoryAvailability,
+    PerformanceHistoryStatus,
+    PerformanceNavPoint,
+    PerformanceOrder,
+    PerformancePosition,
+    PerformanceProjectionRequest,
+    PerformanceRuntime,
+    PerformanceSummary,
     PlanRequest,
     PortfolioSnapshot,
+    PositionEffect,
     PositionRiskUpdate,
+    PositionSide,
     ProcessRequest,
     SignalCandidate,
+    StrategyPerformanceProjection,
     TargetPosition,
 )
 from .execution import (
@@ -133,6 +146,215 @@ def _signal_output(stage: str, candidates: tuple[SignalCandidate, ...]) -> Stage
         component_version="1.0.0",
         facts=({"kind": stage, "items": candidates},),
     )
+
+
+def _report_number(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _performance_runtime(view: object) -> PerformanceRuntime:
+    completed_events = [event for event in view.events if event.type == "PIPELINE_COMPLETED"]
+    if not completed_events:
+        return PerformanceRuntime()
+    event = max(completed_events, key=lambda item: item.occurred_at)
+    run_key = str(event.data["run_key"])
+    batch = next((item for item in view.batches if item.run_key == run_key), None)
+    if batch is None:
+        return PerformanceRuntime(
+            last_successful_pipeline_at=event.occurred_at,
+            last_successful_pipeline_run_id=run_key,
+        )
+    stages = tuple(
+        {
+            "stage": output.stage,
+            "component_version": output.component_version,
+            "schema_version": output.schema_version,
+            "diagnostics": tuple(dict(item) for item in output.diagnostics),
+        }
+        for output in batch.stage_outputs
+    )
+    admitted: int | None = None
+    for output in reversed(batch.stage_outputs):
+        for fact in output.facts:
+            items = fact.get("items") if isinstance(fact, Mapping) else None
+            if isinstance(items, (tuple, list)):
+                admitted = len(items)
+                break
+        if admitted is not None:
+            break
+    data_quality: Mapping[str, Any] = {}
+    for diagnostic in reversed(batch.diagnostics):
+        candidate = diagnostic.get("data_quality")
+        if isinstance(candidate, Mapping):
+            data_quality = candidate
+            break
+    return PerformanceRuntime(
+        last_successful_pipeline_at=event.occurred_at,
+        last_successful_pipeline_run_id=run_key,
+        last_pipeline_admitted=admitted,
+        last_pipeline_stages=stages,
+        last_pipeline_data_quality=data_quality,
+    )
+
+
+def _event_message(event: object) -> str:
+    symbol = str(event.data.get("symbol") or "")
+    messages = {
+        "ACCOUNT_OPENED": "模拟账户已创建",
+        "PIPELINE_COMPLETED": "Portfolio Pipeline 已完成",
+        "ORDER_FILLED": f"{symbol} 订单已成交".strip(),
+        "ORDER_PARTIAL": f"{symbol} 订单部分成交".strip(),
+        "ORDER_CANCELLED": f"{symbol} 订单已取消".strip(),
+        "ORDER_EXPIRED": f"{symbol} 订单已过期".strip(),
+        "RISK_CHANGED": f"{symbol} 风险状态已更新".strip(),
+        "REVISION_TRANSITIONED": "策略版本已切换",
+        "FINANCING_COST_ACCRUED": "融资成本已计提",
+        "BORROW_COST_ACCRUED": f"{symbol} 借券成本已计提".strip(),
+    }
+    return messages.get(event.type, event.type)
+
+
+def _exit_distance_pct(position: object, config: Mapping[str, Any]) -> float | None:
+    price = position.current_price
+    if price is None or price <= 0:
+        return None
+    stop_loss = _report_number(config.get("stop_loss_pct"))
+    trailing = _report_number(
+        config.get("trailing_drawdown_pct", config.get("trailing_rebound_pct"))
+    )
+    if position.side is PositionSide.LONG:
+        thresholds = []
+        if stop_loss is not None:
+            thresholds.append(position.average_cost * (1.0 - stop_loss / 100.0))
+        if position.trailing_active and trailing is not None and position.peak_price is not None:
+            thresholds.append(position.peak_price * (1.0 - trailing / 100.0))
+        return ((price - max(thresholds)) / price * 100.0) if thresholds else None
+    thresholds = []
+    if stop_loss is not None:
+        thresholds.append(position.average_cost * (1.0 + stop_loss / 100.0))
+    if position.trailing_active and trailing is not None and position.trough_price is not None:
+        thresholds.append(position.trough_price * (1.0 + trailing / 100.0))
+    return ((min(thresholds) - price) / price * 100.0) if thresholds else None
+
+
+def _replay_closed_trades(
+    intents: tuple[OrderIntent, ...],
+    progress_by_intent: Mapping[str, object],
+    revision_by_intent: Mapping[str, int],
+    source: object,
+    default_revision: int,
+    lifecycle_complete: bool,
+    lifecycle_reason: str | None,
+) -> tuple[tuple[PerformanceClosedTrade, ...], bool, str | None]:
+    """Replay canonical fills with the same weighted-average position accounting."""
+
+    if not lifecycle_complete:
+        return (), False, lifecycle_reason
+    states: dict[tuple[str, PositionSide], dict[str, float | int]] = {}
+    trades: list[PerformanceClosedTrade] = []
+    ordered = sorted(
+        intents,
+        key=lambda intent: (
+            progress_by_intent[intent.id].fills[0].occurred_at
+            if intent.id in progress_by_intent
+            else intent.created_market_at
+        ),
+    )
+    for intent in ordered:
+        progress = progress_by_intent.get(intent.id)
+        if progress is None:
+            continue
+        key = (intent.symbol, intent.position_side)
+        state = states.get(key)
+        if intent.position_effect in {PositionEffect.OPEN, PositionEffect.INCREASE}:
+            if state is None:
+                if intent.position_effect is PositionEffect.INCREASE:
+                    return (), False, "an increase has no reconstructable open position"
+                state = {
+                    "quantity": 0,
+                    "average_cost": 0.0,
+                    "entry_quantity": 0,
+                    "entry_notional": 0.0,
+                    "entry_fees": 0.0,
+                    "exit_quantity": 0,
+                    "exit_notional": 0.0,
+                    "exit_fees": 0.0,
+                    "raw_realized": 0.0,
+                }
+                states[key] = state
+            for fill in progress.fills:
+                quantity = int(state["quantity"])
+                average_cost = float(state["average_cost"])
+                next_quantity = quantity + fill.quantity
+                state["average_cost"] = (
+                    average_cost * quantity + fill.price * fill.quantity
+                ) / next_quantity
+                state["quantity"] = next_quantity
+                state["entry_quantity"] = int(state["entry_quantity"]) + fill.quantity
+                state["entry_notional"] = (
+                    float(state["entry_notional"]) + fill.price * fill.quantity
+                )
+                state["entry_fees"] = float(state["entry_fees"]) + fill.fees
+            continue
+        if state is None:
+            return (), False, "an exit has no reconstructable open position"
+        direction = 1.0 if intent.position_side is PositionSide.LONG else -1.0
+        for fill in progress.fills:
+            quantity = int(state["quantity"])
+            if fill.quantity > quantity:
+                return (), False, "exit fills exceed the reconstructed position"
+            average_cost = float(state["average_cost"])
+            state["raw_realized"] = float(state["raw_realized"]) + (
+                direction * (fill.price - average_cost) * fill.quantity
+            )
+            state["quantity"] = quantity - fill.quantity
+            state["exit_quantity"] = int(state["exit_quantity"]) + fill.quantity
+            state["exit_notional"] = (
+                float(state["exit_notional"]) + fill.price * fill.quantity
+            )
+            state["exit_fees"] = float(state["exit_fees"]) + fill.fees
+        if intent.position_effect is PositionEffect.CLOSE and progress.status == "FILLED":
+            if int(state["quantity"]) != 0:
+                return (), False, "a filled close did not flatten the reconstructed position"
+            entry_notional = float(state["entry_notional"])
+            entry_quantity = int(state["entry_quantity"])
+            exit_notional = float(state["exit_notional"])
+            exit_quantity = int(state["exit_quantity"])
+            if entry_quantity <= 0 or exit_quantity != entry_quantity:
+                return (), False, "closed lifecycle quantities do not reconcile"
+            realized = (
+                float(state["raw_realized"])
+                - float(state["entry_fees"])
+                - float(state["exit_fees"])
+            )
+            trades.append(
+                PerformanceClosedTrade(
+                    id=intent.id,
+                    name=source.symbol_names.get(intent.symbol, intent.symbol),
+                    symbol=intent.symbol,
+                    entry_price=entry_notional / entry_quantity,
+                    exit_price=exit_notional / exit_quantity,
+                    quantity=exit_quantity,
+                    realized_pnl=realized,
+                    return_pct=realized / entry_notional * 100.0,
+                    reason=intent.reason,
+                    closed_at=progress.fills[-1].occurred_at,
+                    strategy_revision=revision_by_intent.get(
+                        intent.id,
+                        default_revision,
+                    ),
+                    position_side=intent.position_side.value,
+                )
+            )
+            del states[key]
+    trades.sort(key=lambda item: item.closed_at, reverse=True)
+    return tuple(trades), True, None
 
 
 class PortfolioEngine:
@@ -784,4 +1006,245 @@ class PortfolioEngine:
             positions=valuation.positions,
             open_intents=view.open_intents,
             recent_events=view.recent_events,
+        )
+
+    def performance_projection(
+        self,
+        request: PerformanceProjectionRequest,
+    ) -> StrategyPerformanceProjection:
+        """Project the complete report contract from typed ledger and market facts."""
+
+        if type(request) is not PerformanceProjectionRequest:
+            raise TypeError("request must be PerformanceProjectionRequest")
+        if self._ledger is None:
+            raise RuntimeError("PortfolioEngine requires a ledger_store for performance")
+        source = request.strategy
+        snapshot = self.performance(source.id, request.market)
+        view = self._ledger.load_performance_view(source.id)
+        progress_by_intent = {
+            item.intent_id: item for item in view.execution_progress
+        }
+        revision_by_intent = {
+            intent.id: batch.strategy_revision
+            for batch in view.batches
+            for intent in batch.intents
+        }
+        entry_fills: dict[tuple[str, PositionSide], list[object]] = {}
+        for intent in view.intents:
+            if intent.position_effect not in {PositionEffect.OPEN, PositionEffect.INCREASE}:
+                continue
+            progress = progress_by_intent.get(intent.id)
+            if progress is None:
+                continue
+            entry_fills.setdefault((intent.symbol, intent.position_side), []).extend(
+                progress.fills
+            )
+        for fills in entry_fills.values():
+            fills.sort(key=lambda item: item.occurred_at)
+
+        positions = []
+        for slot_id, held in enumerate(snapshot.positions, start=1):
+            market_value = held.market_value
+            unrealized = held.unrealized_pnl
+            if held.current_price is None or market_value is None or unrealized is None:
+                raise RuntimeError(f"position valuation is incomplete: {held.symbol}")
+            cost_notional = held.average_cost * held.quantity
+            direction = 1.0 if held.side is PositionSide.LONG else -1.0
+            quote = request.market.quotes.get(held.symbol, {})
+            day_change = (
+                _report_number(quote.get("percent"))
+                if isinstance(quote, Mapping)
+                else None
+            )
+            first_fills = entry_fills.get((held.symbol, held.side), [])
+            first_fill = first_fills[0] if first_fills else None
+            positions.append(
+                PerformancePosition(
+                    slot_id=slot_id,
+                    name=source.symbol_names.get(held.symbol, held.symbol),
+                    symbol=held.symbol,
+                    first_entry_price=first_fill.price if first_fill is not None else None,
+                    first_entry_at=(
+                        first_fill.occurred_at if first_fill is not None else None
+                    ),
+                    current_price=held.current_price,
+                    day_change_pct=day_change,
+                    return_pct=(unrealized / cost_notional * 100.0),
+                    unrealized_pnl=unrealized,
+                    weight_pct=(
+                        direction * market_value / snapshot.metrics.equity * 100.0
+                        if snapshot.metrics.equity != 0
+                        else 0.0
+                    ),
+                    quantity=held.quantity,
+                    sellable_quantity=held.sellable_quantity,
+                    trailing_active=held.trailing_active,
+                    signal_invalid_days=None,
+                    exit_distance_pct=_exit_distance_pct(held, source.config),
+                    market_value=market_value,
+                    average_cost=held.average_cost,
+                    position_side=held.side.value,
+                )
+            )
+
+        cancellation_by_intent = {
+            str(event.data["intent_id"]): event
+            for event in view.events
+            if event.type in {"ORDER_CANCELLED", "ORDER_EXPIRED"}
+            and event.data.get("intent_id")
+        }
+        orders = []
+        for intent in view.intents:
+            progress = progress_by_intent.get(intent.id)
+            cancelled = cancellation_by_intent.get(intent.id)
+            status = (
+                progress.status
+                if progress is not None
+                else cancelled.type.removeprefix("ORDER_")
+                if cancelled is not None
+                else "INTENDED"
+            )
+            updated_at = (
+                progress.fills[-1].occurred_at
+                if progress is not None
+                else cancelled.occurred_at
+                if cancelled is not None
+                else intent.created_market_at
+            )
+            orders.append(
+                PerformanceOrder(
+                    id=intent.id,
+                    side=intent.order_side.value,
+                    symbol=intent.symbol,
+                    name=source.symbol_names.get(intent.symbol, intent.symbol),
+                    quantity=intent.quantity,
+                    filled_quantity=progress.filled_quantity if progress is not None else 0,
+                    status=status,
+                    reason=intent.reason,
+                    created_at=intent.created_market_at,
+                    updated_at=updated_at,
+                    filled_notional=progress.filled_notional if progress is not None else 0.0,
+                    commission_charged=(
+                        progress.commission_charged if progress is not None else 0.0
+                    ),
+                    fees_charged=progress.fees_charged if progress is not None else 0.0,
+                    strategy_revision=revision_by_intent.get(
+                        intent.id,
+                        snapshot.account.strategy_revision,
+                    ),
+                    position_side=intent.position_side.value,
+                    position_effect=intent.position_effect.value,
+                )
+            )
+        orders.sort(key=lambda item: item.updated_at, reverse=True)
+
+        closed_trades, lifecycle_complete, lifecycle_reason = _replay_closed_trades(
+            view.intents,
+            progress_by_intent,
+            revision_by_intent,
+            source,
+            snapshot.account.strategy_revision,
+            view.lifecycle_complete,
+            view.lifecycle_reason,
+        )
+
+        opened_events = [event for event in view.events if event.type == "ACCOUNT_OPENED"]
+        opened = min(opened_events, key=lambda item: item.occurred_at) if opened_events else None
+        nav_history = []
+        if opened is not None and opened.occurred_at != request.generated_at:
+            nav_history.append(
+                PerformanceNavPoint(
+                    at=opened.occurred_at,
+                    nav=source.initial_cash,
+                    source="strategy_initial_cash",
+                )
+            )
+        nav_history.append(
+            PerformanceNavPoint(
+                at=request.generated_at,
+                nav=snapshot.metrics.equity,
+                source=request.valuation_source,
+            )
+        )
+        nav_complete = opened is not None and not view.batches
+        nav_reason = None
+        if opened is None:
+            nav_reason = "ACCOUNT_OPENED fact is unavailable"
+        elif view.batches:
+            nav_reason = "historical NAV marks are not persisted in ledger schema v2"
+        maximum_drawdown: float | None = None
+        if nav_complete:
+            peak = nav_history[0].nav
+            maximum_drawdown = 0.0
+            for point in nav_history:
+                peak = max(peak, point.nav)
+                maximum_drawdown = max(
+                    maximum_drawdown,
+                    (peak - point.nav) / peak * 100.0 if peak else 0.0,
+                )
+        realized_pnl = (
+            sum(item.realized_pnl for item in closed_trades)
+            if lifecycle_complete
+            else None
+        )
+        wins = sum(item.realized_pnl > 0 for item in closed_trades)
+        events = tuple(
+            PerformanceEventView(
+                id=event.id,
+                type=event.type,
+                occurred_at=event.occurred_at,
+                message=_event_message(event),
+                strategy_revision=(
+                    event.data.get("strategy_revision")
+                    if type(event.data.get("strategy_revision")) is int
+                    else snapshot.account.strategy_revision
+                ),
+                data=event.data,
+            )
+            for event in reversed(view.events[-200:])
+        )
+        summary = PerformanceSummary(
+            initial_cash=source.initial_cash,
+            nav=snapshot.metrics.equity,
+            cash=snapshot.metrics.available_cash,
+            reserved_cash=snapshot.account.reserved_cash,
+            market_value=snapshot.metrics.long_market_value,
+            cumulative_return_pct=(
+                snapshot.metrics.equity / source.initial_cash - 1.0
+            )
+            * 100.0,
+            maximum_drawdown_pct=maximum_drawdown,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=sum(item.unrealized_pnl for item in positions),
+            position_count=len(positions),
+            max_positions=source.max_positions,
+            target_exposure_pct=source.target_exposure_pct,
+            closed_trade_count=len(closed_trades),
+            win_rate_pct=(
+                wins / len(closed_trades) * 100.0 if closed_trades else None
+            ),
+        )
+        return StrategyPerformanceProjection(
+            generated_at=request.generated_at,
+            quote_error=request.quote_error,
+            strategy=source,
+            summary=summary,
+            runtime=_performance_runtime(view),
+            nav_history=tuple(nav_history),
+            positions=tuple(positions),
+            orders=tuple(orders[:100]),
+            closed_trades=tuple(closed_trades[:200]),
+            events=events,
+            history_availability=PerformanceHistoryStatus(
+                nav=PerformanceHistoryAvailability(
+                    complete=nav_complete,
+                    source="v2_ledger",
+                    reason=nav_reason,
+                ),
+                lifecycle=PerformanceHistoryAvailability(
+                    complete=lifecycle_complete,
+                    source="v2_ledger",
+                    reason=lifecycle_reason,
+                ),
+            ),
         )

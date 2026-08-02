@@ -9,14 +9,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
-from .markets import strategy_market
-from .portfolio_engine import PortfolioEngine, PortfolioSnapshot
+from .markets import market_profile, strategy_market
+from .portfolio_engine import PortfolioEngine
 from .portfolio_engine.borrow import BorrowSnapshot
 from .portfolio_engine.contracts import (
     AccountSnapshot,
     DecisionBatch,
     MarketSnapshot,
+    PerformanceProjectionRequest,
+    PerformanceStrategySource,
     RevisionTransition,
+    StrategyPerformanceProjection,
 )
 from .portfolio_engine.ledger import (
     InMemoryLedgerStore,
@@ -119,6 +122,7 @@ class MarketAdapterQuoteProvider:
                 "bar_high": ("bar_high", "high"),
                 "bar_low": ("bar_low", "low"),
                 "bar_volume": ("bar_volume", "volume"),
+                "percent": ("percent", "change_pct"),
             }
             for target, source_names in aliases.items():
                 value = next(
@@ -129,7 +133,7 @@ class MarketAdapterQuoteProvider:
                     ),
                     None,
                 )
-                if value is not None and value > 0:
+                if value is not None and (target == "percent" or value > 0):
                     quote[target] = value
             quotes[symbol] = quote
         if symbols and not quotes:
@@ -234,19 +238,126 @@ def open_portfolio_runtime(
     return engine, account
 
 
-def project_portfolio_snapshot(
+def _symbol_names(strategy: Mapping[str, Any]) -> dict[str, str]:
+    parameters = strategy.get("parameters")
+    watchlist = (
+        parameters.get("watchlist", {}).get("value", ())
+        if isinstance(parameters, Mapping)
+        and isinstance(parameters.get("watchlist"), Mapping)
+        else ()
+    )
+    result: dict[str, str] = {}
+    if isinstance(watchlist, (tuple, list)):
+        for item in watchlist:
+            if isinstance(item, Mapping):
+                symbol = str(item.get("symbol") or "")
+                if symbol:
+                    result[symbol] = str(item.get("name") or symbol)
+            elif isinstance(item, str) and item:
+                result[item] = item
+    return result
+
+
+def _performance_source(strategy: Mapping[str, Any]) -> PerformanceStrategySource:
+    strategy_id = str(strategy.get("id") or "")
+    revision = strategy.get("revision")
+    portfolio = strategy.get("portfolio")
+    allocation = strategy.get("allocation")
+    exposure = strategy.get("exposure_policy")
+    lifecycle = strategy.get("lifecycle")
+    signal = strategy.get("signal")
+    if not strategy_id:
+        raise ValueError("strategy.id is required for portfolio performance")
+    if type(revision) is not int or revision < 1:
+        raise ValueError("strategy.revision must be positive")
+    if not isinstance(portfolio, Mapping):
+        raise ValueError("strategy.portfolio must be an object")
+    initial_cash = _finite_number(portfolio.get("initial_cash"))
+    if initial_cash is None or initial_cash <= 0:
+        raise ValueError("strategy portfolio.initial_cash must be positive")
+    max_positions_value = (
+        exposure.get("max_positions")
+        if isinstance(exposure, Mapping) and exposure.get("max_positions") is not None
+        else portfolio.get("max_positions", 10)
+    )
+    if type(max_positions_value) is not int or max_positions_value <= 0:
+        raise ValueError("strategy max_positions must be a positive integer")
+    market = strategy_market(strategy)
+    profile = market_profile(market)
+    market_regime = strategy.get("market_regime")
+    return PerformanceStrategySource(
+        id=strategy_id,
+        name=str(strategy.get("name") or strategy_id),
+        revision=revision,
+        stage=str(lifecycle.get("stage", "draft")) if isinstance(lifecycle, Mapping) else "draft",
+        market=market,
+        market_label=profile.label,
+        currency=profile.currency,
+        currency_symbol=profile.currency_symbol,
+        initial_cash=initial_cash,
+        max_positions=max_positions_value,
+        signal_model=(
+            str(signal.get("model"))
+            if isinstance(signal, Mapping) and signal.get("model")
+            else None
+        ),
+        signal_time=(
+            str(signal.get("run_time"))
+            if isinstance(signal, Mapping) and signal.get("run_time")
+            else None
+        ),
+        signal_data_cutoff=(
+            str(signal.get("data_cutoff"))
+            if isinstance(signal, Mapping) and signal.get("data_cutoff")
+            else None
+        ),
+        allocation_model=(
+            str(allocation.get("model"))
+            if isinstance(allocation, Mapping) and allocation.get("model")
+            else None
+        ),
+        benchmark_symbol=(
+            str(portfolio.get("benchmark_symbol"))
+            if portfolio.get("benchmark_symbol")
+            else None
+        ),
+        benchmark_name=(
+            str(portfolio.get("benchmark_name"))
+            if portfolio.get("benchmark_name")
+            else None
+        ),
+        market_regime=market_regime if isinstance(market_regime, Mapping) else None,
+        risk_level=(
+            str(strategy.get("risk_level")) if strategy.get("risk_level") else None
+        ),
+        trading_mode=(
+            str(exposure.get("mode"))
+            if isinstance(exposure, Mapping) and exposure.get("mode")
+            else None
+        ),
+        target_exposure_pct=(
+            _finite_number(market_regime.get("target_exposure_pct"))
+            if isinstance(market_regime, Mapping)
+            else None
+        ),
+        config=portfolio,
+        allocation=allocation if isinstance(allocation, Mapping) else {},
+        symbol_names=_symbol_names(strategy),
+    )
+
+
+def project_strategy_performance(
     strategy: Mapping[str, Any],
     *,
     path: str | Path | None = None,
     adapter: object,
     occurred_at: datetime,
-) -> PortfolioSnapshot:
-    """Project one read-only API/report snapshot through PortfolioEngine."""
+) -> StrategyPerformanceProjection:
+    """Project a read-only typed performance view with persisted quote fallback."""
 
     captured_at = _utc_datetime(occurred_at)
-    strategy_id = str(strategy.get("id") or "")
-    if not strategy_id:
-        raise ValueError("strategy.id is required for portfolio performance")
+    source = _performance_source(strategy)
+    strategy_id = source.id
     persistent_store = JsonLedgerStore(portfolio_ledger_path(path))
     try:
         account = persistent_store.load(strategy_id)
@@ -255,14 +366,6 @@ def project_portfolio_snapshot(
         revision = strategy.get("revision")
         if type(revision) is not int or revision < 1:
             raise ValueError("strategy.revision must be positive")
-        portfolio = strategy.get("portfolio")
-        initial_cash = (
-            _finite_number(portfolio.get("initial_cash"))
-            if isinstance(portfolio, Mapping)
-            else None
-        )
-        if initial_cash is None or initial_cash <= 0:
-            raise ValueError("strategy portfolio.initial_cash must be positive")
         store = InMemoryLedgerStore()
         account = store.create_account(
             AccountSnapshot(
@@ -270,15 +373,40 @@ def project_portfolio_snapshot(
                 strategy_id=strategy_id,
                 strategy_revision=revision,
                 occurred_at=captured_at,
-                available_cash=initial_cash,
+                available_cash=source.initial_cash,
                 snapshot_id=f"projection-{strategy_id}-r{revision}",
             )
         )
     symbols = tuple(held.symbol for held in account.positions)
+    quote_error = None
+    valuation_source = "live_quote"
     if symbols:
-        market = MarketAdapterQuoteProvider(adapter, strategy).snapshot(
-            symbols,
-            captured_at,
+        try:
+            live_market = MarketAdapterQuoteProvider(adapter, strategy).snapshot(
+                symbols,
+                captured_at,
+            )
+            quotes = {symbol: dict(value) for symbol, value in live_market.quotes.items()}
+            missing = [symbol for symbol in symbols if symbol not in quotes]
+            if missing:
+                quote_error = "missing live quotes: " + ", ".join(missing)
+                valuation_source = "mixed_live_and_persisted_quotes"
+            market_id = live_market.id
+        except Exception as exc:
+            quotes = {}
+            missing = list(symbols)
+            quote_error = str(exc)
+            valuation_source = "persisted_quote_fallback"
+            market_id = ""
+        positions_by_symbol = {item.symbol: item for item in account.positions}
+        for symbol in missing:
+            held = positions_by_symbol[symbol]
+            quotes[symbol] = {"price": held.current_price or held.average_cost}
+        market_name = strategy_market(strategy)
+        market = MarketSnapshot(
+            id=market_id or _snapshot_id(market_name, captured_at, quotes),
+            occurred_at=captured_at,
+            quotes=quotes,
         )
     else:
         market_name = strategy_market(strategy)
@@ -287,7 +415,15 @@ def project_portfolio_snapshot(
             occurred_at=captured_at,
             quotes={},
         )
-    return PortfolioEngine(ledger_store=store).performance(strategy_id, market)
+    return PortfolioEngine(ledger_store=store).performance_projection(
+        PerformanceProjectionRequest(
+            strategy=source,
+            market=market,
+            generated_at=captured_at,
+            valuation_source=valuation_source,
+            quote_error=quote_error,
+        )
+    )
 
 
 def process_portfolio_runtime(
@@ -314,6 +450,6 @@ __all__ = (
     "FailClosedBorrowProvider",
     "MarketAdapterQuoteProvider",
     "open_portfolio_runtime",
-    "project_portfolio_snapshot",
+    "project_strategy_performance",
     "process_portfolio_runtime",
 )

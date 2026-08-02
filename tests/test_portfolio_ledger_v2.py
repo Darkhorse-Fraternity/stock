@@ -148,6 +148,55 @@ def transition_revision_from_process(
 
 
 class PortfolioLedgerV2Tests(unittest.TestCase):
+    def test_performance_view_replays_lifecycle_and_marks_unreplayable_runs(self):
+        with TemporaryDirectory() as temporary:
+            replayable_path = Path(temporary) / "replayable.json"
+            replayable = JsonLedgerStore(replayable_path)
+            replayable.create_account(replace(account(), snapshot_id="snapshot-0"))
+            intent = OrderIntent(
+                id=stable_execution_intent_id(
+                    symbol="AAPL",
+                    position_side=PositionSide.LONG,
+                    order_side=OrderSide.BUY,
+                    position_effect=PositionEffect.OPEN,
+                    quantity=1,
+                    reason="performance read model",
+                    created_snapshot_id="snapshot-0",
+                    created_market_at=INTENT_CREATED_AT,
+                ),
+                symbol="AAPL",
+                position_side=PositionSide.LONG,
+                order_side=OrderSide.BUY,
+                position_effect=PositionEffect.OPEN,
+                quantity=1,
+                reason="performance read model",
+                created_snapshot_id="snapshot-0",
+            )
+            replayable.commit(
+                replace(
+                    batch(snapshot_id="snapshot-0"),
+                    request_fingerprint="performance-request",
+                    intents=(intent,),
+                )
+            )
+
+            view = replayable.load_performance_view("strategy")
+
+            self.assertEqual(view.intents, (intent,))
+            self.assertEqual(len(view.batches), 1)
+            self.assertTrue(view.lifecycle_complete)
+            self.assertIsNone(view.lifecycle_reason)
+
+            incomplete_path = Path(temporary) / "incomplete.json"
+            incomplete = JsonLedgerStore(incomplete_path)
+            incomplete.create_account(replace(account(), snapshot_id="snapshot-0"))
+            incomplete.commit(batch(snapshot_id="snapshot-0"))
+
+            incomplete_view = incomplete.load_performance_view("strategy")
+
+            self.assertFalse(incomplete_view.lifecycle_complete)
+            self.assertIn("no replayable DecisionBatch", incomplete_view.lifecycle_reason)
+
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

@@ -4,7 +4,9 @@ import argparse
 import json
 import mimetypes
 import os
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -13,7 +15,7 @@ from urllib.parse import urlparse
 from .backtest import BacktestInProgressError, get_backtest, list_backtests, start_backtest
 from .delivery import pause_hermes_delivery, sync_active_strategy_delivery, sync_hermes_delivery
 from .market_adapters import get_market_adapter
-from .markets import market_profile, strategy_market
+from .markets import strategy_market
 from .parameters import (
     PARAMETER_CATALOG,
     activate_strategy,
@@ -34,7 +36,7 @@ from .parameters import (
     transition_strategy_stage,
 )
 from .portfolio_engine.ledger import portfolio_ledger_path
-from .portfolio_runtime import project_portfolio_snapshot
+from .portfolio_runtime import project_strategy_performance
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
 from .us_data_providers import us_market_data_status
@@ -42,6 +44,39 @@ from .us_data_providers import us_market_data_status
 
 WEB_ROOT = Path(__file__).with_name("web")
 MAX_REQUEST_BYTES = 1_000_000
+
+
+def _performance_json(value):
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {field.name: _performance_json(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, dict) or hasattr(value, "items"):
+        return {str(key): _performance_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_performance_json(item) for item in value]
+    return value
+
+
+def _serialize_strategy_performance(projection) -> dict:
+    """Map the typed service projection to the stable public JSON shape."""
+
+    payload = _performance_json(projection)
+    strategy = payload["strategy"]
+    config = strategy.pop("config")
+    allocation = strategy.pop("allocation")
+    strategy.pop("symbol_names")
+    return {
+        **payload,
+        "market": strategy["market"],
+        "market_label": strategy["market_label"],
+        "currency": strategy["currency"],
+        "currency_symbol": strategy["currency_symbol"],
+        "config": config,
+        "allocation": allocation,
+    }
 
 
 def build_strategy_performance(
@@ -57,127 +92,13 @@ def build_strategy_performance(
         raise KeyError(strategy_id)
     occurred_at = now or datetime.now(timezone.utc)
     market_name = strategy_market(strategy)
-    profile = market_profile(market_name)
-    snapshot = project_portfolio_snapshot(
+    projection = project_strategy_performance(
         strategy,
         path=portfolio_ledger_path(path),
         adapter=get_market_adapter(market_name),
         occurred_at=occurred_at,
     )
-    initial_cash = float(strategy.get("portfolio", {}).get("initial_cash") or 0.0)
-    cumulative_return = (
-        (snapshot.metrics.equity / initial_cash - 1.0) * 100.0
-        if initial_cash > 0
-        else None
-    )
-    positions = []
-    for held in snapshot.positions:
-        market_value = held.market_value
-        unrealized_pnl = held.unrealized_pnl
-        cost_notional = held.average_cost * held.quantity
-        positions.append(
-            {
-                "symbol": held.symbol,
-                "name": held.symbol,
-                "quantity": held.quantity,
-                "average_cost": held.average_cost,
-                "current_price": held.current_price,
-                "market_value": market_value,
-                "weight_pct": (
-                    market_value / snapshot.metrics.equity * 100.0
-                    if market_value is not None and snapshot.metrics.equity > 0
-                    else 0.0
-                ),
-                "return_pct": (
-                    unrealized_pnl / cost_notional * 100.0
-                    if unrealized_pnl is not None and cost_notional > 0
-                    else 0.0
-                ),
-                "unrealized_pnl": unrealized_pnl,
-                "sellable_quantity": held.sellable_quantity,
-            }
-        )
-    exposure_policy = strategy.get("exposure_policy", {})
-    max_positions = int(
-        exposure_policy.get("max_positions", 10)
-        if isinstance(exposure_policy, dict)
-        else 10
-    )
-    return {
-        "generated_at": occurred_at.isoformat(),
-        "quote_error": None,
-        "market": market_name,
-        "market_label": profile.label,
-        "currency": profile.currency,
-        "currency_symbol": profile.currency_symbol,
-        "strategy": {
-            "id": strategy_id,
-            "name": strategy.get("name"),
-            "revision": snapshot.account.strategy_revision,
-            "stage": strategy.get("lifecycle", {}).get("stage", "draft"),
-            "market": market_name,
-            "market_label": profile.label,
-            "signal_model": strategy.get("signal", {}).get("model"),
-            "signal_time": strategy.get("signal", {}).get("run_time"),
-            "signal_data_cutoff": strategy.get("signal", {}).get("data_cutoff"),
-            "allocation_model": strategy.get("allocation", {}).get("model"),
-            "market_regime": None,
-            "risk_level": None,
-            "trading_mode": None,
-            "benchmark_symbol": strategy.get("portfolio", {}).get(
-                "benchmark_symbol"
-            ),
-            "benchmark_name": strategy.get("portfolio", {}).get(
-                "benchmark_name"
-            ),
-        },
-        "summary": {
-            "initial_cash": initial_cash,
-            "nav": snapshot.metrics.equity,
-            "cash": snapshot.metrics.available_cash,
-            "reserved_cash": snapshot.account.reserved_cash,
-            "market_value": snapshot.metrics.long_market_value,
-            "cumulative_return_pct": cumulative_return,
-            "maximum_drawdown_pct": None,
-            "realized_pnl": None,
-            "unrealized_pnl": sum(
-                float(item["unrealized_pnl"] or 0.0) for item in positions
-            ),
-            "position_count": len(positions),
-            "max_positions": max_positions,
-            "target_exposure_pct": None,
-            "closed_trade_count": None,
-            "win_rate_pct": None,
-        },
-        "runtime": {},
-        "nav_history": [],
-        "positions": positions,
-        "orders": [
-            {
-                "id": intent.id,
-                "side": intent.order_side.value,
-                "symbol": intent.symbol,
-                "name": intent.symbol,
-                "quantity": intent.quantity,
-                "filled_quantity": 0,
-                "status": "INTENDED",
-                "reason": intent.reason,
-            }
-            for intent in snapshot.open_intents
-        ],
-        "closed_trades": [],
-        "events": [
-            {
-                "id": event.id,
-                "type": event.type,
-                "occurred_at": event.occurred_at.isoformat(),
-                "data": dict(event.data),
-            }
-            for event in reversed(snapshot.recent_events)
-        ],
-        "config": dict(strategy.get("portfolio", {})),
-        "allocation": dict(strategy.get("allocation", {})),
-    }
+    return _serialize_strategy_performance(projection)
 
 
 def health_payload() -> dict:

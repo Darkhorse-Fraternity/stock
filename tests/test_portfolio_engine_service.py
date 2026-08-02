@@ -185,6 +185,232 @@ def recommendation_plan(decision=None) -> RecommendationPlan:
 
 
 class PortfolioEngineServiceTests(unittest.TestCase):
+    def test_closed_trade_replay_is_exact_across_increase_reduce_close_and_reopen(self):
+        replay = getattr(service, "_replay_closed_trades", None)
+        self.assertIsNotNone(replay)
+        if replay is None:
+            return
+
+        source = contracts.PerformanceStrategySource(
+            id="strategy-us",
+            name="replay",
+            revision=3,
+            stage="paper",
+            market="us",
+            market_label="美股",
+            currency="USD",
+            currency_symbol="$",
+            initial_cash=100_000.0,
+            max_positions=10,
+            symbol_names={"L": "Long Inc"},
+        )
+
+        def intent(intent_id, effect, quantity, minute, reason):
+            return contracts.OrderIntent(
+                id=intent_id,
+                symbol="L",
+                position_side=PositionSide.LONG,
+                order_side=(
+                    contracts.OrderSide.BUY
+                    if effect in {contracts.PositionEffect.OPEN, contracts.PositionEffect.INCREASE}
+                    else contracts.OrderSide.SELL
+                ),
+                position_effect=effect,
+                quantity=quantity,
+                reason=reason,
+                created_snapshot_id=f"snapshot-{intent_id}",
+                created_market_at=NOW + timedelta(minutes=minute),
+            )
+
+        def progress(order, price, fee, minute):
+            occurred_at = NOW + timedelta(minutes=minute)
+            fill_id = contracts.stable_execution_progress_fill_id(
+                intent_id=order.id,
+                symbol=order.symbol,
+                position_side=order.position_side,
+                order_side=order.order_side,
+                snapshot_id=f"market-{order.id}",
+                occurred_at=occurred_at,
+                quantity=order.quantity,
+                price=price,
+                fees=fee,
+                commission=fee,
+                status="FILLED",
+            )
+            return contracts.OrderExecutionProgress(
+                intent_id=order.id,
+                symbol=order.symbol,
+                position_side=order.position_side,
+                order_side=order.order_side,
+                intent_quantity=order.quantity,
+                execution_policy_fingerprint="replay-policy",
+                fills=(
+                    contracts.ExecutionProgressFill(
+                        id=fill_id,
+                        intent_id=order.id,
+                        symbol=order.symbol,
+                        position_side=order.position_side,
+                        order_side=order.order_side,
+                        snapshot_id=f"market-{order.id}",
+                        occurred_at=occurred_at,
+                        quantity=order.quantity,
+                        price=price,
+                        fees=fee,
+                        commission=fee,
+                        status="FILLED",
+                    ),
+                ),
+            )
+
+        orders = (
+            intent("open-1", contracts.PositionEffect.OPEN, 10, 1, "open first"),
+            intent("increase-1", contracts.PositionEffect.INCREASE, 10, 2, "increase first"),
+            intent("reduce-1", contracts.PositionEffect.REDUCE, 5, 3, "trim first"),
+            intent("close-1", contracts.PositionEffect.CLOSE, 15, 4, "close first"),
+            intent("open-2", contracts.PositionEffect.OPEN, 5, 5, "open second"),
+            intent("close-2", contracts.PositionEffect.CLOSE, 5, 6, "close second"),
+        )
+        prices = (100.0, 120.0, 130.0, 90.0, 200.0, 210.0)
+        progress_by_intent = {
+            order.id: progress(order, price, 1.0, index + 10)
+            for index, (order, price) in enumerate(zip(orders, prices))
+        }
+
+        trades, complete, reason = replay(
+            orders,
+            progress_by_intent,
+            {order.id: 3 for order in orders},
+            source,
+            3,
+            True,
+            None,
+        )
+
+        self.assertTrue(complete)
+        self.assertIsNone(reason)
+        self.assertEqual(len(trades), 2)
+        second, first = trades
+        self.assertEqual(second.entry_price, 200.0)
+        self.assertEqual(second.exit_price, 210.0)
+        self.assertEqual(second.realized_pnl, 48.0)
+        self.assertEqual(first.entry_price, 110.0)
+        self.assertEqual(first.exit_price, 100.0)
+        self.assertEqual(first.quantity, 20)
+        self.assertEqual(first.realized_pnl, -204.0)
+        self.assertAlmostEqual(first.return_pct, -204.0 / 2_200.0 * 100.0)
+
+        unavailable, complete, reason = replay(
+            (orders[3],),
+            {orders[3].id: progress_by_intent[orders[3].id]},
+            {orders[3].id: 3},
+            source,
+            3,
+            True,
+            None,
+        )
+        self.assertEqual(unavailable, ())
+        self.assertFalse(complete)
+        self.assertIn("no reconstructable open position", reason)
+
+    def test_typed_performance_projection_owns_all_economic_calculations(self):
+        source_type = getattr(contracts, "PerformanceStrategySource", None)
+        request_type = getattr(contracts, "PerformanceProjectionRequest", None)
+        projection_type = getattr(contracts, "StrategyPerformanceProjection", None)
+        self.assertIsNotNone(source_type)
+        self.assertIsNotNone(request_type)
+        self.assertIsNotNone(projection_type)
+        if source_type is None or request_type is None or projection_type is None:
+            return
+
+        with TemporaryDirectory() as temp_dir:
+            store = JsonLedgerStore(Path(temp_dir) / "ledger.json")
+            store.create_account(
+                AccountSnapshot(
+                    id="performance-account",
+                    strategy_id="strategy-us",
+                    strategy_revision=3,
+                    occurred_at=NOW,
+                    available_cash=99_000.0,
+                    positions=(
+                        contracts.PositionSnapshot(
+                            symbol="L",
+                            side=PositionSide.LONG,
+                            quantity=10,
+                            average_cost=100.0,
+                            current_price=105.0,
+                            peak_price=110.0,
+                            sellable_quantity=10,
+                        ),
+                    ),
+                    snapshot_id="performance-snapshot",
+                )
+            )
+            store.commit(
+                contracts.DecisionBatch(
+                    run_key="performance-run",
+                    strategy_id="strategy-us",
+                    strategy_revision=3,
+                    portfolio_snapshot_id="performance-snapshot",
+                    market_snapshot_id="performance-history-market",
+                    request_fingerprint="performance-request",
+                )
+            )
+            source = source_type(
+                id="strategy-us",
+                name="US typed strategy",
+                revision=3,
+                stage="paper",
+                market="us",
+                market_label="美股",
+                currency="USD",
+                currency_symbol="$",
+                initial_cash=100_000.0,
+                max_positions=10,
+                signal_model="long-test-v1",
+                benchmark_symbol="SPY",
+                benchmark_name="S&P 500",
+                config={"initial_cash": 100_000.0},
+                allocation={"model": "equal_weight"},
+                symbol_names={"L": "Long Inc"},
+            )
+            request = request_type(
+                strategy=source,
+                market=MarketSnapshot(
+                    id="performance-market",
+                    occurred_at=NOW,
+                    quotes={"L": {"price": 120.0, "percent": 3.5}},
+                ),
+                generated_at=NOW,
+                valuation_source="live_quote",
+            )
+            projection = service.PortfolioEngine(ledger_store=store).performance_projection(
+                request
+            )
+
+        self.assertIs(type(projection), projection_type)
+        self.assertEqual(projection.summary.nav, 100_200.0)
+        self.assertAlmostEqual(projection.summary.cumulative_return_pct, 0.2)
+        self.assertEqual(projection.summary.unrealized_pnl, 200.0)
+        self.assertEqual(projection.summary.realized_pnl, 0.0)
+        self.assertEqual(projection.positions[0].return_pct, 20.0)
+        self.assertEqual(projection.positions[0].day_change_pct, 3.5)
+        self.assertAlmostEqual(
+            projection.positions[0].weight_pct,
+            1_200.0 / 100_200.0 * 100.0,
+        )
+        self.assertEqual(projection.nav_history[-1].nav, 100_200.0)
+        self.assertEqual(projection.nav_history[-1].source, "live_quote")
+        self.assertEqual(projection.history_availability.nav.source, "v2_ledger")
+        self.assertFalse(projection.history_availability.nav.complete)
+        self.assertIn("historical NAV marks", projection.history_availability.nav.reason)
+        self.assertTrue(projection.history_availability.lifecycle.complete)
+        for name in (
+            "PerformanceProjectionRequest",
+            "PerformanceStrategySource",
+            "StrategyPerformanceProjection",
+        ):
+            self.assertIs(getattr(public_portfolio_engine, name), getattr(contracts, name))
+
     def _built_in_short_decision(
         self,
         *,
@@ -297,7 +523,15 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertTrue(hasattr(contracts, "PortfolioLedgerView"))
         self.assertEqual(
             set(public_portfolio_engine.__all__),
-            {"PortfolioEngine", "PlanRequest", "ProcessRequest", "PortfolioSnapshot"},
+            {
+                "PerformanceProjectionRequest",
+                "PerformanceStrategySource",
+                "PortfolioEngine",
+                "PlanRequest",
+                "ProcessRequest",
+                "PortfolioSnapshot",
+                "StrategyPerformanceProjection",
+            },
         )
 
     def test_recommendation_plan_accepts_only_exact_decision_batch(self):
