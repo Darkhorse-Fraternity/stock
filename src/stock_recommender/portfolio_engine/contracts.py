@@ -1820,7 +1820,7 @@ class PerformanceSummary(_DeeplyImmutable):
     position_count: int
     max_positions: int
     target_exposure_pct: float | None
-    closed_trade_count: int
+    closed_trade_count: int | None
     win_rate_pct: float | None
 
 
@@ -1829,8 +1829,15 @@ class PerformanceRuntime(_DeeplyImmutable):
     last_successful_pipeline_at: datetime | None = None
     last_successful_pipeline_run_id: str | None = None
     last_pipeline_admitted: int | None = None
-    last_pipeline_stages: tuple[Mapping[str, Any], ...] = ()
-    last_pipeline_data_quality: Mapping[str, Any] = field(default_factory=dict)
+    last_pipeline_stages: tuple[Mapping[str, Any], ...] | None = None
+    last_pipeline_market_regime: Mapping[str, Any] | None = None
+    last_pipeline_data_quality: Mapping[str, Any] | None = None
+    availability: PerformanceHistoryAvailability = field(
+        default_factory=lambda: PerformanceHistoryAvailability(
+            complete=True,
+            source="v2_ledger",
+        )
+    )
 
     def __post_init__(self) -> None:
         if self.last_successful_pipeline_at is not None:
@@ -1839,20 +1846,35 @@ class PerformanceRuntime(_DeeplyImmutable):
             _require_string(self.last_successful_pipeline_run_id, "last_successful_pipeline_run_id")
         if self.last_pipeline_admitted is not None:
             _require_integer(self.last_pipeline_admitted, "last_pipeline_admitted")
-        stages = _mapping_tuple(self.last_pipeline_stages, "last_pipeline_stages")
-        _require_mapping(self.last_pipeline_data_quality, "last_pipeline_data_quality")
-        object.__setattr__(self, "last_pipeline_stages", stages)
-        object.__setattr__(
-            self,
+        if self.last_pipeline_stages is not None:
+            stages = _mapping_tuple(self.last_pipeline_stages, "last_pipeline_stages")
+            object.__setattr__(
+                self,
+                "last_pipeline_stages",
+                tuple(_deep_freeze(item) for item in stages),
+            )
+        for field_name in (
+            "last_pipeline_market_regime",
             "last_pipeline_data_quality",
-            _deep_freeze(self.last_pipeline_data_quality),
-        )
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_mapping(value, field_name)
+                object.__setattr__(self, field_name, _deep_freeze(value))
+        if type(self.availability) is not PerformanceHistoryAvailability:
+            raise TypeError("availability must be PerformanceHistoryAvailability")
 
 
 @dataclass(frozen=True)
 class PerformanceNavPoint(_DeeplyImmutable):
     at: datetime
     nav: float
+    cash: float
+    market_value: float
+    cumulative_return_pct: float
+    drawdown_pct: float | None
+    risk_level: str | None
+    trading_mode: str | None
     source: str
 
 
@@ -1893,9 +1915,29 @@ class PerformanceOrder(_DeeplyImmutable):
     filled_notional: float
     commission_charged: float
     fees_charged: float
-    strategy_revision: int
+    strategy_revision: int | None
     position_side: str
     position_effect: str
+    key: str | None = None
+    control_epoch: int | None = None
+    purpose: str | None = None
+    slot_id: int | None = None
+    signal_price: float | None = None
+    score: float | None = None
+    reserved_cash: float | None = None
+    valid_date: str | None = None
+    valid_session_date: str | None = None
+    cancel_reason: str | None = None
+    replacement_candidate: Mapping[str, Any] | None = None
+
+    def __post_init__(self) -> None:
+        if self.replacement_candidate is not None:
+            _require_mapping(self.replacement_candidate, "replacement_candidate")
+            object.__setattr__(
+                self,
+                "replacement_candidate",
+                _deep_freeze(self.replacement_candidate),
+            )
 
 
 @dataclass(frozen=True)
@@ -1920,7 +1962,8 @@ class PerformanceEventView(_DeeplyImmutable):
     type: str
     occurred_at: datetime
     message: str
-    strategy_revision: int
+    strategy_revision: int | None
+    key: str | None = None
     data: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

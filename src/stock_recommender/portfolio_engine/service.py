@@ -163,12 +163,27 @@ def _performance_runtime(view: object) -> PerformanceRuntime:
     if not completed_events:
         return PerformanceRuntime()
     event = max(completed_events, key=lambda item: item.occurred_at)
-    run_key = str(event.data["run_key"])
+    raw_run_key = event.data.get("run_key")
+    run_key = raw_run_key if type(raw_run_key) is str and raw_run_key else None
+    if run_key is None:
+        return PerformanceRuntime(
+            last_successful_pipeline_at=event.occurred_at,
+            availability=PerformanceHistoryAvailability(
+                complete=False,
+                source="v2_ledger",
+                reason="PIPELINE_COMPLETED event has no canonical run key",
+            ),
+        )
     batch = next((item for item in view.batches if item.run_key == run_key), None)
     if batch is None:
         return PerformanceRuntime(
             last_successful_pipeline_at=event.occurred_at,
             last_successful_pipeline_run_id=run_key,
+            availability=PerformanceHistoryAvailability(
+                complete=False,
+                source="v2_ledger",
+                reason="pipeline DecisionBatch is unavailable",
+            ),
         )
     stages = tuple(
         {
@@ -179,27 +194,55 @@ def _performance_runtime(view: object) -> PerformanceRuntime:
         }
         for output in batch.stage_outputs
     )
-    admitted: int | None = None
-    for output in reversed(batch.stage_outputs):
-        for fact in output.facts:
-            items = fact.get("items") if isinstance(fact, Mapping) else None
-            if isinstance(items, (tuple, list)):
-                admitted = len(items)
-                break
-        if admitted is not None:
-            break
-    data_quality: Mapping[str, Any] = {}
-    for diagnostic in reversed(batch.diagnostics):
-        candidate = diagnostic.get("data_quality")
-        if isinstance(candidate, Mapping):
-            data_quality = candidate
-            break
+    admitted = len(batch.intents)
+
+    def canonical_mapping(field_name: str) -> Mapping[str, Any] | None:
+        containers: list[Mapping[str, Any]] = []
+        containers.extend(
+            item for item in batch.diagnostics if isinstance(item, Mapping)
+        )
+        for output in batch.stage_outputs:
+            containers.extend(
+                item
+                for item in (*output.facts, *output.diagnostics)
+                if isinstance(item, Mapping)
+            )
+        for container in reversed(containers):
+            candidate = container.get(field_name)
+            if isinstance(candidate, Mapping):
+                return candidate
+            if container.get("kind") == field_name:
+                value = container.get("value")
+                if isinstance(value, Mapping):
+                    return value
+        return None
+
+    market_regime = canonical_mapping("market_regime")
+    data_quality = canonical_mapping("data_quality")
+    missing = [
+        label
+        for label, value in (
+            ("market regime", market_regime),
+            ("data quality", data_quality),
+        )
+        if value is None
+    ]
     return PerformanceRuntime(
         last_successful_pipeline_at=event.occurred_at,
         last_successful_pipeline_run_id=run_key,
         last_pipeline_admitted=admitted,
         last_pipeline_stages=stages,
+        last_pipeline_market_regime=market_regime,
         last_pipeline_data_quality=data_quality,
+        availability=PerformanceHistoryAvailability(
+            complete=not missing,
+            source="v2_ledger",
+            reason=(
+                "canonical pipeline metadata unavailable: " + ", ".join(missing)
+                if missing
+                else None
+            ),
+        ),
     )
 
 
@@ -251,25 +294,33 @@ def _replay_closed_trades(
     default_revision: int,
     lifecycle_complete: bool,
     lifecycle_reason: str | None,
+    *,
+    expected_positions: tuple[object, ...] | None = None,
 ) -> tuple[tuple[PerformanceClosedTrade, ...], bool, str | None]:
     """Replay canonical fills with the same weighted-average position accounting."""
 
     if not lifecycle_complete:
         return (), False, lifecycle_reason
-    states: dict[tuple[str, PositionSide], dict[str, float | int]] = {}
+    states: dict[tuple[str, PositionSide], dict[str, float | int | str]] = {}
     trades: list[PerformanceClosedTrade] = []
-    ordered = sorted(
-        intents,
-        key=lambda intent: (
-            progress_by_intent[intent.id].fills[0].occurred_at
-            if intent.id in progress_by_intent
-            else intent.created_market_at
-        ),
+    intent_by_id = {intent.id: intent for intent in intents}
+    timeline: list[tuple[object, OrderIntent, object]] = []
+    for progress in progress_by_intent.values():
+        intent = intent_by_id.get(progress.intent_id)
+        if intent is None:
+            return (), False, "execution progress has no canonical intent"
+        for fill in progress.fills:
+            timeline.append((fill, intent, progress))
+    timeline.sort(
+        key=lambda item: (
+            item[0].occurred_at,
+            item[0].snapshot_id,
+            item[1].id,
+            item[0].id,
+        )
     )
-    for intent in ordered:
-        progress = progress_by_intent.get(intent.id)
-        if progress is None:
-            continue
+
+    for fill, intent, progress in timeline:
         key = (intent.symbol, intent.position_side)
         state = states.get(key)
         if intent.position_effect in {PositionEffect.OPEN, PositionEffect.INCREASE}:
@@ -286,42 +337,46 @@ def _replay_closed_trades(
                     "exit_notional": 0.0,
                     "exit_fees": 0.0,
                     "raw_realized": 0.0,
+                    "open_intent_id": intent.id,
                 }
                 states[key] = state
-            for fill in progress.fills:
-                quantity = int(state["quantity"])
-                average_cost = float(state["average_cost"])
-                next_quantity = quantity + fill.quantity
-                state["average_cost"] = (
-                    average_cost * quantity + fill.price * fill.quantity
-                ) / next_quantity
-                state["quantity"] = next_quantity
-                state["entry_quantity"] = int(state["entry_quantity"]) + fill.quantity
-                state["entry_notional"] = (
-                    float(state["entry_notional"]) + fill.price * fill.quantity
-                )
-                state["entry_fees"] = float(state["entry_fees"]) + fill.fees
+            elif (
+                intent.position_effect is PositionEffect.OPEN
+                and state.get("open_intent_id") != intent.id
+            ):
+                return (), False, "an open fill overlaps a reconstructed position"
+            quantity = int(state["quantity"])
+            average_cost = float(state["average_cost"])
+            next_quantity = quantity + fill.quantity
+            state["average_cost"] = (
+                average_cost * quantity + fill.price * fill.quantity
+            ) / next_quantity
+            state["quantity"] = next_quantity
+            state["entry_quantity"] = int(state["entry_quantity"]) + fill.quantity
+            state["entry_notional"] = (
+                float(state["entry_notional"]) + fill.price * fill.quantity
+            )
+            state["entry_fees"] = float(state["entry_fees"]) + fill.fees
             continue
         if state is None:
             return (), False, "an exit has no reconstructable open position"
         direction = 1.0 if intent.position_side is PositionSide.LONG else -1.0
-        for fill in progress.fills:
-            quantity = int(state["quantity"])
-            if fill.quantity > quantity:
-                return (), False, "exit fills exceed the reconstructed position"
-            average_cost = float(state["average_cost"])
-            state["raw_realized"] = float(state["raw_realized"]) + (
-                direction * (fill.price - average_cost) * fill.quantity
-            )
-            state["quantity"] = quantity - fill.quantity
-            state["exit_quantity"] = int(state["exit_quantity"]) + fill.quantity
-            state["exit_notional"] = (
-                float(state["exit_notional"]) + fill.price * fill.quantity
-            )
-            state["exit_fees"] = float(state["exit_fees"]) + fill.fees
-        if intent.position_effect is PositionEffect.CLOSE and progress.status == "FILLED":
-            if int(state["quantity"]) != 0:
-                return (), False, "a filled close did not flatten the reconstructed position"
+        quantity = int(state["quantity"])
+        if fill.quantity > quantity:
+            return (), False, "exit fills exceed the reconstructed position"
+        average_cost = float(state["average_cost"])
+        state["raw_realized"] = float(state["raw_realized"]) + (
+            direction * (fill.price - average_cost) * fill.quantity
+        )
+        state["quantity"] = quantity - fill.quantity
+        state["exit_quantity"] = int(state["exit_quantity"]) + fill.quantity
+        state["exit_notional"] = (
+            float(state["exit_notional"]) + fill.price * fill.quantity
+        )
+        state["exit_fees"] = float(state["exit_fees"]) + fill.fees
+        if int(state["quantity"]) == 0:
+            if intent.position_effect is not PositionEffect.CLOSE:
+                return (), False, "a reduce fill flattened the reconstructed position"
             entry_notional = float(state["entry_notional"])
             entry_quantity = int(state["entry_quantity"])
             exit_notional = float(state["exit_notional"])
@@ -344,7 +399,7 @@ def _replay_closed_trades(
                     realized_pnl=realized,
                     return_pct=realized / entry_notional * 100.0,
                     reason=intent.reason,
-                    closed_at=progress.fills[-1].occurred_at,
+                    closed_at=fill.occurred_at,
                     strategy_revision=revision_by_intent.get(
                         intent.id,
                         default_revision,
@@ -353,6 +408,31 @@ def _replay_closed_trades(
                 )
             )
             del states[key]
+        elif (
+            intent.position_effect is PositionEffect.CLOSE
+            and fill is progress.fills[-1]
+            and progress.status == "FILLED"
+        ):
+            return (), False, "a completed close did not flatten the reconstructed position"
+
+    if expected_positions is not None:
+        expected = {
+            (position.symbol, position.side): position
+            for position in expected_positions
+        }
+        if set(states) != set(expected):
+            return (), False, "current positions are not explained by canonical fills"
+        for key, position in expected.items():
+            state = states[key]
+            if int(state["quantity"]) != position.quantity:
+                return (), False, "current position quantity differs from canonical fills"
+            if not math.isclose(
+                float(state["average_cost"]),
+                position.average_cost,
+                rel_tol=1e-12,
+                abs_tol=1e-9,
+            ):
+                return (), False, "current position average cost differs from canonical fills"
     trades.sort(key=lambda item: item.closed_at, reverse=True)
     return tuple(trades), True, None
 
@@ -1130,10 +1210,29 @@ class PortfolioEngine:
                     fees_charged=progress.fees_charged if progress is not None else 0.0,
                     strategy_revision=revision_by_intent.get(
                         intent.id,
-                        snapshot.account.strategy_revision,
                     ),
                     position_side=intent.position_side.value,
                     position_effect=intent.position_effect.value,
+                    key=None,
+                    control_epoch=None,
+                    purpose=(
+                        "ENTRY"
+                        if intent.position_effect
+                        in {PositionEffect.OPEN, PositionEffect.INCREASE}
+                        else "EXIT"
+                    ),
+                    slot_id=None,
+                    signal_price=None,
+                    score=None,
+                    reserved_cash=None,
+                    valid_date=None,
+                    valid_session_date=None,
+                    cancel_reason=(
+                        str(cancelled.data.get("reason"))
+                        if cancelled is not None and cancelled.data.get("reason")
+                        else None
+                    ),
+                    replacement_candidate=None,
                 )
             )
         orders.sort(key=lambda item: item.updated_at, reverse=True)
@@ -1146,58 +1245,107 @@ class PortfolioEngine:
             snapshot.account.strategy_revision,
             view.lifecycle_complete,
             view.lifecycle_reason,
+            expected_positions=view.account.positions,
         )
 
         opened_events = [event for event in view.events if event.type == "ACCOUNT_OPENED"]
         opened = min(opened_events, key=lambda item: item.occurred_at) if opened_events else None
         nav_history = []
-        if opened is not None and opened.occurred_at != request.generated_at:
+        opened_cash = (
+            _report_number(opened.data.get("available_cash"))
+            if opened is not None
+            else None
+        )
+        opened_cash_missing = opened is not None and opened_cash is None
+        if (
+            opened is not None
+            and lifecycle_complete
+            and opened.occurred_at != request.generated_at
+            and opened_cash is not None
+        ):
             nav_history.append(
                 PerformanceNavPoint(
                     at=opened.occurred_at,
-                    nav=source.initial_cash,
-                    source="strategy_initial_cash",
+                    nav=opened_cash,
+                    cash=opened_cash,
+                    market_value=0.0,
+                    cumulative_return_pct=(
+                        opened_cash / source.initial_cash - 1.0
+                    )
+                    * 100.0,
+                    drawdown_pct=0.0,
+                    risk_level=None,
+                    trading_mode=None,
+                    source="account_opened",
                 )
             )
         nav_history.append(
             PerformanceNavPoint(
                 at=request.generated_at,
                 nav=snapshot.metrics.equity,
+                cash=snapshot.metrics.available_cash,
+                market_value=snapshot.metrics.long_market_value,
+                cumulative_return_pct=(
+                    snapshot.metrics.equity / source.initial_cash - 1.0
+                )
+                * 100.0,
+                drawdown_pct=None,
+                risk_level=source.risk_level,
+                trading_mode=source.trading_mode,
                 source=request.valuation_source,
             )
         )
-        nav_complete = opened is not None and not view.batches
+        nav_complete = (
+            opened is not None
+            and not opened_cash_missing
+            and not view.batches
+            and lifecycle_complete
+        )
         nav_reason = None
         if opened is None:
             nav_reason = "ACCOUNT_OPENED fact is unavailable"
+        elif opened_cash_missing:
+            nav_reason = "ACCOUNT_OPENED has no canonical available cash"
+        elif not lifecycle_complete:
+            nav_reason = "lifecycle is incomplete; historical NAV cannot be reconstructed"
         elif view.batches:
             nav_reason = "historical NAV marks are not persisted in ledger schema v2"
         maximum_drawdown: float | None = None
         if nav_complete:
             peak = nav_history[0].nav
             maximum_drawdown = 0.0
+            complete_nav_history = []
             for point in nav_history:
                 peak = max(peak, point.nav)
-                maximum_drawdown = max(
-                    maximum_drawdown,
-                    (peak - point.nav) / peak * 100.0 if peak else 0.0,
+                drawdown = (peak - point.nav) / peak * 100.0 if peak else 0.0
+                complete_nav_history.append(
+                    replace(point, drawdown_pct=drawdown)
                 )
+                maximum_drawdown = max(maximum_drawdown, drawdown)
+            nav_history = complete_nav_history
         realized_pnl = (
             sum(item.realized_pnl for item in closed_trades)
             if lifecycle_complete
             else None
         )
         wins = sum(item.realized_pnl > 0 for item in closed_trades)
+        revision_by_event = {
+            event.id: batch.strategy_revision
+            for batch in view.batches
+            for event in batch.events
+        }
         events = tuple(
             PerformanceEventView(
                 id=event.id,
+                key=None,
                 type=event.type,
                 occurred_at=event.occurred_at,
                 message=_event_message(event),
                 strategy_revision=(
                     event.data.get("strategy_revision")
                     if type(event.data.get("strategy_revision")) is int
-                    else snapshot.account.strategy_revision
+                    else revision_by_event.get(event.id)
+                    or revision_by_intent.get(str(event.data.get("intent_id") or ""))
                 ),
                 data=event.data,
             )
@@ -1219,7 +1367,7 @@ class PortfolioEngine:
             position_count=len(positions),
             max_positions=source.max_positions,
             target_exposure_pct=source.target_exposure_pct,
-            closed_trade_count=len(closed_trades),
+            closed_trade_count=(len(closed_trades) if lifecycle_complete else None),
             win_rate_pct=(
                 wins / len(closed_trades) * 100.0 if closed_trades else None
             ),

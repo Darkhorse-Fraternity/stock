@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from stock_recommender.context import (
@@ -38,6 +39,7 @@ from stock_recommender.portfolio_engine.contracts import (
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerError
 from stock_recommender.portfolio_engine.pre_execution import HardCapBreach
 from stock_recommender.portfolio_engine.risk import COVER_ONLY
+from stock_recommender.pipeline import StageOutput
 from stock_recommender.recommendation import RecommendationPlan
 from stock_recommender.reports import render_report
 from stock_recommender.tracking import save_daily_selection
@@ -185,6 +187,272 @@ def recommendation_plan(decision=None) -> RecommendationPlan:
 
 
 class PortfolioEngineServiceTests(unittest.TestCase):
+    def test_performance_runtime_uses_canonical_batch_and_marks_missing_facts(self):
+        event = contracts.PortfolioEvent(
+            id="pipeline-event",
+            type="PIPELINE_COMPLETED",
+            occurred_at=NOW,
+            data={"run_key": "pipeline:canonical", "market_snapshot_id": "market-1"},
+        )
+        batch = contracts.DecisionBatch(
+            run_key="pipeline:canonical",
+            strategy_id="strategy-us",
+            strategy_revision=3,
+            portfolio_snapshot_id="portfolio-0",
+            market_snapshot_id="market-1",
+            request_fingerprint="runtime-fingerprint",
+            diagnostics=(
+                {"market_regime": {"state": "RISK_ON"}},
+                {"data_quality": {"status": "READY"}},
+            ),
+            stage_outputs=(
+                StageOutput(
+                    stage="margin_admission",
+                    component_version="1.0.0",
+                    facts=({"kind": "margin_admitted_intents", "items": ()},),
+                ),
+            ),
+        )
+
+        runtime = service._performance_runtime(
+            SimpleNamespace(events=(event,), batches=(batch,))
+        )
+
+        self.assertTrue(runtime.availability.complete)
+        self.assertEqual(runtime.last_successful_pipeline_at, NOW)
+        self.assertEqual(runtime.last_successful_pipeline_run_id, "pipeline:canonical")
+        self.assertEqual(runtime.last_pipeline_admitted, 0)
+        self.assertEqual(runtime.last_pipeline_market_regime, {"state": "RISK_ON"})
+        self.assertEqual(runtime.last_pipeline_data_quality, {"status": "READY"})
+        self.assertEqual(runtime.last_pipeline_stages[0]["stage"], "margin_admission")
+
+        unavailable = service._performance_runtime(
+            SimpleNamespace(events=(event,), batches=())
+        )
+        self.assertFalse(unavailable.availability.complete)
+        self.assertIn("DecisionBatch", unavailable.availability.reason)
+        self.assertIsNone(unavailable.last_pipeline_admitted)
+        self.assertIsNone(unavailable.last_pipeline_stages)
+        self.assertIsNone(unavailable.last_pipeline_market_regime)
+        self.assertIsNone(unavailable.last_pipeline_data_quality)
+
+    def test_performance_lifecycle_requires_fills_to_explain_current_positions(self):
+        source = contracts.PerformanceStrategySource(
+            id="strategy-us",
+            name="lifecycle",
+            revision=3,
+            stage="paper",
+            market="us",
+            market_label="美股",
+            currency="USD",
+            currency_symbol="$",
+            initial_cash=100_000.0,
+            max_positions=10,
+        )
+        request = contracts.PerformanceProjectionRequest(
+            strategy=source,
+            market=market(),
+            generated_at=NOW,
+            valuation_source="test",
+        )
+        unexplained = replace(
+            account(),
+            available_cash=99_000.0,
+            positions=(
+                contracts.PositionSnapshot(
+                    symbol="L",
+                    side=PositionSide.LONG,
+                    quantity=10,
+                    average_cost=100.0,
+                    current_price=100.0,
+                ),
+            ),
+        )
+
+        with TemporaryDirectory() as temporary:
+            unexplained_store = JsonLedgerStore(Path(temporary) / "unexplained.json")
+            unexplained_store.create_account(unexplained)
+            projection = service.PortfolioEngine(
+                ledger_store=unexplained_store
+            ).performance_projection(request)
+
+            self.assertFalse(projection.history_availability.lifecycle.complete)
+            self.assertFalse(projection.history_availability.nav.complete)
+            self.assertIn(
+                "current position",
+                projection.history_availability.lifecycle.reason,
+            )
+            self.assertIsNone(projection.summary.realized_pnl)
+            self.assertIsNone(projection.summary.closed_trade_count)
+            self.assertIsNone(projection.summary.win_rate_pct)
+
+            empty_store = JsonLedgerStore(Path(temporary) / "empty.json")
+            empty_store.create_account(account())
+            empty_projection = service.PortfolioEngine(
+                ledger_store=empty_store
+            ).performance_projection(request)
+
+        self.assertTrue(empty_projection.history_availability.lifecycle.complete)
+        self.assertTrue(empty_projection.history_availability.nav.complete)
+        self.assertEqual(empty_projection.summary.realized_pnl, 0.0)
+        self.assertEqual(empty_projection.summary.closed_trade_count, 0)
+        self.assertIsNone(empty_projection.summary.win_rate_pct)
+        self.assertEqual(empty_projection.nav_history[-1].drawdown_pct, 0.0)
+
+    def test_closed_trade_replay_orders_every_fill_globally_and_reconciles_current_lot(self):
+        source = contracts.PerformanceStrategySource(
+            id="strategy-us",
+            name="interleaved fills",
+            revision=3,
+            stage="paper",
+            market="us",
+            market_label="美股",
+            currency="USD",
+            currency_symbol="$",
+            initial_cash=100_000.0,
+            max_positions=10,
+        )
+
+        def order(intent_id, effect, quantity, order_side):
+            return contracts.OrderIntent(
+                id=intent_id,
+                symbol="L",
+                position_side=PositionSide.LONG,
+                order_side=order_side,
+                position_effect=effect,
+                quantity=quantity,
+                reason=intent_id,
+                created_snapshot_id=f"created-{intent_id}",
+                created_market_at=NOW,
+            )
+
+        def fill(intent, *, quantity, price, minute, status, snapshot_id):
+            occurred_at = NOW + timedelta(minutes=minute)
+            fill_id = contracts.stable_execution_progress_fill_id(
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                position_side=intent.position_side,
+                order_side=intent.order_side,
+                snapshot_id=snapshot_id,
+                occurred_at=occurred_at,
+                quantity=quantity,
+                price=price,
+                fees=0.0,
+                commission=0.0,
+                status=status,
+            )
+            return contracts.ExecutionProgressFill(
+                id=fill_id,
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                position_side=intent.position_side,
+                order_side=intent.order_side,
+                snapshot_id=snapshot_id,
+                occurred_at=occurred_at,
+                quantity=quantity,
+                price=price,
+                fees=0.0,
+                commission=0.0,
+                status=status,
+            )
+
+        opened = order(
+            "open-interleaved",
+            contracts.PositionEffect.OPEN,
+            10,
+            contracts.OrderSide.BUY,
+        )
+        closed = order(
+            "close-interleaved",
+            contracts.PositionEffect.CLOSE,
+            5,
+            contracts.OrderSide.SELL,
+        )
+        progress = {
+            opened.id: contracts.OrderExecutionProgress(
+                intent_id=opened.id,
+                symbol=opened.symbol,
+                position_side=opened.position_side,
+                order_side=opened.order_side,
+                intent_quantity=10,
+                execution_policy_fingerprint="interleaved-policy",
+                fills=(
+                    fill(
+                        opened,
+                        quantity=5,
+                        price=100.0,
+                        minute=10,
+                        status="PARTIAL",
+                        snapshot_id="open-t10",
+                    ),
+                    fill(
+                        opened,
+                        quantity=5,
+                        price=120.0,
+                        minute=30,
+                        status="FILLED",
+                        snapshot_id="open-t30",
+                    ),
+                ),
+            ),
+            closed.id: contracts.OrderExecutionProgress(
+                intent_id=closed.id,
+                symbol=closed.symbol,
+                position_side=closed.position_side,
+                order_side=closed.order_side,
+                intent_quantity=5,
+                execution_policy_fingerprint="interleaved-policy",
+                fills=(
+                    fill(
+                        closed,
+                        quantity=5,
+                        price=110.0,
+                        minute=20,
+                        status="FILLED",
+                        snapshot_id="close-t20",
+                    ),
+                ),
+            ),
+        }
+        expected_position = contracts.PositionSnapshot(
+            symbol="L",
+            side=PositionSide.LONG,
+            quantity=5,
+            average_cost=120.0,
+            current_price=120.0,
+        )
+
+        trades, complete, reason = service._replay_closed_trades(
+            (opened, closed),
+            progress,
+            {opened.id: 3, closed.id: 3},
+            source,
+            3,
+            True,
+            None,
+            expected_positions=(expected_position,),
+        )
+
+        self.assertTrue(complete, reason)
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0].entry_price, 100.0)
+        self.assertEqual(trades[0].exit_price, 110.0)
+        self.assertEqual(trades[0].realized_pnl, 50.0)
+
+        trades, complete, reason = service._replay_closed_trades(
+            (opened, closed),
+            progress,
+            {opened.id: 3, closed.id: 3},
+            source,
+            3,
+            True,
+            None,
+            expected_positions=(replace(expected_position, average_cost=100.0),),
+        )
+        self.assertEqual(trades, ())
+        self.assertFalse(complete)
+        self.assertIn("average cost", reason)
+
     def test_closed_trade_replay_is_exact_across_increase_reduce_close_and_reopen(self):
         replay = getattr(service, "_replay_closed_trades", None)
         self.assertIsNotNone(replay)
@@ -391,7 +659,8 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertEqual(projection.summary.nav, 100_200.0)
         self.assertAlmostEqual(projection.summary.cumulative_return_pct, 0.2)
         self.assertEqual(projection.summary.unrealized_pnl, 200.0)
-        self.assertEqual(projection.summary.realized_pnl, 0.0)
+        self.assertIsNone(projection.summary.realized_pnl)
+        self.assertIsNone(projection.summary.closed_trade_count)
         self.assertEqual(projection.positions[0].return_pct, 20.0)
         self.assertEqual(projection.positions[0].day_change_pct, 3.5)
         self.assertAlmostEqual(
@@ -402,8 +671,8 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertEqual(projection.nav_history[-1].source, "live_quote")
         self.assertEqual(projection.history_availability.nav.source, "v2_ledger")
         self.assertFalse(projection.history_availability.nav.complete)
-        self.assertIn("historical NAV marks", projection.history_availability.nav.reason)
-        self.assertTrue(projection.history_availability.lifecycle.complete)
+        self.assertIn("lifecycle is incomplete", projection.history_availability.nav.reason)
+        self.assertFalse(projection.history_availability.lifecycle.complete)
         for name in (
             "PerformanceProjectionRequest",
             "PerformanceStrategySource",

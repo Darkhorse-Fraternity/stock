@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
@@ -16,6 +17,9 @@ from stock_recommender.portfolio_engine.contracts import (
     AccountSnapshot,
     PerformanceHistoryAvailability,
     PerformanceHistoryStatus,
+    PerformanceEventView,
+    PerformanceNavPoint,
+    PerformanceOrder,
     PerformanceRuntime,
     PerformanceStrategySource,
     PerformanceSummary,
@@ -27,6 +31,77 @@ from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
+    def test_typed_projection_preserves_complete_nested_public_api_shape(self):
+        runtime_fields = {item.name for item in fields(PerformanceRuntime)}
+        self.assertTrue(
+            {
+                "last_successful_pipeline_at",
+                "last_successful_pipeline_run_id",
+                "last_pipeline_admitted",
+                "last_pipeline_stages",
+                "last_pipeline_market_regime",
+                "last_pipeline_data_quality",
+                "availability",
+            }.issubset(runtime_fields)
+        )
+        self.assertEqual(
+            {item.name for item in fields(PerformanceNavPoint)},
+            {
+                "at",
+                "nav",
+                "cash",
+                "market_value",
+                "cumulative_return_pct",
+                "drawdown_pct",
+                "risk_level",
+                "trading_mode",
+                "source",
+            },
+        )
+        self.assertTrue(
+            {
+                "id",
+                "key",
+                "strategy_revision",
+                "control_epoch",
+                "side",
+                "purpose",
+                "symbol",
+                "name",
+                "slot_id",
+                "quantity",
+                "filled_quantity",
+                "filled_notional",
+                "commission_charged",
+                "fees_charged",
+                "status",
+                "reason",
+                "signal_price",
+                "score",
+                "reserved_cash",
+                "valid_date",
+                "valid_session_date",
+                "created_at",
+                "updated_at",
+                "replacement_candidate",
+                "cancel_reason",
+                "position_side",
+                "position_effect",
+            }.issubset({item.name for item in fields(PerformanceOrder)})
+        )
+        self.assertEqual(
+            {item.name for item in fields(PerformanceEventView)},
+            {
+                "id",
+                "key",
+                "type",
+                "occurred_at",
+                "message",
+                "strategy_revision",
+                "data",
+            },
+        )
+
     class _QuoteAdapter:
         def __init__(self, *, price=120.0, percent=2.5, error=None):
             self.price = price
@@ -92,12 +167,55 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 closed_trade_count=0,
                 win_rate_pct=None,
             ),
-            runtime=PerformanceRuntime(),
-            nav_history=(),
+            runtime=PerformanceRuntime(
+                last_pipeline_market_regime={"state": "RISK_ON"},
+            ),
+            nav_history=(
+                PerformanceNavPoint(
+                    at=now,
+                    nav=123.0,
+                    cash=5.0,
+                    market_value=118.0,
+                    cumulative_return_pct=999.0,
+                    drawdown_pct=None,
+                    risk_level=None,
+                    trading_mode=None,
+                    source="test",
+                ),
+            ),
             positions=(),
-            orders=(),
+            orders=(
+                PerformanceOrder(
+                    id="order-1",
+                    side="BUY",
+                    symbol="AAPL",
+                    name="Apple",
+                    quantity=1,
+                    filled_quantity=0,
+                    status="INTENDED",
+                    reason="test",
+                    created_at=now,
+                    updated_at=now,
+                    filled_notional=0.0,
+                    commission_charged=0.0,
+                    fees_charged=0.0,
+                    strategy_revision=2,
+                    position_side="LONG",
+                    position_effect="OPEN",
+                ),
+            ),
             closed_trades=(),
-            events=(),
+            events=(
+                PerformanceEventView(
+                    id="event-1",
+                    type="ACCOUNT_OPENED",
+                    occurred_at=now,
+                    message="opened",
+                    strategy_revision=2,
+                    key=None,
+                    data={},
+                ),
+            ),
             history_availability=PerformanceHistoryStatus(
                 nav=PerformanceHistoryAvailability(
                     complete=False,
@@ -116,6 +234,41 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["nav"], 123.0)
         self.assertEqual(payload["summary"]["cumulative_return_pct"], 999.0)
         self.assertEqual(payload["summary"]["realized_pnl"], 7.0)
+        self.assertEqual(
+            payload["runtime"]["last_pipeline_market_regime"],
+            {"state": "RISK_ON"},
+        )
+        self.assertEqual(
+            set(payload["nav_history"][0]),
+            {
+                "at",
+                "nav",
+                "cash",
+                "market_value",
+                "cumulative_return_pct",
+                "drawdown_pct",
+                "risk_level",
+                "trading_mode",
+                "source",
+            },
+        )
+        self.assertIsNone(payload["orders"][0]["key"])
+        self.assertIsNone(payload["orders"][0]["signal_price"])
+        self.assertIsNone(payload["orders"][0]["replacement_candidate"])
+        self.assertEqual(
+            set(payload["events"][0]),
+            {
+                "id",
+                "key",
+                "type",
+                "occurred_at",
+                "message",
+                "strategy_revision",
+                "data",
+            },
+        )
+        self.assertEqual(payload["config"], {"initial_cash": 100.0})
+        self.assertEqual(payload["allocation"], {"model": "equal_weight"})
 
         for method, path in (("do_PUT", "/api/config"), ("do_POST", "/api/config/reset")):
             with self.subTest(method=method, path=path):
@@ -219,9 +372,10 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
             (expected_nav / initial_cash - 1.0) * 100.0,
         )
         self.assertEqual(payload["summary"]["unrealized_pnl"], 200.0)
-        self.assertEqual(payload["summary"]["realized_pnl"], 0.0)
-        self.assertEqual(payload["summary"]["closed_trade_count"], 0)
+        self.assertIsNone(payload["summary"]["realized_pnl"])
+        self.assertIsNone(payload["summary"]["closed_trade_count"])
         self.assertEqual(payload["summary"]["win_rate_pct"], None)
+        self.assertFalse(payload["history_availability"]["lifecycle"]["complete"])
         held = payload["positions"][0]
         self.assertEqual(held["current_price"], 120.0)
         self.assertEqual(held["day_change_pct"], 2.5)
