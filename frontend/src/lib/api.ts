@@ -128,6 +128,55 @@ export interface ShortPolicy {
   maximum_volatility_20d_pct: number
 }
 
+export type PerformanceJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | PerformanceJsonValue[]
+  | { readonly [key: string]: PerformanceJsonValue }
+
+export interface PerformanceJsonObject {
+  readonly [key: string]: PerformanceJsonValue
+}
+
+export interface PerformanceHistoryAvailability {
+  complete: boolean
+  source: string
+  reason: string | null
+}
+
+export interface PerformanceHistoryStatus {
+  nav: PerformanceHistoryAvailability
+  lifecycle: PerformanceHistoryAvailability
+}
+
+export interface PortfolioPerformanceStrategy {
+  id: string
+  name: string
+  revision: number
+  stage: string
+  market: "cn" | "us"
+  market_label: string
+  currency: string
+  currency_symbol: string
+  initial_cash: number
+  max_positions: number
+  signal_model: string | null
+  signal_time: string | null
+  signal_data_cutoff: string | null
+  allocation_model: string | null
+  benchmark_symbol: string | null
+  benchmark_name: string | null
+  market_regime: PerformanceJsonObject | null
+  risk_level: string | null
+  trading_mode: string | null
+  target_exposure_pct: number | null
+  exposure_policy: ExposurePolicy
+  margin_policy: MarginPolicy
+  short_policy: ShortPolicy
+}
+
 export interface PortfolioPerformanceSummary {
   initial_cash: number
   nav: number
@@ -181,35 +230,101 @@ export interface PortfolioPerformancePosition {
   margin_used: number
 }
 
+export interface PortfolioPerformanceRuntime {
+  last_successful_pipeline_at: string | null
+  last_successful_pipeline_run_id: string | null
+  last_pipeline_admitted: number | null
+  last_pipeline_stages: PerformanceJsonObject[] | null
+  last_pipeline_market_regime: PerformanceJsonObject | null
+  last_pipeline_data_quality: PerformanceJsonObject | null
+  availability: PerformanceHistoryAvailability
+}
+
+export interface PortfolioPerformanceNavPoint {
+  at: string
+  nav: number
+  cash: number
+  market_value: number
+  cumulative_return_pct: number
+  drawdown_pct: number | null
+  risk_level: string | null
+  trading_mode: string | null
+  source: string
+}
+
+export interface PortfolioPerformanceOrder {
+  id: string
+  side: "BUY" | "SELL"
+  symbol: string
+  name: string
+  quantity: number
+  filled_quantity: number
+  status: "INTENDED" | "PARTIAL" | "FILLED" | "CANCELLED" | "EXPIRED"
+  reason: string
+  created_at: string
+  updated_at: string
+  filled_notional: number
+  commission_charged: number
+  fees_charged: number
+  strategy_revision: number | null
+  position_side: "LONG" | "SHORT"
+  position_effect: "OPEN" | "INCREASE" | "REDUCE" | "CLOSE"
+  key: string | null
+  control_epoch: number | null
+  purpose: "ENTRY" | "EXIT" | null
+  slot_id: number | null
+  signal_price: number | null
+  score: number | null
+  reserved_cash: number | null
+  valid_date: string | null
+  valid_session_date: string | null
+  cancel_reason: string | null
+  replacement_candidate: PerformanceJsonObject | null
+}
+
+export interface PortfolioPerformanceClosedTrade {
+  id: string
+  name: string
+  symbol: string
+  entry_price: number
+  exit_price: number
+  quantity: number
+  realized_pnl: number
+  return_pct: number
+  reason: string
+  closed_at: string
+  strategy_revision: number
+  position_side: "LONG" | "SHORT"
+}
+
 export interface PortfolioPerformanceEvent {
   id: string
   type: string
   occurred_at: string
   message: string
   strategy_revision: number | null
-  key?: string | null
-  data: Record<string, unknown>
+  key: string | null
+  data: PerformanceJsonObject
 }
 
 export interface StrategyPerformancePayload {
   generated_at: string
   quote_error: string | null
-  strategy: {
-    id: string
-    name: string
-    revision: number
-    stage: string
-    market: "cn" | "us"
-    market_label: string
-    currency: string
-    currency_symbol: string
-    exposure_policy: ExposurePolicy
-    margin_policy: MarginPolicy
-    short_policy: ShortPolicy
-  }
+  strategy: PortfolioPerformanceStrategy
   summary: PortfolioPerformanceSummary
+  runtime: PortfolioPerformanceRuntime
+  nav_history: PortfolioPerformanceNavPoint[]
   positions: PortfolioPerformancePosition[]
+  orders: PortfolioPerformanceOrder[]
+  closed_trades: PortfolioPerformanceClosedTrade[]
   events: PortfolioPerformanceEvent[]
+  history_availability: PerformanceHistoryStatus
+  market: "cn" | "us"
+  market_label: string
+  currency: string
+  currency_symbol: string
+  config: PortfolioConfig
+  allocation: AllocationConfig
 }
 
 export interface SignalConfig {
