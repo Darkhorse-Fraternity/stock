@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+from copy import deepcopy
 from dataclasses import fields
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +13,7 @@ from stock_recommender.admin import (
     _serialize_strategy_performance,
     build_strategy_performance,
 )
-from stock_recommender.parameters import create_strategy
+from stock_recommender.parameters import create_strategy, load_strategy_config, save_strategy_config
 from stock_recommender.portfolio_engine.contracts import (
     AccountSnapshot,
     PerformanceHistoryAvailability,
@@ -23,14 +24,80 @@ from stock_recommender.portfolio_engine.contracts import (
     PerformanceRuntime,
     PerformanceStrategySource,
     PerformanceSummary,
+    PortfolioEvent,
     PositionSide,
     PositionSnapshot,
     StrategyPerformanceProjection,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
+from stock_recommender.portfolio_engine.service import _event_message
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
+    def test_public_event_messages_explain_margin_carry_cover_and_forced_reasons(self):
+        occurred_at = datetime(2026, 8, 3, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+        cases = (
+            ("MARGIN_CALL", "MAINTENANCE_MARGIN_BREACH", "保证金追缴", "维持保证金不足"),
+            ("COVER_ONLY", "BORROW_REVOKED", "仅允许空头回补", "借券资格撤销"),
+            ("FINANCING_COST_ACCRUED", None, "融资成本已计提", None),
+            ("BORROW_COST_ACCRUED", None, "借券成本已计提", None),
+            ("FORCED_DELEVERAGE", "HARD_EXPOSURE_CAP", "强制去杠杆", "敞口超过硬上限"),
+        )
+        for index, (event_type, reason, label, reason_label) in enumerate(cases):
+            with self.subTest(event_type=event_type):
+                message = _event_message(
+                    PortfolioEvent(
+                        id=f"public-event-{index}",
+                        type=event_type,
+                        occurred_at=occurred_at,
+                        data={"symbol": "PLTR", "reason": reason},
+                    )
+                )
+                self.assertIn(label, message)
+                if reason_label:
+                    self.assertIn(reason_label, message)
+
+    def test_strategy_get_and_put_expose_policies_and_policy_put_creates_revision(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "strategies.json"
+            with patch.dict(os.environ, {"STOCK_AGENT_CONFIG": str(config_path)}, clear=False):
+                original = create_strategy("policy api")
+
+                get_result = {}
+                get_handler = AdminHandler.__new__(AdminHandler)
+                get_handler.path = f"/api/strategies/{original['id']}"
+                get_handler._send_json = lambda payload, status=None: get_result.update(
+                    payload=payload,
+                    status=status,
+                )
+                get_handler.do_GET()
+
+                for section in ("exposure_policy", "margin_policy", "short_policy"):
+                    self.assertIn(section, get_result["payload"]["config"])
+
+                candidate = deepcopy(get_result["payload"]["config"])
+                candidate["parameters"]["market"] = {"enabled": True, "value": "us"}
+                candidate["exposure_policy"]["mode"] = "LONG_SHORT"
+                put_result = {}
+                put_handler = AdminHandler.__new__(AdminHandler)
+                put_handler.path = f"/api/strategies/{original['id']}"
+                put_handler._read_json = lambda: candidate
+                put_handler._send_json = lambda payload, status=None: put_result.update(
+                    payload=payload,
+                    status=status,
+                )
+                put_handler.do_PUT()
+
+                revised = put_result["payload"]["config"]
+                persisted_original = load_strategy_config(strategy_id=original["id"])
+
+        self.assertNotEqual(revised["id"], original["id"])
+        self.assertEqual(revised["revision"], 2)
+        self.assertEqual(revised["exposure_policy"]["mode"], "LONG_SHORT")
+        self.assertEqual(revised["lifecycle"]["stage"], "draft")
+        self.assertFalse(revised["validation"]["approval_gate"]["passed"])
+        self.assertEqual(persisted_original["exposure_policy"]["mode"], "LONG_ONLY")
+
     def test_typed_projection_preserves_complete_nested_public_api_shape(self):
         runtime_fields = {item.name for item in fields(PerformanceRuntime)}
         self.assertTrue(
@@ -157,6 +224,15 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 cash=5.0,
                 reserved_cash=0.0,
                 market_value=118.0,
+                long_market_value=118.0,
+                short_liability=0.0,
+                gross_exposure_pct=95.9349593495935,
+                net_exposure_pct=95.9349593495935,
+                margin_rate_pct=104.23728813559322,
+                buying_power=5.0,
+                margin_loan=0.0,
+                financing_cost=0.0,
+                borrow_cost=0.0,
                 cumulative_return_pct=999.0,
                 maximum_drawdown_pct=None,
                 realized_pnl=7.0,
@@ -421,6 +497,77 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 payload["events"][0]
             )
         )
+
+    def test_long_short_portfolio_api_exposes_typed_account_and_position_metrics(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "strategies.json"
+            portfolio_path = Path(temp_dir) / "portfolios.json"
+            environment = {
+                "STOCK_AGENT_CONFIG": str(config_path),
+                "STOCK_AGENT_PORTFOLIO_PATH": str(portfolio_path),
+            }
+            occurred_at = datetime(2026, 8, 3, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+            with patch.dict(os.environ, environment, clear=False):
+                original = create_strategy("long short performance")
+                candidate = deepcopy(original)
+                candidate["parameters"]["market"] = {"enabled": True, "value": "us"}
+                candidate["exposure_policy"]["mode"] = "LONG_SHORT"
+                strategy = save_strategy_config(candidate, strategy_id=original["id"])
+                initial_cash = strategy["portfolio"]["initial_cash"]
+                JsonLedgerStore(portfolio_path).create_account(
+                    AccountSnapshot(
+                        id=f"account-{strategy['id']}",
+                        strategy_id=strategy["id"],
+                        strategy_revision=strategy["revision"],
+                        occurred_at=occurred_at,
+                        available_cash=initial_cash,
+                        restricted_short_proceeds=1_000.0,
+                        margin_loan=500.0,
+                        accrued_financing_cost=12.5,
+                        accrued_borrow_cost=4.5,
+                        positions=(
+                            PositionSnapshot(
+                                symbol="PLTR",
+                                side=PositionSide.SHORT,
+                                quantity=10,
+                                average_cost=100.0,
+                                current_price=90.0,
+                                position_mode="COVER_ONLY",
+                            ),
+                        ),
+                        snapshot_id="admin-long-short-snapshot",
+                    )
+                )
+                with patch(
+                    "stock_recommender.admin.get_market_adapter",
+                    return_value=self._QuoteAdapter(price=90.0, percent=-2.0),
+                ):
+                    payload = build_strategy_performance(
+                        strategy_id=strategy["id"],
+                        path=portfolio_path,
+                        now=occurred_at,
+                    )
+
+        summary = payload["summary"]
+        self.assertEqual(summary["long_market_value"], 0.0)
+        self.assertEqual(summary["short_liability"], 900.0)
+        self.assertIn("gross_exposure_pct", summary)
+        self.assertIn("net_exposure_pct", summary)
+        self.assertIn("margin_rate_pct", summary)
+        self.assertIn("buying_power", summary)
+        self.assertEqual(summary["margin_loan"], 500.0)
+        self.assertEqual(summary["financing_cost"], 12.5)
+        self.assertEqual(summary["borrow_cost"], 4.5)
+        held = payload["positions"][0]
+        self.assertEqual(held["side"], "SHORT")
+        self.assertAlmostEqual(held["return_pct"], 10.0)
+        self.assertEqual(held["position_mode"], "COVER_ONLY")
+        self.assertEqual(
+            held["borrow_rate_pct"],
+            strategy["short_policy"]["estimated_borrow_apr_pct"],
+        )
+        self.assertGreater(held["margin_used"], 0.0)
+        self.assertIsNotNone(held["exit_distance_pct"])
 
     def test_quote_failure_returns_error_and_persisted_valuation(self):
         with tempfile.TemporaryDirectory() as temp_dir:

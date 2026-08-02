@@ -316,10 +316,21 @@ def _event_message(event: object) -> str:
         "ORDER_EXPIRED": f"{symbol} 订单已过期".strip(),
         "RISK_CHANGED": f"{symbol} 风险状态已更新".strip(),
         "REVISION_TRANSITIONED": "策略版本已切换",
+        "MARGIN_CALL": "保证金追缴",
+        "COVER_ONLY": "仅允许空头回补",
+        "FORCED_DELEVERAGE": "强制去杠杆",
         "FINANCING_COST_ACCRUED": "融资成本已计提",
         "BORROW_COST_ACCRUED": f"{symbol} 借券成本已计提".strip(),
     }
-    return messages.get(event.type, event.type)
+    message = messages.get(event.type, event.type)
+    reasons = {
+        "MAINTENANCE_MARGIN_BREACH": "维持保证金不足",
+        "MARGIN_CALL": "保证金率低于维持线",
+        "BORROW_REVOKED": "借券资格撤销",
+        "HARD_EXPOSURE_CAP": "敞口超过硬上限",
+    }
+    reason = reasons.get(str(event.data.get("reason") or ""))
+    return f"{message}（{reason}）" if reason else message
 
 
 def _exit_distance_pct(position: object, config: Mapping[str, Any]) -> float | None:
@@ -343,6 +354,32 @@ def _exit_distance_pct(position: object, config: Mapping[str, Any]) -> float | N
     if position.trailing_active and trailing is not None and position.trough_price is not None:
         thresholds.append(position.trough_price * (1.0 + trailing / 100.0))
     return ((min(thresholds) - price) / price * 100.0) if thresholds else None
+
+
+def _public_ratio(value: float) -> float | None:
+    return value if math.isfinite(value) else None
+
+
+def _performance_margin_terms(
+    source: object,
+    metrics: object,
+) -> tuple[float, float]:
+    """Return policy-consistent margin usage ratio and available buying power."""
+
+    exposure = effective_exposure_policy(source.exposure_policy)
+    margin = MarginPolicy(**normalize_margin_policy(source.margin_policy))
+    threshold_pct = margin.maintenance_margin_pct + margin.liquidation_buffer_pct
+    gross = metrics.long_market_value + metrics.short_liability
+    margin_capacity = (
+        max(0.0, metrics.equity * 100.0 / threshold_pct - gross)
+        if metrics.equity > 0 and threshold_pct > 0
+        else 0.0
+    )
+    gross_capacity = max(
+        0.0,
+        metrics.equity * exposure.max_gross_exposure_pct / 100.0 - gross,
+    )
+    return threshold_pct, min(margin_capacity, gross_capacity)
 
 
 @dataclass(frozen=True)
@@ -1288,6 +1325,11 @@ class PortfolioEngine:
         lifecycle_complete = lifecycle.complete
         lifecycle_reason = lifecycle.reason
 
+        margin_threshold_pct, buying_power = _performance_margin_terms(
+            source,
+            snapshot.metrics,
+        )
+        short_policy = ShortPolicy(**normalize_short_policy(source.short_policy))
         positions = []
         for slot_id, held in enumerate(snapshot.positions, start=1):
             market_value = held.market_value
@@ -1327,10 +1369,23 @@ class PortfolioEngine:
                     sellable_quantity=held.sellable_quantity,
                     trailing_active=held.trailing_active,
                     signal_invalid_days=None,
-                    exit_distance_pct=_exit_distance_pct(held, source.config),
+                    exit_distance_pct=_exit_distance_pct(
+                        held,
+                        source.short_policy
+                        if held.side is PositionSide.SHORT
+                        else source.config,
+                    ),
                     market_value=market_value,
                     average_cost=held.average_cost,
                     position_side=held.side.value,
+                    side=held.side.value,
+                    position_mode=held.position_mode,
+                    borrow_rate_pct=(
+                        short_policy.estimated_borrow_apr_pct
+                        if held.side is PositionSide.SHORT
+                        else None
+                    ),
+                    margin_used=market_value * margin_threshold_pct / 100.0,
                 )
             )
 
@@ -1536,6 +1591,15 @@ class PortfolioEngine:
             cash=snapshot.metrics.available_cash,
             reserved_cash=snapshot.account.reserved_cash,
             market_value=snapshot.metrics.long_market_value,
+            long_market_value=snapshot.metrics.long_market_value,
+            short_liability=snapshot.metrics.short_liability,
+            gross_exposure_pct=_public_ratio(snapshot.metrics.gross_exposure_pct),
+            net_exposure_pct=_public_ratio(snapshot.metrics.net_exposure_pct),
+            margin_rate_pct=_public_ratio(snapshot.metrics.margin_rate_pct),
+            buying_power=buying_power,
+            margin_loan=snapshot.metrics.margin_loan,
+            financing_cost=snapshot.metrics.accrued_financing_cost,
+            borrow_cost=snapshot.metrics.accrued_borrow_cost,
             cumulative_return_pct=(
                 snapshot.metrics.equity / source.initial_cash - 1.0
             )

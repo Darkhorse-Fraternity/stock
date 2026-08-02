@@ -15,7 +15,7 @@ from .portfolio_engine.ledger import JsonLedgerStore
 from .portfolio_engine.contracts import DecisionBatch
 from .portfolio_engine.service import PortfolioEngine
 from .recommendation import RecommendationPlan, recommendation_tracking_entries
-from .reports import format_recommendation_snapshot
+from .reports import append_performance_link, format_recommendation_snapshot
 from .runtime import assert_strategy_runnable
 from .us_data_providers import strategy_us_data_source
 from .utils import beijing_now, number
@@ -174,6 +174,7 @@ def generate_saved_tracking_report(
     quote_fetcher: Callable | None = None,
     benchmark_fetcher: Callable | None = None,
     history_path: str | Path | None = None,
+    performance_url: str = "",
 ) -> str:
     current = beijing_now(now)
     state = load_daily_selection_state(state_path, now=current)
@@ -199,13 +200,17 @@ def generate_saved_tracking_report(
     by_symbol = {str(row.get("symbol")): row for row in rows}
     ordered = [by_symbol[symbol] for symbol in symbols if symbol in by_symbol]
     if not ordered:
-        return "\n".join(
+        return append_performance_link("\n".join(
             [
                 "⚠️ **推荐股盘中行情不可用**",
-                f"数据源错误：{error or '未返回有效行情'}",
+                (
+                    f"策略：{state.get('strategy_name') or state.get('strategy_id') or '未命名策略'}"
+                    f" · v{state.get('strategy_revision', 1)}"
+                ),
+                "数据源状态：暂不可用",
                 "本次不发布成交量和涨跌幅，避免使用失效数据。",
             ]
-        )
+        ), performance_url)
 
     initial_benchmark = state.get("benchmark_initial_change_pct")
     current_benchmark = None
@@ -293,12 +298,16 @@ def generate_saved_tracking_report(
     benchmark_line = (
         f"板块成分等权近似：{benchmark_return:+.2f}%（从推荐时刻起）"
         if benchmark_return is not None
-        else f"板块基准暂不可用：{benchmark_error or state.get('benchmark_error') or '未记录推荐时刻基准'}"
+        else "板块基准暂不可用"
     )
-    return "\n".join(
+    return append_performance_link("\n".join(
         [
             f"📊 **推荐股盘中情况报告** ({current.strftime('%Y 年%m月%d日')})",
-            f"策略模式：{mode_label} · v{state.get('strategy_revision', 1)}",
+            (
+                f"策略：{state.get('strategy_name') or state.get('strategy_id') or '未命名策略'}"
+                f" · v{state.get('strategy_revision', 1)}"
+            ),
+            f"策略模式：{mode_label}",
             "",
             snapshot,
             "",
@@ -308,4 +317,4 @@ def generate_saved_tracking_report(
             "仅跟踪今日 08:00 基于前一交易日收盘数据生成的策略持仓，不重新选股。",
             "仅供策略验证，不构成投资建议。",
         ]
-    )
+    ), performance_url)

@@ -91,11 +91,12 @@ class PortfolioCliTests(unittest.TestCase):
             return_value=("batch", "snapshot"),
         ) as process, patch.object(
             cli, "format_portfolio_actions", return_value=""
-        ), redirect_stdout(stream):
+        ) as format_actions, redirect_stdout(stream):
             cli.main()
 
         self.assertEqual(stream.getvalue(), "")
         process.assert_called_once()
+        self.assertEqual(format_actions.call_args.kwargs["snapshot"], "snapshot")
 
     def test_scheduled_ai_passes_runtime_to_one_plan_and_tracks_exact_plan(self):
         environment = {

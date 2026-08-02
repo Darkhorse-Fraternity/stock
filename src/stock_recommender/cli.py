@@ -143,7 +143,7 @@ def main() -> None:
             performance_url=performance_url,
         )
     elif mode == "risk":
-        batch, _ = process_portfolio_runtime(
+        batch, snapshot = process_portfolio_runtime(
             strategy,
             engine=portfolio_engine,
             account=portfolio_account,
@@ -152,6 +152,7 @@ def main() -> None:
         report = format_portfolio_actions(
             strategy,
             batch,
+            snapshot=snapshot,
             performance_url=performance_url,
         )
     elif mode == "data":

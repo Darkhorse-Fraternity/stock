@@ -275,6 +275,8 @@ def _performance_source(strategy: Mapping[str, Any]) -> PerformanceStrategySourc
     portfolio = strategy.get("portfolio")
     allocation = strategy.get("allocation")
     exposure = strategy.get("exposure_policy")
+    margin = strategy.get("margin_policy")
+    short = strategy.get("short_policy")
     lifecycle = strategy.get("lifecycle")
     signal = strategy.get("signal")
     if not strategy_id:
@@ -351,6 +353,9 @@ def _performance_source(strategy: Mapping[str, Any]) -> PerformanceStrategySourc
             if isinstance(market_regime, Mapping)
             else None
         ),
+        exposure_policy=exposure if isinstance(exposure, Mapping) else {},
+        margin_policy=margin if isinstance(margin, Mapping) else {},
+        short_policy=short if isinstance(short, Mapping) else {},
         config=portfolio,
         allocation=allocation if isinstance(allocation, Mapping) else {},
         symbol_names=_symbol_names(strategy),

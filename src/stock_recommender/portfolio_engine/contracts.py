@@ -1743,6 +1743,9 @@ class PerformanceStrategySource(_DeeplyImmutable):
     risk_level: str | None = None
     trading_mode: str | None = None
     target_exposure_pct: float | None = None
+    exposure_policy: Mapping[str, Any] = field(default_factory=dict)
+    margin_policy: Mapping[str, Any] = field(default_factory=dict)
+    short_policy: Mapping[str, Any] = field(default_factory=dict)
     config: Mapping[str, Any] = field(default_factory=dict)
     allocation: Mapping[str, Any] = field(default_factory=dict)
     symbol_names: Mapping[str, str] = field(default_factory=dict)
@@ -1783,7 +1786,14 @@ class PerformanceStrategySource(_DeeplyImmutable):
         if self.market_regime is not None:
             _require_mapping(self.market_regime, "market_regime")
             object.__setattr__(self, "market_regime", _deep_freeze(self.market_regime))
-        for field_name in ("config", "allocation", "symbol_names"):
+        for field_name in (
+            "exposure_policy",
+            "margin_policy",
+            "short_policy",
+            "config",
+            "allocation",
+            "symbol_names",
+        ):
             value = getattr(self, field_name)
             _require_mapping(value, field_name)
             object.__setattr__(self, field_name, _deep_freeze(value))
@@ -1815,6 +1825,15 @@ class PerformanceSummary(_DeeplyImmutable):
     cash: float
     reserved_cash: float
     market_value: float
+    long_market_value: float
+    short_liability: float
+    gross_exposure_pct: float | None
+    net_exposure_pct: float | None
+    margin_rate_pct: float | None
+    buying_power: float
+    margin_loan: float
+    financing_cost: float
+    borrow_cost: float
     cumulative_return_pct: float
     maximum_drawdown_pct: float | None
     realized_pnl: float | None
@@ -1829,8 +1848,26 @@ class PerformanceSummary(_DeeplyImmutable):
         _require_positive_finite_number(self.initial_cash, "initial_cash")
         _require_nonnegative_finite_number(self.nav, "nav")
         _require_finite_number(self.cash, "cash")
-        for field_name in ("reserved_cash", "market_value"):
+        for field_name in (
+            "reserved_cash",
+            "market_value",
+            "long_market_value",
+            "short_liability",
+            "buying_power",
+            "margin_loan",
+            "financing_cost",
+            "borrow_cost",
+        ):
             _require_nonnegative_finite_number(getattr(self, field_name), field_name)
+        if self.gross_exposure_pct is not None:
+            _require_nonnegative_finite_number(
+                self.gross_exposure_pct,
+                "gross_exposure_pct",
+            )
+        if self.net_exposure_pct is not None:
+            _require_finite_number(self.net_exposure_pct, "net_exposure_pct")
+        if self.margin_rate_pct is not None:
+            _require_nonnegative_finite_number(self.margin_rate_pct, "margin_rate_pct")
         _require_finite_number(self.cumulative_return_pct, "cumulative_return_pct")
         if self.maximum_drawdown_pct is not None:
             _require_nonnegative_finite_number(
@@ -1951,6 +1988,10 @@ class PerformancePosition(_DeeplyImmutable):
     market_value: float
     average_cost: float
     position_side: str
+    side: str
+    position_mode: str
+    borrow_rate_pct: float | None
+    margin_used: float
 
     def __post_init__(self) -> None:
         _require_integer(self.slot_id, "slot_id")
@@ -1991,6 +2032,15 @@ class PerformancePosition(_DeeplyImmutable):
         _require_string(self.position_side, "position_side")
         if self.position_side not in {item.value for item in PositionSide}:
             raise ValueError("position_side must be LONG or SHORT")
+        _require_string(self.side, "side")
+        if self.side != self.position_side:
+            raise ValueError("side must equal position_side")
+        _require_string(self.position_mode, "position_mode")
+        if self.borrow_rate_pct is not None:
+            _require_nonnegative_finite_number(self.borrow_rate_pct, "borrow_rate_pct")
+        if self.position_side == PositionSide.LONG.value and self.borrow_rate_pct is not None:
+            raise ValueError("LONG position must not expose a borrow rate")
+        _require_nonnegative_finite_number(self.margin_used, "margin_used")
 
 
 @dataclass(frozen=True)

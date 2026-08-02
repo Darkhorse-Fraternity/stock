@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping
+from urllib.parse import urlsplit
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import (
@@ -23,11 +25,96 @@ from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
 
 
-def append_performance_link(report: str, url: str) -> str:
+def _safe_performance_url(url: object) -> str:
     target = str(url or "").strip()
+    if (
+        not target
+        or len(target) > 2048
+        or any(character.isspace() or ord(character) < 32 for character in target)
+        or any(character in target for character in "[]()<>\\")
+    ):
+        return ""
+    try:
+        parsed = urlsplit(target)
+        _ = parsed.port
+    except ValueError:
+        return ""
+    if (
+        parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return ""
+    return target
+
+
+def append_performance_link(report: str, url: str) -> str:
+    target = _safe_performance_url(url)
     if not target or target in report:
         return report
     return f"{report.rstrip()}\n\n📊 [查看策略表现]({target})"
+
+
+def _ratio_text(value: float) -> str:
+    return f"{value:.2f}%" if math.isfinite(value) else "--"
+
+
+def _position_direction(side: object) -> str:
+    return "多头" if getattr(side, "value", side) == "LONG" else "空头"
+
+
+def _intent_action(item: object) -> str:
+    effect = getattr(item.position_effect, "value", item.position_effect)
+    if getattr(item.position_side, "value", item.position_side) == "SHORT":
+        return "空头回补" if effect in {"REDUCE", "CLOSE"} else "空头卖出"
+    return "多头减仓" if effect in {"REDUCE", "CLOSE"} else "多头买入"
+
+
+def _fill_action(item: object, intents_by_id: Mapping[str, object]) -> str:
+    intent = intents_by_id.get(item.intent_id)
+    direction = _intent_action(intent) if intent is not None else "方向未知"
+    return (
+        f"模拟成交：{item.symbol} {direction} "
+        f"{item.quantity} 股 @ {item.price:.2f}"
+    )
+
+
+def _event_action(item: object) -> str:
+    labels = {
+        "MARGIN_CALL": "保证金追缴",
+        "COVER_ONLY": "仅允许空头回补",
+        "FINANCING_COST_ACCRUED": "融资成本计提",
+        "BORROW_COST_ACCRUED": "借券成本计提",
+        "FORCED_DELEVERAGE": "强制去杠杆",
+    }
+    reasons = {
+        "MAINTENANCE_MARGIN_BREACH": "维持保证金不足",
+        "MARGIN_CALL": "保证金率低于维持线",
+        "BORROW_REVOKED": "借券资格撤销",
+        "HARD_EXPOSURE_CAP": "敞口超过硬上限",
+    }
+    event_type = str(getattr(item, "type", ""))
+    label = labels.get(event_type, event_type)
+    data = getattr(item, "data", {})
+    reason = reasons.get(str(data.get("reason") or "")) if isinstance(data, Mapping) else None
+    return f"{label}（{reason}）" if reason else label
+
+
+def _account_metric_lines(snapshot: PortfolioSnapshot) -> tuple[str, str]:
+    metrics = snapshot.metrics
+    return (
+        (
+            f"总敞口 {_ratio_text(metrics.gross_exposure_pct)} · "
+            f"净敞口 {_ratio_text(metrics.net_exposure_pct)} · "
+            f"保证金率 {_ratio_text(metrics.margin_rate_pct)}"
+        ),
+        (
+            f"融资负债 {metrics.margin_loan:,.2f} · "
+            f"融资成本 {metrics.accrued_financing_cost:,.2f} · "
+            f"借券成本 {metrics.accrued_borrow_cost:,.2f}"
+        ),
+    )
 
 
 def format_portfolio_snapshot(
@@ -50,46 +137,43 @@ def format_portfolio_snapshot(
             f"可用现金：{snapshot.account.available_cash:,.2f} · "
             f"持仓：{len(snapshot.positions)}/{max_positions}"
         ),
+        *_account_metric_lines(snapshot),
     ]
     for held in snapshot.positions:
         lines.append(
-            f"- {held.symbol} {held.side.value}：{held.quantity} 股 · "
+            f"- {held.symbol} {_position_direction(held.side)}：{held.quantity} 股 · "
             f"现价 {held.current_price:.2f}"
         )
     if not snapshot.positions:
         lines.append("- 当前空仓")
-    if performance_url:
-        lines.extend(("", f"策略表现：{performance_url}"))
-    return "\n".join(lines)
+    return append_performance_link("\n".join(lines), performance_url)
 
 
 def format_portfolio_actions(
     strategy: Mapping[str, Any],
     batch: DecisionBatch,
     *,
+    snapshot: PortfolioSnapshot,
     performance_url: str = "",
 ) -> str:
+    intents_by_id = {item.id: item for item in batch.intents}
     actions = [
         *(
-            f"订单意图：{item.symbol} {item.order_side.value} {item.quantity}"
+            f"订单意图：{item.symbol} {_intent_action(item)} {item.quantity} 股"
             for item in batch.intents
         ),
-        *(
-            f"模拟成交：{item.symbol} {item.quantity} @ {item.price:.2f}"
-            for item in batch.fills
-        ),
-        *(f"事件：{item.type}" for item in batch.events),
+        *(_fill_action(item, intents_by_id) for item in batch.fills),
+        *(f"事件：{_event_action(item)}" for item in batch.events),
     ]
     if not actions:
         return ""
     lines = [
         "⚠️ **策略组合动作通知**",
         f"策略：{strategy.get('name') or strategy.get('id')} · v{strategy.get('revision')}",
+        *_account_metric_lines(snapshot),
         *actions,
     ]
-    if performance_url:
-        lines.extend(("", f"策略表现：{performance_url}"))
-    return "\n".join(lines)
+    return append_performance_link("\n".join(lines), performance_url)
 
 
 def decorate_strategy_output(report: str, strategy: dict | None) -> str:
