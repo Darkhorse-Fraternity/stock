@@ -908,6 +908,57 @@ def _simple_batch(
     )
 
 
+def _simple_filled_batch(account: AccountSnapshot) -> DecisionBatch:
+    batch = _simple_batch(
+        account,
+        run_key="normalized-authority-run",
+        intent_id="normalized-authority-intent",
+        market_snapshot_id="normalized-authority-market",
+    )
+    intent = batch.intents[0]
+    fill_values = {
+        "intent_id": intent.id,
+        "symbol": intent.symbol,
+        "position_side": intent.position_side,
+        "order_side": intent.order_side,
+        "snapshot_id": batch.market_snapshot_id,
+        "occurred_at": account.occurred_at + timedelta(minutes=1),
+        "quantity": 1,
+        "price": 10.0,
+        "fees": 0.0,
+        "commission": 0.0,
+        "status": "FILLED",
+    }
+    detail = ExecutionProgressFill(
+        id=stable_execution_progress_fill_id(**fill_values),
+        **fill_values,
+    )
+    return replace(
+        batch,
+        fills=(
+            ExecutionFill(
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                quantity=1,
+                price=10.0,
+                fees=0.0,
+                status="FILLED",
+            ),
+        ),
+        execution_progress=(
+            OrderExecutionProgress(
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                position_side=intent.position_side,
+                order_side=intent.order_side,
+                intent_quantity=1,
+                execution_policy_fingerprint="normalized-authority-policy",
+                fills=(detail,),
+            ),
+        ),
+    )
+
+
 @unittest.skipUnless(DATABASE_URL, "requires Docker PostgreSQL")
 class MonthLongShortIntegrationTests(unittest.TestCase):
     @classmethod
@@ -1092,6 +1143,32 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                 "WHERE strategy_id=%s AND run_key=%s AND source_kind='BATCH'",
                 (),
             ),
+            "derived_as_batch_with_null_ordinal": (
+                "UPDATE {}.events SET source_kind='BATCH' "
+                "WHERE strategy_id=%s AND run_key=%s AND source_kind='DERIVED'",
+                ("derived",),
+            ),
+            "batch_with_null_ordinal": (
+                "UPDATE {}.events SET batch_ordinal=NULL "
+                "WHERE strategy_id=%s AND run_key=%s AND source_kind='BATCH'",
+                (),
+            ),
+            "derived_with_nonnull_ordinal": (
+                "UPDATE {}.events SET batch_ordinal=0 "
+                "WHERE strategy_id=%s AND run_key=%s AND source_kind='DERIVED'",
+                ("derived",),
+            ),
+            "batch_as_derived_with_nonnull_ordinal": (
+                "UPDATE {}.events SET source_kind='DERIVED' "
+                "WHERE strategy_id=%s AND run_key=%s AND source_kind='BATCH'",
+                (),
+            ),
+            "result_snapshot_id": (
+                "UPDATE {}.committed_runs SET result_snapshot_id="
+                "'tampered-result-snapshot' "
+                "WHERE strategy_id=%s AND run_key=%s",
+                (),
+            ),
         }
         import psycopg
         from psycopg import sql
@@ -1109,11 +1186,15 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                         snapshot_id="normalized-authority-bootstrap",
                     )
                     store.create_account(account)
-                    batch = _simple_batch(
-                        account,
-                        run_key="normalized-authority-run",
-                        intent_id="normalized-authority-intent",
-                        market_snapshot_id="normalized-authority-market",
+                    batch = (
+                        _simple_filled_batch(account)
+                        if "derived" in options
+                        else _simple_batch(
+                            account,
+                            run_key="normalized-authority-run",
+                            intent_id="normalized-authority-intent",
+                            market_snapshot_id="normalized-authority-market",
+                        )
                     )
                     store.commit(batch)
                     self.assertEqual(
@@ -1125,7 +1206,7 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                         batch,
                     )
                     identifiers = [sql.Identifier(schema)]
-                    if options:
+                    if "double_schema" in options:
                         identifiers.append(sql.Identifier(schema))
                     with psycopg.connect(DATABASE_URL) as connection:
                         connection.execute(

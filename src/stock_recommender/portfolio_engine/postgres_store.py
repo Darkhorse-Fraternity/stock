@@ -1114,6 +1114,8 @@ class PostgresLedgerStore:
             ) != item[3:6]:
                 raise LedgerError("event columns differ from payload")
             if item[2] == "BATCH":
+                if item[1] is None:
+                    raise LedgerError("batch event requires a public ordinal")
                 batch_event_public.append((item[1], event))
             elif item[2] != "DERIVED" or item[1] is not None:
                 raise LedgerError("batch-derived event has invalid source metadata")
@@ -1135,6 +1137,8 @@ class PostgresLedgerStore:
             ),
             carry_accruals=_public_items(tuple(carry_public), table="carry_accruals"),
         )
+        if _stable_snapshot_id(batch) != _result_snapshot_id:
+            raise LedgerError("committed run result_snapshot_id is inconsistent")
         facts = _canonical_batch_facts(batch)
         normalized_facts = (
             tuple(intents),
