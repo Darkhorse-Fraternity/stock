@@ -333,10 +333,30 @@ class LongShortNotificationTests(unittest.TestCase):
             "https://token@stock.example/portfolio",
             "https://stock.example/portfolio\nINTERNAL_SECRET",
             "https://stock.example/portfolio\x7fsecret",
+            " https://stock.example/portfolio",
+            "https://stock.example/portfolio ",
+            "https://stock.example/portfolio\u200b",
             "javascript:alert(1)",
         ):
             with self.subTest(malicious=malicious):
                 self.assertEqual(append_performance_link("report", malicious), "report")
+
+    def test_performance_link_rejects_percent_decoded_controls_and_whitespace(self):
+        for encoded in (
+            "%00",
+            "%1f",
+            "%7f",
+            "%80",
+            "%9f",
+            "%09",
+            "%0A",
+            "%0D",
+            "%20",
+            "%C2%A0",
+        ):
+            with self.subTest(encoded=encoded):
+                url = f"https://stock.example/portfolio{encoded}secret"
+                self.assertEqual(append_performance_link("report", url), "report")
 
     def test_performance_link_accepts_hosts_ports_and_parenthesized_paths_safely(self):
         cases = {

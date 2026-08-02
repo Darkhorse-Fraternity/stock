@@ -3,9 +3,10 @@ from __future__ import annotations
 import ipaddress
 import math
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote_to_bytes, urlsplit, urlunsplit
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import (
@@ -29,6 +30,13 @@ from .utils import number
 def _normalized_url_component(value: str, *, safe: str) -> str:
     if re.search(r"%(?![0-9A-Fa-f]{2})", value):
         raise ValueError("invalid percent escape")
+    decoded = unquote_to_bytes(value).decode("utf-8", errors="strict")
+    if any(
+        character.isspace()
+        or unicodedata.category(character).startswith("C")
+        for character in decoded
+    ):
+        raise ValueError("decoded URL component contains whitespace or controls")
 
     def normalize_escape(match: re.Match[str]) -> str:
         byte = int(match.group(1), 16)
@@ -67,14 +75,14 @@ def _normalized_url_host(hostname: str) -> str:
 
 
 def _safe_performance_url(url: object) -> str:
-    target = str(url or "").strip()
+    target = str(url or "")
     if (
         not target
         or len(target) > 2048
+        or target != target.strip()
         or any(
             character.isspace()
-            or ord(character) < 32
-            or 127 <= ord(character) <= 159
+            or unicodedata.category(character).startswith("C")
             for character in target
         )
     ):
