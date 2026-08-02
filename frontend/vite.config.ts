@@ -1,25 +1,12 @@
 import path from "node:path"
 import tailwindcss from "@tailwindcss/vite"
 import react from "@vitejs/plugin-react"
-import { defineConfig, type Plugin } from "vite"
+import { defineConfig } from "vite"
 
-function stripOutputTrailingWhitespace(): Plugin {
-  return {
-    name: "strip-output-trailing-whitespace",
-    generateBundle(_options, bundle) {
-      for (const output of Object.values(bundle)) {
-        if (output.type === "chunk") {
-          output.code = output.code.replace(/[\t ]+$/gm, "")
-        } else if (typeof output.source === "string") {
-          output.source = output.source.replace(/[\t ]+$/gm, "")
-        }
-      }
-    },
-  }
-}
+import { stripJsTrailingWhitespace } from "./src/vite-plugins"
 
 export default defineConfig({
-  plugins: [react(), tailwindcss(), stripOutputTrailingWhitespace()],
+  plugins: [react(), tailwindcss(), stripJsTrailingWhitespace()],
   resolve: {
     alias: { "@": path.resolve(__dirname, "./src") },
   },
@@ -31,5 +18,11 @@ export default defineConfig({
   build: {
     outDir: "../src/stock_recommender/web",
     emptyOutDir: true,
+    rollupOptions: {
+      input: {
+        index: path.resolve(__dirname, "./index.html"),
+        performance: path.resolve(__dirname, "./performance.html"),
+      },
+    },
   },
 })

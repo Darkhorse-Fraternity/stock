@@ -1,4 +1,6 @@
+import json
 import os
+import re
 import tempfile
 import unittest
 from copy import deepcopy
@@ -289,7 +291,14 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
         )
 
         payload = _serialize_strategy_performance(projection)
+        contract_fixture = json.loads(
+            (
+                Path(__file__).parents[1]
+                / "frontend/src/test-fixtures/admin-strategy-performance.json"
+            ).read_text(encoding="utf-8")
+        )
 
+        self.assertEqual(payload, contract_fixture)
         self.assertEqual(payload["summary"]["nav"], 123.0)
         self.assertEqual(payload["summary"]["cumulative_return_pct"], 999.0)
         self.assertEqual(payload["summary"]["realized_pnl"], 7.0)
@@ -372,14 +381,18 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 handler._send_json = lambda payload, status=None: captured.update(payload=payload, status=status)
                 handler.do_GET()
                 payload = captured["payload"]
-                page = (Path(__file__).parents[1] / "src/stock_recommender/web/performance.html").read_text(encoding="utf-8")
+                web_root = Path(__file__).parents[1] / "src/stock_recommender/web"
+                page = (web_root / "performance.html").read_text(encoding="utf-8")
 
         self.assertEqual(payload["strategy"]["id"], strategy["id"])
         self.assertEqual(payload["summary"]["nav"], 123_456.0)
         self.assertEqual(payload["summary"]["cash"], 123_456.0)
         self.assertEqual(payload["summary"]["max_positions"], 10)
         self.assertIn("策略表现 · Stock Agent", page)
-        self.assertIn("Strategy Portfolio Ledger", page)
+        module_path = re.search(r'src="(/assets/performance-[^"]+\.js)"', page)
+        self.assertIsNotNone(module_path)
+        module = (web_root / module_path.group(1).lstrip("/")).read_text(encoding="utf-8")
+        self.assertIn("Strategy Portfolio Ledger", module)
 
     def test_performance_payload_has_complete_fields_and_central_economics(self):
         with tempfile.TemporaryDirectory() as temp_dir:

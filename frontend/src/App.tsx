@@ -68,6 +68,7 @@ import {
   type UsMarketDataStatus,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
+import { PolicyNumberInput, useStrategySaveFlow } from "@/strategy-policy"
 
 type StatusFilter = "all" | "enabled" | "available" | "planned"
 const usInapplicableParameters = new Set([
@@ -693,15 +694,14 @@ function PortfolioSettings({ portfolio, allocation, strategyId, market, onChange
 }
 
 function PolicyNumberField({ label, value, maximum, suffix = "%", disabled = false, step = 1, onChange }: { label: string; value: number; maximum: number; suffix?: string; disabled?: boolean; step?: number; onChange: (value: number) => void }) {
-  const id = `policy-${label.replaceAll(" ", "-")}`
   return (
-    <label className={cn("grid gap-2 border-l-2 border-slate-200 bg-slate-50/65 px-3 py-3", disabled && "opacity-50")} htmlFor={id}>
+    <label className={cn("grid gap-2 border-l-2 border-slate-200 bg-slate-50/65 px-3 py-3", disabled && "opacity-50")}>
       <span className="flex items-start justify-between gap-3 text-xs">
         <span className="font-medium text-foreground">{label}</span>
         <span className="shrink-0 font-mono text-[10px] text-muted-foreground">系统上限 {maximum}{suffix}</span>
       </span>
       <span className="flex items-center gap-2">
-        <Input id={id} className="h-9 text-right font-mono tabular-nums" disabled={disabled} type="number" min={0} max={maximum} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <PolicyNumberInput key={`${label}-${value}`} label={label} value={value} minimum={0} maximum={maximum} step={step} disabled={disabled} inputClassName="h-9 w-full rounded-md border border-input bg-transparent px-3 text-right font-mono text-sm tabular-nums shadow-xs outline-none focus-visible:ring-[3px] focus-visible:ring-ring/50" onCommit={onChange} />
         <span className="min-w-8 text-xs text-muted-foreground">{suffix}</span>
       </span>
     </label>
@@ -904,7 +904,6 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [deliverySync, setDeliverySync] = useState<ConfigPayload["delivery_sync"] | null>(initialData.delivery_sync || null)
   const [dataSourceStatus, setDataSourceStatus] = useState(initialData.us_market_data)
-  const [savedExposureMode, setSavedExposureMode] = useState<ExposureMode>(initialData.config.exposure_policy.mode)
 
   const updateParameter = (id: string, patch: Partial<Parameter>) => {
     setParameters((current) => current.map((item) => item.id === id ? { ...item, ...patch, effective: (patch.enabled ?? item.enabled) && item.status !== "planned" } : item))
@@ -967,42 +966,29 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
     return item
   }), [parameters, activeGroup, statusFilter, search, marketCode])
 
-  const safeConfig = marketCode === "us" ? config : { ...config, exposure_policy: { ...config.exposure_policy, mode: "LONG_ONLY" as const } }
-  const confirmPolicyTransition = () => {
-    const initialMode = savedExposureMode
-    return initialMode !== "LONG_ONLY"
-      || safeConfig.exposure_policy.mode === "LONG_ONLY"
-      || window.confirm("启用多空或杠杆会创建新的策略 revision，并重置回测与模拟盘审批。继续保存？")
-  }
-
-  const saveMutation = useMutation({
-    mutationFn: () => {
-      const states = Object.fromEntries(parameters.map((item) => [item.id, { enabled: item.enabled, value: item.value }]))
-      return saveStrategy(config.id!, { ...safeConfig, parameters: states })
-    },
-    onSuccess: (payload) => {
+  const states = Object.fromEntries(parameters.map((item) => [item.id, { enabled: item.enabled, value: item.value }]))
+  const saveFlow = useStrategySaveFlow({
+    config: { ...config, parameters: states },
+    market: marketCode,
+    save: (payload) => saveStrategy(config.id!, payload),
+    onSaved: (payload) => {
       setParameters(payload.parameters)
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
       setDataSourceStatus(payload.us_market_data)
-      setSavedExposureMode(payload.config.exposure_policy.mode)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
       toast.success("策略配置已保存", { description: isActive ? payload.delivery_sync?.message || "下一次选股会读取这份策略" : "启用策略后生效" })
       if (payload.delivery_sync?.status === "error") toast.error("报告推送同步失败", { description: payload.delivery_sync.message })
     },
-    onError: (error) => toast.error(error.message),
   })
 
   const saveIfConfirmed = () => {
-    if (!confirmPolicyTransition()) return
-    saveMutation.mutate()
+    void saveFlow.save().catch((error: Error) => toast.error(error.message))
   }
 
-  const saveIfConfirmedAsync = () => confirmPolicyTransition()
-    ? saveMutation.mutateAsync()
-    : Promise.reject(new Error("SAVE_CANCELLED"))
+  const saveIfConfirmedAsync = () => saveFlow.beforeRun()
 
   const resetMutation = useMutation({
     mutationFn: () => resetStrategy(config.id!),
@@ -1011,7 +997,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
       setDataSourceStatus(payload.us_market_data)
-      setSavedExposureMode(payload.config.exposure_policy.mode)
+      saveFlow.commitBaseline(payload.config.exposure_policy.mode)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
@@ -1102,7 +1088,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
             <Button variant="outline" size="sm" className="hidden sm:inline-flex" disabled={resetMutation.isPending} onClick={() => window.confirm("恢复默认参数？") && resetMutation.mutate()}><RotateCcw />恢复默认</Button>
             <StrategyRunSheet strategyId={config.id!} strategyName={config.name} compact pendingChanges={dirty} beforeRun={saveIfConfirmedAsync} />
             <StrategyMapper strategyId={config.id!} parameters={parameters} onApply={applyDraft} />
-            <Button size="sm" className="size-8 px-0 sm:w-auto sm:px-3" disabled={!dirty || saveMutation.isPending} onClick={saveIfConfirmed}><Save /><span className="hidden sm:inline">{saveMutation.isPending ? "保存中" : "保存配置"}</span><span className="sr-only sm:hidden">保存配置</span></Button>
+            <Button size="sm" className="size-8 px-0 sm:w-auto sm:px-3" disabled={!dirty || saveFlow.isPending} onClick={saveIfConfirmed}><Save /><span className="hidden sm:inline">{saveFlow.isPending ? "保存中" : "保存配置"}</span><span className="sr-only sm:hidden">保存配置</span></Button>
           </div>
         </header>
 

@@ -323,8 +323,8 @@ export interface StrategyPerformancePayload {
   market_label: string
   currency: string
   currency_symbol: string
-  config: PortfolioConfig
-  allocation: AllocationConfig
+  config: PerformanceJsonObject
+  allocation: PerformanceJsonObject
 }
 
 export interface SignalConfig {
