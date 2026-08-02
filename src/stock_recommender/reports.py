@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import ipaddress
 import math
 import re
 from datetime import datetime
 from typing import Any, Callable, Iterable, Mapping
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import (
@@ -25,35 +26,92 @@ from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
 
 
+def _normalized_url_component(value: str, *, safe: str) -> str:
+    if re.search(r"%(?![0-9A-Fa-f]{2})", value):
+        raise ValueError("invalid percent escape")
+
+    def normalize_escape(match: re.Match[str]) -> str:
+        byte = int(match.group(1), 16)
+        character = chr(byte)
+        if character.isascii() and (
+            character.isalnum() or character in "-._~"
+        ):
+            return character
+        return f"%{byte:02X}"
+
+    normalized = re.sub(r"%([0-9A-Fa-f]{2})", normalize_escape, value)
+    return quote(normalized, safe=f"{safe}%")
+
+
+def _normalized_url_host(hostname: str) -> str:
+    if ":" in hostname:
+        return f"[{ipaddress.IPv6Address(hostname).compressed}]"
+    try:
+        return str(ipaddress.IPv4Address(hostname))
+    except ipaddress.AddressValueError:
+        pass
+    ascii_host = hostname.encode("idna").decode("ascii").lower()
+    if len(ascii_host) > 253:
+        raise ValueError("hostname is too long")
+    labels = ascii_host.rstrip(".").split(".")
+    if any(
+        not label
+        or len(label) > 63
+        or label.startswith("-")
+        or label.endswith("-")
+        or re.fullmatch(r"[a-z0-9-]+", label) is None
+        for label in labels
+    ):
+        raise ValueError("invalid hostname")
+    return ascii_host
+
+
 def _safe_performance_url(url: object) -> str:
     target = str(url or "").strip()
     if (
         not target
         or len(target) > 2048
-        or any(character.isspace() or ord(character) < 32 for character in target)
-        or any(character in target for character in "[]()<>\\")
+        or any(
+            character.isspace()
+            or ord(character) < 32
+            or 127 <= ord(character) <= 159
+            for character in target
+        )
     ):
         return ""
     try:
         parsed = urlsplit(target)
-        _ = parsed.port
-    except ValueError:
+        port = parsed.port
+        hostname = _normalized_url_host(parsed.hostname or "")
+        path = _normalized_url_component(
+            parsed.path,
+            safe="/:@!$&'*+,;=-._~",
+        )
+        query = _normalized_url_component(
+            parsed.query,
+            safe="=&/?@!$'*+,;:-._~",
+        )
+        fragment = _normalized_url_component(
+            parsed.fragment,
+            safe="=&/?@!$'*+,;:-._~",
+        )
+    except (UnicodeError, ValueError):
         return ""
     if (
         parsed.scheme.lower() not in {"http", "https"}
-        or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
     ):
         return ""
-    return target
+    authority = f"{hostname}:{port}" if port is not None else hostname
+    return urlunsplit((parsed.scheme.lower(), authority, path, query, fragment))
 
 
 def append_performance_link(report: str, url: str) -> str:
     target = _safe_performance_url(url)
     if not target or target in report:
         return report
-    return f"{report.rstrip()}\n\n📊 [查看策略表现]({target})"
+    return f"{report.rstrip()}\n\n📊 [查看策略表现](<{target}>)"
 
 
 def _ratio_text(value: float) -> str:
@@ -71,34 +129,84 @@ def _intent_action(item: object) -> str:
     return "多头减仓" if effect in {"REDUCE", "CLOSE"} else "多头买入"
 
 
-def _fill_action(item: object, intents_by_id: Mapping[str, object]) -> str:
+def _risk_reason_text(reason: object) -> str:
+    return {
+        "MARGIN_CALL": "保证金追缴，强制去杠杆（保证金率低于维持线）",
+        "LONG_STOP_LOSS": "多头止损",
+        "SHORT_STOP_LOSS": "空头止损回补",
+        "LONG_TRAILING_STOP": "多头追踪止盈",
+        "SHORT_TRAILING_STOP": "空头追踪止盈回补",
+    }.get(str(reason or ""), "")
+
+
+def _intent_line(item: object) -> str:
+    reason = _risk_reason_text(item.reason)
+    suffix = f" · {reason}" if reason else ""
+    return (
+        f"订单意图：{item.symbol} {_intent_action(item)} {item.quantity} 股"
+        f"{suffix}"
+    )
+
+
+def _fill_action(
+    item: object,
+    intents_by_id: Mapping[str, object],
+    progress_by_intent: Mapping[str, object],
+) -> str:
     intent = intents_by_id.get(item.intent_id)
-    direction = _intent_action(intent) if intent is not None else "方向未知"
+    if intent is not None:
+        direction = _intent_action(intent)
+    else:
+        progress = progress_by_intent.get(item.intent_id)
+        side = getattr(getattr(progress, "position_side", None), "value", None)
+        order_side = getattr(getattr(progress, "order_side", None), "value", None)
+        if side == "SHORT":
+            direction = "空头回补" if order_side == "BUY" else "空头卖出"
+        elif side == "LONG":
+            direction = "多头买入" if order_side == "BUY" else "多头卖出"
+        else:
+            direction = "方向未知"
     return (
         f"模拟成交：{item.symbol} {direction} "
         f"{item.quantity} 股 @ {item.price:.2f}"
     )
 
 
+def _risk_update_action(item: object, intents: tuple[object, ...]) -> str:
+    matched_reason = next(
+        (
+            _risk_reason_text(intent.reason)
+            for intent in intents
+            if intent.symbol == item.symbol and intent.position_side == item.side
+        ),
+        "",
+    )
+    direction = _position_direction(item.side)
+    if matched_reason:
+        return f"风险动作：{item.symbol} {direction} · {matched_reason}"
+    if item.position_mode == "COVER_ONLY":
+        return f"风险状态：{item.symbol} 空头 · 仅允许空头回补"
+    if item.trailing_active:
+        return f"风险状态：{item.symbol} {direction} · 追踪退出已激活"
+    return f"风险状态：{item.symbol} {direction} · 风险参数已更新"
+
+
 def _event_action(item: object) -> str:
     labels = {
-        "MARGIN_CALL": "保证金追缴",
-        "COVER_ONLY": "仅允许空头回补",
+        "RISK_CHANGED": "风险状态已更新",
         "FINANCING_COST_ACCRUED": "融资成本计提",
         "BORROW_COST_ACCRUED": "借券成本计提",
-        "FORCED_DELEVERAGE": "强制去杠杆",
-    }
-    reasons = {
-        "MAINTENANCE_MARGIN_BREACH": "维持保证金不足",
-        "MARGIN_CALL": "保证金率低于维持线",
-        "BORROW_REVOKED": "借券资格撤销",
-        "HARD_EXPOSURE_CAP": "敞口超过硬上限",
     }
     event_type = str(getattr(item, "type", ""))
     label = labels.get(event_type, event_type)
     data = getattr(item, "data", {})
-    reason = reasons.get(str(data.get("reason") or "")) if isinstance(data, Mapping) else None
-    return f"{label}（{reason}）" if reason else label
+    if event_type == "RISK_CHANGED" and isinstance(data, Mapping):
+        reason = _risk_reason_text(data.get("reason"))
+        if reason:
+            return reason
+        if data.get("position_mode") == "COVER_ONLY":
+            return "仅允许空头回补"
+    return label
 
 
 def _account_metric_lines(snapshot: PortfolioSnapshot) -> tuple[str, str]:
@@ -157,12 +265,17 @@ def format_portfolio_actions(
     performance_url: str = "",
 ) -> str:
     intents_by_id = {item.id: item for item in batch.intents}
+    progress_by_intent = {item.intent_id: item for item in batch.execution_progress}
     actions = [
+        *(_intent_line(item) for item in batch.intents),
         *(
-            f"订单意图：{item.symbol} {_intent_action(item)} {item.quantity} 股"
-            for item in batch.intents
+            _fill_action(item, intents_by_id, progress_by_intent)
+            for item in batch.fills
         ),
-        *(_fill_action(item, intents_by_id) for item in batch.fills),
+        *(
+            _risk_update_action(item, batch.intents)
+            for item in batch.position_risk_updates
+        ),
         *(f"事件：{_event_action(item)}" for item in batch.events),
     ]
     if not actions:

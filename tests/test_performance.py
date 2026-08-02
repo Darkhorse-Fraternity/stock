@@ -169,7 +169,7 @@ class RecommendationPerformanceTests(unittest.TestCase):
         url = "https://stocks.example.test/performance"
         report = append_performance_link("模拟盘报告", url)
 
-        self.assertIn(f"[查看策略表现]({url})", report)
+        self.assertIn(f"[查看策略表现](<{url}>)", report)
         self.assertEqual(append_performance_link(report, url), report)
 
 

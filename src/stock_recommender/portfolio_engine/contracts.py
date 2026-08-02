@@ -1991,6 +1991,8 @@ class PerformancePosition(_DeeplyImmutable):
     side: str
     position_mode: str
     borrow_rate_pct: float | None
+    borrow_rate_source: str
+    borrow_rate_estimated: bool
     margin_used: float
 
     def __post_init__(self) -> None:
@@ -2038,8 +2040,25 @@ class PerformancePosition(_DeeplyImmutable):
         _require_string(self.position_mode, "position_mode")
         if self.borrow_rate_pct is not None:
             _require_nonnegative_finite_number(self.borrow_rate_pct, "borrow_rate_pct")
+        _require_string(self.borrow_rate_source, "borrow_rate_source")
+        if self.borrow_rate_source not in {"strategy_estimate", "unavailable"}:
+            raise ValueError(
+                "borrow_rate_source must be strategy_estimate or unavailable"
+            )
+        if type(self.borrow_rate_estimated) is not bool:
+            raise TypeError("borrow_rate_estimated must be a boolean")
         if self.position_side == PositionSide.LONG.value and self.borrow_rate_pct is not None:
             raise ValueError("LONG position must not expose a borrow rate")
+        if self.position_side == PositionSide.LONG.value and (
+            self.borrow_rate_source != "unavailable" or self.borrow_rate_estimated
+        ):
+            raise ValueError("LONG position borrow rate must be unavailable")
+        if self.position_side == PositionSide.SHORT.value and (
+            self.borrow_rate_pct is None
+            or self.borrow_rate_source != "strategy_estimate"
+            or not self.borrow_rate_estimated
+        ):
+            raise ValueError("SHORT position borrow rate must be a strategy estimate")
         _require_nonnegative_finite_number(self.margin_used, "margin_used")
 
 

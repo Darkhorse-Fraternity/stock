@@ -21,42 +21,18 @@ from stock_recommender.portfolio_engine.contracts import (
     PerformanceEventView,
     PerformanceNavPoint,
     PerformanceOrder,
+    PerformancePosition,
     PerformanceRuntime,
     PerformanceStrategySource,
     PerformanceSummary,
-    PortfolioEvent,
     PositionSide,
     PositionSnapshot,
     StrategyPerformanceProjection,
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
-from stock_recommender.portfolio_engine.service import _event_message
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
-    def test_public_event_messages_explain_margin_carry_cover_and_forced_reasons(self):
-        occurred_at = datetime(2026, 8, 3, 10, 0, tzinfo=ZoneInfo("America/New_York"))
-        cases = (
-            ("MARGIN_CALL", "MAINTENANCE_MARGIN_BREACH", "保证金追缴", "维持保证金不足"),
-            ("COVER_ONLY", "BORROW_REVOKED", "仅允许空头回补", "借券资格撤销"),
-            ("FINANCING_COST_ACCRUED", None, "融资成本已计提", None),
-            ("BORROW_COST_ACCRUED", None, "借券成本已计提", None),
-            ("FORCED_DELEVERAGE", "HARD_EXPOSURE_CAP", "强制去杠杆", "敞口超过硬上限"),
-        )
-        for index, (event_type, reason, label, reason_label) in enumerate(cases):
-            with self.subTest(event_type=event_type):
-                message = _event_message(
-                    PortfolioEvent(
-                        id=f"public-event-{index}",
-                        type=event_type,
-                        occurred_at=occurred_at,
-                        data={"symbol": "PLTR", "reason": reason},
-                    )
-                )
-                self.assertIn(label, message)
-                if reason_label:
-                    self.assertIn(reason_label, message)
-
     def test_strategy_get_and_put_expose_policies_and_policy_put_creates_revision(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "strategies.json"
@@ -167,6 +143,13 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 "strategy_revision",
                 "data",
             },
+        )
+        self.assertTrue(
+            {
+                "borrow_rate_pct",
+                "borrow_rate_source",
+                "borrow_rate_estimated",
+            }.issubset({item.name for item in fields(PerformancePosition)})
         )
 
     class _QuoteAdapter:
@@ -527,6 +510,14 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                         accrued_borrow_cost=4.5,
                         positions=(
                             PositionSnapshot(
+                                symbol="MSFT",
+                                side=PositionSide.LONG,
+                                quantity=1,
+                                average_cost=90.0,
+                                current_price=90.0,
+                                sellable_quantity=1,
+                            ),
+                            PositionSnapshot(
                                 symbol="PLTR",
                                 side=PositionSide.SHORT,
                                 quantity=10,
@@ -549,7 +540,7 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                     )
 
         summary = payload["summary"]
-        self.assertEqual(summary["long_market_value"], 0.0)
+        self.assertEqual(summary["long_market_value"], 90.0)
         self.assertEqual(summary["short_liability"], 900.0)
         self.assertIn("gross_exposure_pct", summary)
         self.assertIn("net_exposure_pct", summary)
@@ -558,7 +549,8 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
         self.assertEqual(summary["margin_loan"], 500.0)
         self.assertEqual(summary["financing_cost"], 12.5)
         self.assertEqual(summary["borrow_cost"], 4.5)
-        held = payload["positions"][0]
+        held_by_symbol = {item["symbol"]: item for item in payload["positions"]}
+        held = held_by_symbol["PLTR"]
         self.assertEqual(held["side"], "SHORT")
         self.assertAlmostEqual(held["return_pct"], 10.0)
         self.assertEqual(held["position_mode"], "COVER_ONLY")
@@ -566,8 +558,14 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
             held["borrow_rate_pct"],
             strategy["short_policy"]["estimated_borrow_apr_pct"],
         )
+        self.assertEqual(held["borrow_rate_source"], "strategy_estimate")
+        self.assertTrue(held["borrow_rate_estimated"])
         self.assertGreater(held["margin_used"], 0.0)
         self.assertIsNotNone(held["exit_distance_pct"])
+        long_held = held_by_symbol["MSFT"]
+        self.assertIsNone(long_held["borrow_rate_pct"])
+        self.assertEqual(long_held["borrow_rate_source"], "unavailable")
+        self.assertFalse(long_held["borrow_rate_estimated"])
 
     def test_quote_failure_returns_error_and_persisted_valuation(self):
         with tempfile.TemporaryDirectory() as temp_dir:

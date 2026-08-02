@@ -305,8 +305,34 @@ def _performance_runtime(
     )
 
 
-def _event_message(event: object) -> str:
-    symbol = str(event.data.get("symbol") or "")
+_PUBLIC_RISK_REASONS = frozenset(
+    {
+        "MARGIN_CALL",
+        "LONG_STOP_LOSS",
+        "SHORT_STOP_LOSS",
+        "LONG_TRAILING_STOP",
+        "SHORT_TRAILING_STOP",
+    }
+)
+
+
+def _risk_reason_message(reason: object) -> str:
+    return {
+        "MARGIN_CALL": "保证金追缴，强制去杠杆（保证金率低于维持线）",
+        "LONG_STOP_LOSS": "多头止损",
+        "SHORT_STOP_LOSS": "空头止损回补",
+        "LONG_TRAILING_STOP": "多头追踪止盈",
+        "SHORT_TRAILING_STOP": "空头追踪止盈回补",
+    }.get(str(reason or ""), "")
+
+
+def _event_message(
+    event: object,
+    *,
+    data: Mapping[str, Any] | None = None,
+) -> str:
+    payload = event.data if data is None else data
+    symbol = str(payload.get("symbol") or "")
     messages = {
         "ACCOUNT_OPENED": "模拟账户已创建",
         "PIPELINE_COMPLETED": "Portfolio Pipeline 已完成",
@@ -316,21 +342,42 @@ def _event_message(event: object) -> str:
         "ORDER_EXPIRED": f"{symbol} 订单已过期".strip(),
         "RISK_CHANGED": f"{symbol} 风险状态已更新".strip(),
         "REVISION_TRANSITIONED": "策略版本已切换",
-        "MARGIN_CALL": "保证金追缴",
-        "COVER_ONLY": "仅允许空头回补",
-        "FORCED_DELEVERAGE": "强制去杠杆",
         "FINANCING_COST_ACCRUED": "融资成本已计提",
         "BORROW_COST_ACCRUED": f"{symbol} 借券成本已计提".strip(),
     }
     message = messages.get(event.type, event.type)
+    if event.type != "RISK_CHANGED":
+        return message
+    reason = _risk_reason_message(payload.get("reason"))
+    if reason:
+        return f"{symbol} {reason}".strip()
+    if payload.get("position_mode") == "COVER_ONLY":
+        return f"{symbol} 进入仅允许空头回补状态".strip()
+    return message
+
+
+def _performance_event_data(
+    event: object,
+    batches_by_run_key: Mapping[str, DecisionBatch],
+) -> Mapping[str, Any]:
+    if event.type != "RISK_CHANGED":
+        return event.data
+    run_key = event.data.get("run_key")
+    batch = batches_by_run_key.get(run_key) if type(run_key) is str else None
+    if batch is None:
+        return event.data
+    symbol = str(event.data.get("symbol") or "")
+    side = str(event.data.get("side") or "")
     reasons = {
-        "MAINTENANCE_MARGIN_BREACH": "维持保证金不足",
-        "MARGIN_CALL": "保证金率低于维持线",
-        "BORROW_REVOKED": "借券资格撤销",
-        "HARD_EXPOSURE_CAP": "敞口超过硬上限",
+        intent.reason
+        for intent in batch.intents
+        if intent.symbol == symbol
+        and intent.position_side.value == side
+        and intent.reason in _PUBLIC_RISK_REASONS
     }
-    reason = reasons.get(str(event.data.get("reason") or ""))
-    return f"{message}（{reason}）" if reason else message
+    if len(reasons) != 1:
+        return event.data
+    return MappingProxyType({**event.data, "reason": next(iter(reasons))})
 
 
 def _exit_distance_pct(position: object, config: Mapping[str, Any]) -> float | None:
@@ -1385,6 +1432,12 @@ class PortfolioEngine:
                         if held.side is PositionSide.SHORT
                         else None
                     ),
+                    borrow_rate_source=(
+                        "strategy_estimate"
+                        if held.side is PositionSide.SHORT
+                        else "unavailable"
+                    ),
+                    borrow_rate_estimated=held.side is PositionSide.SHORT,
                     margin_used=market_value * margin_threshold_pct / 100.0,
                 )
             )
@@ -1568,23 +1621,29 @@ class PortfolioEngine:
             for batch in view.batches
             for event in batch.events
         }
-        events = tuple(
-            PerformanceEventView(
-                id=event.id,
-                key=None,
-                type=event.type,
-                occurred_at=event.occurred_at,
-                message=_event_message(event),
-                strategy_revision=(
-                    event.data.get("strategy_revision")
-                    if type(event.data.get("strategy_revision")) is int
-                    else revision_by_event.get(event.id)
-                    or revision_by_intent.get(str(event.data.get("intent_id") or ""))
-                ),
-                data=event.data,
+        batches_by_run_key = {batch.run_key: batch for batch in view.batches}
+        event_views = []
+        for event in reversed(view.events[-200:]):
+            event_data = _performance_event_data(event, batches_by_run_key)
+            event_views.append(
+                PerformanceEventView(
+                    id=event.id,
+                    key=None,
+                    type=event.type,
+                    occurred_at=event.occurred_at,
+                    message=_event_message(event, data=event_data),
+                    strategy_revision=(
+                        event_data.get("strategy_revision")
+                        if type(event_data.get("strategy_revision")) is int
+                        else revision_by_event.get(event.id)
+                        or revision_by_intent.get(
+                            str(event_data.get("intent_id") or "")
+                        )
+                    ),
+                    data=event_data,
+                )
             )
-            for event in reversed(view.events[-200:])
-        )
+        events = tuple(event_views)
         summary = PerformanceSummary(
             initial_cash=source.initial_cash,
             nav=snapshot.metrics.equity,
