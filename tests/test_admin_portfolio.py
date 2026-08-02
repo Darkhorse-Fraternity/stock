@@ -8,8 +8,8 @@ from zoneinfo import ZoneInfo
 
 from stock_recommender.admin import AdminHandler
 from stock_recommender.parameters import create_strategy
-from stock_recommender.portfolio import plan_daily_candidates
-from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME, candidates_with_positive_momentum
+from stock_recommender.portfolio_engine.contracts import AccountSnapshot
+from stock_recommender.portfolio_engine.ledger import JsonLedgerStore
 
 
 class AdminPortfolioIntegrationTests(unittest.TestCase):
@@ -43,15 +43,22 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
             }
             with patch.dict(os.environ, environment, clear=False):
                 strategy = create_strategy("科技 AI")
-                strategy["lifecycle"]["stage"] = "paper"
-                plan_daily_candidates(
-                    strategy,
-                    candidates_with_positive_momentum(
-                        [{"symbol": "600001", "name": "测试股票", "price": 10.0, "score": 0.8}]
-                    ),
-                    now=datetime(2026, 7, 22, 8, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
-                    path=portfolio_path,
-                    market_regime=FULL_EXPOSURE_MARKET_REGIME,
+                JsonLedgerStore(portfolio_path).create_account(
+                    AccountSnapshot(
+                        id=f"account-{strategy['id']}",
+                        strategy_id=strategy["id"],
+                        strategy_revision=strategy["revision"],
+                        occurred_at=datetime(
+                            2026,
+                            7,
+                            22,
+                            8,
+                            0,
+                            tzinfo=ZoneInfo("Asia/Shanghai"),
+                        ),
+                        available_cash=123_456.0,
+                        snapshot_id="admin-v2-snapshot",
+                    )
                 )
                 captured = {}
                 handler = AdminHandler.__new__(AdminHandler)
@@ -62,6 +69,8 @@ class AdminPortfolioIntegrationTests(unittest.TestCase):
                 page = (Path(__file__).parents[1] / "src/stock_recommender/web/performance.html").read_text(encoding="utf-8")
 
         self.assertEqual(payload["strategy"]["id"], strategy["id"])
+        self.assertEqual(payload["summary"]["nav"], 123_456.0)
+        self.assertEqual(payload["summary"]["cash"], 123_456.0)
         self.assertEqual(payload["summary"]["max_positions"], 10)
         self.assertIn("策略表现 · Stock Agent", page)
         self.assertIn("Strategy Portfolio Ledger", page)

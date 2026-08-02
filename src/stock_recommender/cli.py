@@ -12,12 +12,16 @@ from .market_adapters import get_market_adapter
 from .parameters import find_strategy_config, load_strategy_config, parameter_value
 from .markets import strategy_market
 from .portfolio_runtime import (
-    format_portfolio_actions,
-    format_portfolio_snapshot,
     open_portfolio_runtime,
     process_portfolio_runtime,
 )
-from .reports import append_performance_link, render_ai_report_result, render_report_result
+from .reports import (
+    append_performance_link,
+    format_portfolio_actions,
+    format_portfolio_snapshot,
+    render_ai_report_result,
+    render_report_result,
+)
 from .runtime import assert_strategy_runnable
 from .schedule import (
     parse_publish_hours,

@@ -1,4 +1,3 @@
-import inspect
 import json
 import tempfile
 import unittest
@@ -9,8 +8,6 @@ from pathlib import Path
 from recommendation_fixtures import make_recommendation_plan
 from stock_recommender.market_regime import allocation_config
 from stock_recommender.parameters import normalize_allocation_config
-from stock_recommender.portfolio import plan_daily_candidates
-from stock_recommender.portfolio_pipeline import run_entry_pipeline
 from stock_recommender.tracking import save_daily_selection
 
 
@@ -59,11 +56,6 @@ class RecommendationArchitectureTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "must be present"):
             replace(plan, selected_candidates=({"symbol": "600002", "name": "越界候选", "price": 11.0},))
-
-    def test_portfolio_entry_points_require_an_explicit_market_regime(self):
-        self.assertIs(inspect.signature(plan_daily_candidates).parameters["market_regime"].default, inspect.Parameter.empty)
-        self.assertIs(inspect.signature(run_entry_pipeline).parameters["market_regime"].default, inspect.Parameter.empty)
-
 
 if __name__ == "__main__":
     unittest.main()

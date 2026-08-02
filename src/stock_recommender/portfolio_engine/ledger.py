@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import threading
 from dataclasses import dataclass, replace
 from datetime import date, datetime
@@ -102,6 +103,18 @@ _REVISION_TRANSITION_FIELDS = frozenset(
         "cancelled_intent_ids",
     }
 )
+
+
+def portfolio_ledger_path(path: str | Path | None = None) -> Path:
+    """Resolve the single schema-v2 ledger path used by runtime and migration."""
+
+    if path is not None:
+        return Path(path).expanduser()
+    configured = os.getenv(
+        "STOCK_AGENT_PORTFOLIO_PATH",
+        "data/strategy_portfolios.json",
+    ).strip()
+    return Path(configured or "data/strategy_portfolios.json").expanduser()
 
 
 class LedgerError(ValueError):

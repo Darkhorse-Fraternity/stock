@@ -1,113 +1,179 @@
+from __future__ import annotations
+
+import os
 import tempfile
 import unittest
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
-from stock_recommender.parameters import default_strategy_config
-from stock_recommender.market_regime import evaluate_market_regime
-from stock_recommender.portfolio import load_portfolio_account, monitor_portfolio, plan_daily_candidates
-from stock_recommender.signal_engine import extract_signal_features, rank_signal_rows, select_ranked_signals
+from stock_recommender.portfolio_backtest import (
+    EngineReplayFrame,
+    HistoricalBorrowBook,
+    replay_engine_frames,
+)
+from stock_recommender.portfolio_engine.config import (
+    default_exposure_policy,
+    default_margin_policy,
+    default_short_policy,
+)
+from stock_recommender.portfolio_engine.contracts import (
+    MarketSnapshot,
+    PositionSide,
+    SignalCandidate,
+)
 
 
-SHANGHAI = ZoneInfo("Asia/Shanghai")
+SYMBOLS = ("AAPL", "MSFT", "NVDA")
 
 
-def trading_dates(start: date, count: int) -> list[date]:
-    rows = []
+class MonthStaticLongSignals:
+    model_id = "month-static-long-v2"
+    side = PositionSide.LONG
+
+    def evaluate(self, rows, event_calendar):
+        del event_calendar
+        cutoff = str(rows[0]["cutoff_date"])
+        return tuple(
+            SignalCandidate(
+                symbol=symbol,
+                side=PositionSide.LONG,
+                score=1.0 - index / 100.0,
+                requested_weight_pct=15.0,
+                model_id=self.model_id,
+                thesis_id=f"{self.model_id}:{symbol}:{cutoff}",
+            )
+            for index, symbol in enumerate(SYMBOLS)
+        )
+
+
+def trading_dates(start: date, count: int) -> tuple[date, ...]:
+    sessions = []
     current = start
-    while len(rows) < count:
+    while len(sessions) < count:
         if current.weekday() < 5:
-            rows.append(current)
+            sessions.append(current)
         current += timedelta(days=1)
-    return rows
+    return tuple(sessions)
+
+
+def strategy() -> dict:
+    return {
+        "version": 6,
+        "id": "month-v2-replay",
+        "revision": 1,
+        "market": "us",
+        "signal": {"model": MonthStaticLongSignals.model_id},
+        "lifecycle": {"stage": "paper"},
+        "exposure_policy": default_exposure_policy(),
+        "margin_policy": default_margin_policy(),
+        "short_policy": default_short_policy(),
+        "portfolio": {
+            "initial_cash": 100_000.0,
+            "commission_rate_pct": 0.0,
+            "minimum_commission_cny": 0.0,
+            "stamp_duty_rate_pct": 0.0,
+            "transfer_fee_rate_pct": 0.0,
+            "slippage_bps": 0.0,
+            "max_bar_participation_pct": 100.0,
+        },
+    }
+
+
+def market(snapshot_id: str, occurred_at: datetime, session_index: int) -> MarketSnapshot:
+    quotes = {}
+    for symbol_index, symbol in enumerate(SYMBOLS):
+        price = 100.0 + session_index * 0.5 + symbol_index
+        quotes[symbol] = {
+            "price": price,
+            "bar_open": price,
+            "bar_high": price,
+            "bar_low": price,
+            "bar_volume": 1_000_000.0,
+            "volume_ratio": 1.0,
+            "one_day_return": 0.005,
+        }
+    return MarketSnapshot(
+        id=snapshot_id,
+        occurred_at=occurred_at,
+        quotes=quotes,
+    )
+
+
+def month_frames() -> tuple[EngineReplayFrame, ...]:
+    frames = []
+    for index, session in enumerate(trading_dates(date(2026, 1, 5), 22)):
+        cutoff_at = datetime.combine(
+            session,
+            time(20, 0),
+            tzinfo=timezone.utc,
+        )
+        cutoff = market(f"month-plan-{index:02d}", cutoff_at, index)
+        process = market(
+            f"month-process-{index:02d}",
+            cutoff_at + timedelta(minutes=1),
+            index,
+        )
+        frames.extend(
+            (
+                EngineReplayFrame.plan(
+                    cutoff,
+                    analyzed_rows=(
+                        {
+                            "symbol": SYMBOLS[0],
+                            "cutoff_date": session.isoformat(),
+                        },
+                    ),
+                    event_calendar={symbol: None for symbol in SYMBOLS},
+                ),
+                EngineReplayFrame.process(process, record_nav=True),
+            )
+        )
+    return tuple(frames)
 
 
 class OneMonthPipelineIntegrationTests(unittest.TestCase):
-    def test_one_month_signal_to_portfolio_replay_uses_isolated_ledger(self):
-        strategy = default_strategy_config()
-        strategy.update({"id": "month-replay", "name": "月度隔离回放", "revision": 1})
-        strategy["lifecycle"]["stage"] = "paper"
-        dates = trading_dates(date(2026, 1, 5), 96)
-        replay_dates = dates[-22:]
-        symbols = [f"60000{index}" for index in range(1, 6)]
-        histories = {}
-        for symbol_index, symbol in enumerate(symbols, 1):
-            histories[symbol] = [
-                {
-                    "date": day,
-                    "open": 10 + symbol_index + index * (0.025 + symbol_index * 0.003),
-                    "close": 10 + symbol_index + index * (0.026 + symbol_index * 0.003),
-                    "high": 10.2 + symbol_index + index * (0.026 + symbol_index * 0.003),
-                    "low": 9.8 + symbol_index + index * (0.025 + symbol_index * 0.003),
-                    "volume": 1_000_000 + symbol_index * 10_000 + index * 1_000,
-                }
-                for index, day in enumerate(dates)
-            ]
-
+    def test_22_sessions_replay_through_v2_engine_without_runtime_ledger_pollution(self):
+        frames = month_frames()
+        registry = {
+            MonthStaticLongSignals.model_id: MonthStaticLongSignals(),
+        }
+        borrow = HistoricalBorrowBook.from_raw({}, history_complete=False)
         with tempfile.TemporaryDirectory() as directory:
-            ledger = Path(directory) / "month-portfolio.json"
-            for replay_day in replay_dates:
-                signal_rows = []
-                for symbol in symbols:
-                    features = extract_signal_features(histories[symbol], cutoff=replay_day)
-                    self.assertIsNotNone(features)
-                    day_row = next(item for item in histories[symbol] if item["date"] == replay_day)
-                    signal_rows.append(
-                        {
-                            "symbol": symbol,
-                            "name": symbol,
-                            "price": day_row["open"],
-                            "percent": features["latest_return"] * 100,
-                            "signal_features": features,
-                        }
-                    )
-                ranked = rank_signal_rows(signal_rows, strategy=strategy)
-                selected = select_ranked_signals(ranked, 3, strategy=strategy)
-                morning = datetime.combine(replay_day, time(8, 0), tzinfo=SHANGHAI)
-                plan_daily_candidates(
-                    strategy,
-                    selected,
-                    now=morning,
-                    path=ledger,
-                    market_regime=evaluate_market_regime(ranked, strategy),
+            runtime_ledger = Path(directory) / "must-not-be-created.json"
+            with patch.dict(
+                os.environ,
+                {"STOCK_AGENT_PORTFOLIO_PATH": str(runtime_ledger)},
+            ):
+                paper = replay_engine_frames(
+                    strategy=strategy(),
+                    frames=frames,
+                    borrow_book=borrow,
+                    signal_registry=registry,
+                    replay_mode="paper",
                 )
-                prices = {row["symbol"]: row["price"] for row in signal_rows}
-
-                def quotes(watchlist):
-                    return [
-                        {
-                            "symbol": item["symbol"],
-                            "name": item.get("name") or item["symbol"],
-                            "price": prices[item["symbol"]],
-                            "percent": 0.5,
-                            "volume": 2_000_000,
-                            "turnover": prices[item["symbol"]] * 2_000_000,
-                        }
-                        for item in watchlist
-                    ], None
-
-                account, _, _ = monitor_portfolio(
-                    strategy,
-                    now=datetime.combine(replay_day, time(9, 35), tzinfo=SHANGHAI),
-                    path=ledger,
-                    quote_fetcher=quotes,
+                backtest = replay_engine_frames(
+                    strategy=strategy(),
+                    frames=frames,
+                    borrow_book=borrow,
+                    signal_registry=registry,
+                    replay_mode="backtest",
                 )
-                account, _, _ = monitor_portfolio(
-                    strategy,
-                    now=datetime.combine(replay_day, time(9, 40), tzinfo=SHANGHAI),
-                    path=ledger,
-                    quote_fetcher=quotes,
-                )
-                self.assertLessEqual(len(account["positions"]), 10)
 
-            account = load_portfolio_account(strategy["id"], path=ledger)
-            self.assertIsNotNone(account)
-            self.assertEqual(sum(key.startswith("daily:") for key in account["committed_run_keys"]), 22)
-            self.assertEqual(account["signal_model"], "factor_rank_v1")
-            self.assertTrue(any(event["type"] == "ORDER_FILLED" for event in account["events"]))
-            self.assertGreaterEqual(len(account["nav_history"]), 22)
-            self.assertTrue(ledger.is_file())
+            self.assertFalse(runtime_ledger.exists())
+
+        self.assertEqual(len(paper.nav_series), 22)
+        self.assertEqual(len(paper.position_snapshots), 22)
+        self.assertEqual(
+            sum(bool(frame) for frame in paper.signal_fingerprints),
+            22,
+        )
+        self.assertLessEqual(len(paper.final_positions), 10)
+        self.assertTrue(paper.final_positions)
+        self.assertEqual(paper.event_fingerprints, backtest.event_fingerprints)
+        self.assertEqual(paper.fill_fingerprints, backtest.fill_fingerprints)
+        self.assertEqual(paper.position_snapshots, backtest.position_snapshots)
+        self.assertEqual(paper.nav_series, backtest.nav_series)
 
 
 if __name__ == "__main__":

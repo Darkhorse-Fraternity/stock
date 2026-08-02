@@ -47,6 +47,15 @@ def _find_forbidden_engine_imports(
 
 
 class PortfolioEngineArchitectureTests(unittest.TestCase):
+    def test_legacy_portfolio_modules_are_removed(self):
+        root = ROOT / "src" / "stock_recommender"
+        self.assertFalse((root / "portfolio.py").exists())
+        self.assertFalse((root / "portfolio_pipeline.py").exists())
+        self.assertIsNone(importlib.util.find_spec("stock_recommender.portfolio"))
+        self.assertIsNone(
+            importlib.util.find_spec("stock_recommender.portfolio_pipeline")
+        )
+
     def test_import_guard_detects_forbidden_import_syntaxes_and_aliases(self):
         forbidden = {"reports", "admin", "delivery", "tracking"}
         templates = (

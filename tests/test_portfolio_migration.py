@@ -17,6 +17,7 @@ from stock_recommender.portfolio_engine.config import (
     default_margin_policy,
     default_short_policy,
 )
+from stock_recommender.portfolio_engine import ledger as ledger_module
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerSchemaError
 from stock_recommender.portfolio_engine import migration as migration_module
 from stock_recommender.portfolio_engine.migration import (
@@ -877,6 +878,22 @@ class PortfolioMigrationTests(unittest.TestCase):
         )
         self.assertEqual(apply_status, 0)
         self.assertEqual(json.loads(self.portfolio_path.read_text())["version"], 2)
+
+    def test_ledger_path_resolver_owns_the_runtime_environment_default(self) -> None:
+        resolver = getattr(ledger_module, "portfolio_ledger_path", None)
+        self.assertTrue(callable(resolver))
+        with patch.dict(
+            os.environ,
+            {"STOCK_AGENT_PORTFOLIO_PATH": "runtime/portfolio-v2.json"},
+        ):
+            self.assertEqual(
+                resolver(),
+                Path("runtime/portfolio-v2.json"),
+            )
+            self.assertEqual(
+                resolver("explicit/portfolio-v2.json"),
+                Path("explicit/portfolio-v2.json"),
+            )
 
     def test_cli_requires_exactly_one_mode(self) -> None:
         with self.assertRaises(SystemExit):

@@ -23,10 +23,10 @@ from stock_recommender.portfolio_runtime import (
     EmptyEventCalendarProvider,
     FailClosedBorrowProvider,
     MarketAdapterQuoteProvider,
-    format_portfolio_snapshot,
     open_portfolio_runtime,
     process_portfolio_runtime,
 )
+from stock_recommender.reports import format_portfolio_snapshot
 
 
 NOW = datetime(2026, 8, 3, 14, 30, tzinfo=timezone.utc)

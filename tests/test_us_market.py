@@ -26,11 +26,6 @@ from stock_recommender.parameters import (
     convert_strategy_text,
     default_strategy_config,
 )
-from stock_recommender.portfolio import (
-    create_portfolio_account,
-    plan_daily_candidates,
-    process_market_snapshot,
-)
 from stock_recommender.schedule import should_publish_now
 from stock_recommender.tracking import load_daily_selection_state
 from stock_recommender.universe import normalize_stock_symbol, normalize_watchlist
@@ -48,9 +43,6 @@ from stock_recommender.us_data_providers import (
     strategy_us_data_source,
     us_market_data_status,
 )
-
-from recommendation_fixtures import FULL_EXPOSURE_MARKET_REGIME
-
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 
@@ -681,52 +673,6 @@ class UsMarketAdapterTests(unittest.TestCase):
             ),
         )
         self.assertIs(unchanged, plan)
-
-    def test_us_portfolio_uses_whole_shares_zero_commission_and_same_day_sellable(self):
-        strategy = us_strategy()
-        signal_time = datetime(2026, 7, 30, 8, 0, tzinfo=SHANGHAI)
-        open_time = datetime(2026, 7, 30, 9, 35, tzinfo=ZoneInfo("America/New_York"))
-        account = create_portfolio_account(strategy, now=signal_time)
-        account, _ = plan_daily_candidates(
-            strategy,
-            [
-                {
-                    "symbol": "AAPL",
-                    "name": "Apple",
-                    "price": 200,
-                    "score": 0.9,
-                    "signal_features": {"momentum20": 0.1, "trend": 2},
-                }
-            ],
-            now=signal_time,
-            account=account,
-            market_regime=FULL_EXPOSURE_MARKET_REGIME,
-        )
-        account, events = process_market_snapshot(
-            strategy,
-            [
-                {
-                    "symbol": "AAPL",
-                    "name": "Apple",
-                    "price": 201,
-                    "volume": 10_000_000,
-                    "bar_volume": 10_000_000,
-                    "bar_open": 201,
-                    "bar_high": 202,
-                    "bar_low": 200,
-                }
-            ],
-            now=open_time,
-            account=account,
-        )
-        position = account["positions"]["AAPL"]
-        fill = next(event for event in events if event["type"] == "ORDER_FILLED")
-
-        self.assertEqual(account["market"], "us")
-        self.assertEqual(account["currency"], "USD")
-        self.assertGreater(position["quantity"], 0)
-        self.assertEqual(position["sellable_quantity"], position["quantity"])
-        self.assertEqual(fill["data"]["fees"], 0)
 
     def test_us_session_guards_cover_dst_and_delivery_window(self):
         summer_open = datetime(2026, 7, 30, 22, 0, tzinfo=SHANGHAI)

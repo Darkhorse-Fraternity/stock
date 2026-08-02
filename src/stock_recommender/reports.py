@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 from .config import DEFAULT_BOARD_CODE, DEFAULT_BOARD_NAME, DEFAULT_LLM_TIMEOUT_SECONDS
 from .context import (
@@ -17,6 +17,7 @@ from .llm import call_llm_analysis
 from .market_regime import normalize_market_regime_decision
 from .markets import CN_MARKET, market_profile, strategy_market
 from .parameters import chase_risk_threshold, normalize_portfolio_config
+from .portfolio_engine.contracts import DecisionBatch, PortfolioSnapshot
 from .recommendation import RecommendationOutput, RecommendationPlan
 from .universe import normalize_sector_filters, normalize_watchlist
 from .utils import number
@@ -27,6 +28,68 @@ def append_performance_link(report: str, url: str) -> str:
     if not target or target in report:
         return report
     return f"{report.rstrip()}\n\n📊 [查看策略表现]({target})"
+
+
+def format_portfolio_snapshot(
+    strategy: Mapping[str, Any],
+    snapshot: PortfolioSnapshot,
+    *,
+    performance_url: str = "",
+) -> str:
+    exposure_policy = strategy.get("exposure_policy")
+    max_positions = (
+        exposure_policy.get("max_positions", 10)
+        if isinstance(exposure_policy, Mapping)
+        else 10
+    )
+    lines = [
+        "📊 **策略持仓每小时报告**",
+        f"策略：{strategy.get('name') or strategy.get('id')} · v{strategy.get('revision')}",
+        (
+            f"净值：{snapshot.metrics.equity:,.2f} · "
+            f"可用现金：{snapshot.account.available_cash:,.2f} · "
+            f"持仓：{len(snapshot.positions)}/{max_positions}"
+        ),
+    ]
+    for held in snapshot.positions:
+        lines.append(
+            f"- {held.symbol} {held.side.value}：{held.quantity} 股 · "
+            f"现价 {held.current_price:.2f}"
+        )
+    if not snapshot.positions:
+        lines.append("- 当前空仓")
+    if performance_url:
+        lines.extend(("", f"策略表现：{performance_url}"))
+    return "\n".join(lines)
+
+
+def format_portfolio_actions(
+    strategy: Mapping[str, Any],
+    batch: DecisionBatch,
+    *,
+    performance_url: str = "",
+) -> str:
+    actions = [
+        *(
+            f"订单意图：{item.symbol} {item.order_side.value} {item.quantity}"
+            for item in batch.intents
+        ),
+        *(
+            f"模拟成交：{item.symbol} {item.quantity} @ {item.price:.2f}"
+            for item in batch.fills
+        ),
+        *(f"事件：{item.type}" for item in batch.events),
+    ]
+    if not actions:
+        return ""
+    lines = [
+        "⚠️ **策略组合动作通知**",
+        f"策略：{strategy.get('name') or strategy.get('id')} · v{strategy.get('revision')}",
+        *actions,
+    ]
+    if performance_url:
+        lines.extend(("", f"策略表现：{performance_url}"))
+    return "\n".join(lines)
 
 
 def decorate_strategy_output(report: str, strategy: dict | None) -> str:

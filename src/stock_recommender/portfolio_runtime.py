@@ -18,7 +18,11 @@ from .portfolio_engine.contracts import (
     MarketSnapshot,
     RevisionTransition,
 )
-from .portfolio_engine.ledger import JsonLedgerStore
+from .portfolio_engine.ledger import (
+    InMemoryLedgerStore,
+    JsonLedgerStore,
+    portfolio_ledger_path,
+)
 from .us_data_providers import strategy_us_data_source
 
 
@@ -230,6 +234,62 @@ def open_portfolio_runtime(
     return engine, account
 
 
+def project_portfolio_snapshot(
+    strategy: Mapping[str, Any],
+    *,
+    path: str | Path | None = None,
+    adapter: object,
+    occurred_at: datetime,
+) -> PortfolioSnapshot:
+    """Project one read-only API/report snapshot through PortfolioEngine."""
+
+    captured_at = _utc_datetime(occurred_at)
+    strategy_id = str(strategy.get("id") or "")
+    if not strategy_id:
+        raise ValueError("strategy.id is required for portfolio performance")
+    persistent_store = JsonLedgerStore(portfolio_ledger_path(path))
+    try:
+        account = persistent_store.load(strategy_id)
+        store = persistent_store
+    except KeyError:
+        revision = strategy.get("revision")
+        if type(revision) is not int or revision < 1:
+            raise ValueError("strategy.revision must be positive")
+        portfolio = strategy.get("portfolio")
+        initial_cash = (
+            _finite_number(portfolio.get("initial_cash"))
+            if isinstance(portfolio, Mapping)
+            else None
+        )
+        if initial_cash is None or initial_cash <= 0:
+            raise ValueError("strategy portfolio.initial_cash must be positive")
+        store = InMemoryLedgerStore()
+        account = store.create_account(
+            AccountSnapshot(
+                id=f"account-{strategy_id}",
+                strategy_id=strategy_id,
+                strategy_revision=revision,
+                occurred_at=captured_at,
+                available_cash=initial_cash,
+                snapshot_id=f"projection-{strategy_id}-r{revision}",
+            )
+        )
+    symbols = tuple(held.symbol for held in account.positions)
+    if symbols:
+        market = MarketAdapterQuoteProvider(adapter, strategy).snapshot(
+            symbols,
+            captured_at,
+        )
+    else:
+        market_name = strategy_market(strategy)
+        market = MarketSnapshot(
+            id=_snapshot_id(market_name, captured_at, {}),
+            occurred_at=captured_at,
+            quotes={},
+        )
+    return PortfolioEngine(ledger_store=store).performance(strategy_id, market)
+
+
 def process_portfolio_runtime(
     strategy: Mapping[str, Any],
     *,
@@ -249,68 +309,11 @@ def process_portfolio_runtime(
     return batch, snapshot
 
 
-def format_portfolio_snapshot(
-    strategy: Mapping[str, Any],
-    snapshot: PortfolioSnapshot,
-    *,
-    performance_url: str = "",
-) -> str:
-    exposure_policy = strategy.get("exposure_policy")
-    max_positions = (
-        exposure_policy.get("max_positions", 10)
-        if isinstance(exposure_policy, Mapping)
-        else 10
-    )
-    lines = [
-        "📊 **策略持仓每小时报告**",
-        f"策略：{strategy.get('name') or strategy.get('id')} · v{strategy.get('revision')}",
-        (
-            f"净值：{snapshot.metrics.equity:,.2f} · "
-            f"可用现金：{snapshot.account.available_cash:,.2f} · "
-            f"持仓：{len(snapshot.positions)}/{max_positions}"
-        ),
-    ]
-    for held in snapshot.positions:
-        lines.append(
-            f"- {held.symbol} {held.side.value}：{held.quantity} 股 · "
-            f"现价 {held.current_price:.2f}"
-        )
-    if not snapshot.positions:
-        lines.append("- 当前空仓")
-    if performance_url:
-        lines.extend(("", f"策略表现：{performance_url}"))
-    return "\n".join(lines)
-
-
-def format_portfolio_actions(
-    strategy: Mapping[str, Any],
-    batch: DecisionBatch,
-    *,
-    performance_url: str = "",
-) -> str:
-    actions = [
-        *(f"订单意图：{item.symbol} {item.order_side.value} {item.quantity}" for item in batch.intents),
-        *(f"模拟成交：{item.symbol} {item.quantity} @ {item.price:.2f}" for item in batch.fills),
-        *(f"事件：{item.type}" for item in batch.events),
-    ]
-    if not actions:
-        return ""
-    lines = [
-        "⚠️ **策略组合动作通知**",
-        f"策略：{strategy.get('name') or strategy.get('id')} · v{strategy.get('revision')}",
-        *actions,
-    ]
-    if performance_url:
-        lines.extend(("", f"策略表现：{performance_url}"))
-    return "\n".join(lines)
-
-
 __all__ = (
     "EmptyEventCalendarProvider",
     "FailClosedBorrowProvider",
     "MarketAdapterQuoteProvider",
-    "format_portfolio_actions",
-    "format_portfolio_snapshot",
     "open_portfolio_runtime",
+    "project_portfolio_snapshot",
     "process_portfolio_runtime",
 )

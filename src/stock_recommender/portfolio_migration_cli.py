@@ -9,6 +9,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Sequence
 
+from .portfolio_engine.ledger import portfolio_ledger_path
 from .portfolio_engine.migration import MigrationError, migrate_stores
 
 
@@ -38,9 +39,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         strategy_path = args.strategy_path
     if args.portfolio_path is None:
-        from .portfolio import portfolio_store_path
-
-        portfolio_path = portfolio_store_path()
+        portfolio_path = portfolio_ledger_path()
     else:
         portfolio_path = args.portfolio_path
     try:
