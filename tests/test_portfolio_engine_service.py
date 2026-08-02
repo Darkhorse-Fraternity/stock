@@ -187,6 +187,73 @@ def recommendation_plan(decision=None) -> RecommendationPlan:
 
 
 class PortfolioEngineServiceTests(unittest.TestCase):
+    def test_performance_projection_allows_finite_negative_available_cash(self):
+        generated_at = NOW + timedelta(minutes=1)
+        negative_cash_account = AccountSnapshot(
+            id="negative-cash-account",
+            strategy_id="strategy-us",
+            strategy_revision=3,
+            occurred_at=NOW,
+            available_cash=-1.0,
+            positions=(
+                contracts.PositionSnapshot(
+                    symbol="L",
+                    side=PositionSide.LONG,
+                    quantity=2,
+                    average_cost=100.0,
+                    current_price=100.0,
+                    sellable_quantity=2,
+                ),
+            ),
+            snapshot_id="negative-cash-snapshot",
+        )
+        view = contracts.PortfolioPerformanceLedgerView(
+            account=negative_cash_account,
+            lifecycle_complete=False,
+            lifecycle_reason="fixture omits canonical fills",
+        )
+        source = contracts.PerformanceStrategySource(
+            id="strategy-us",
+            name="negative cash projection",
+            revision=3,
+            stage="paper",
+            market="us",
+            market_label="美股",
+            currency="USD",
+            currency_symbol="$",
+            initial_cash=200.0,
+            max_positions=10,
+            symbol_names={"L": "Long Inc"},
+        )
+        request = contracts.PerformanceProjectionRequest(
+            strategy=source,
+            market=MarketSnapshot(
+                id="negative-cash-market",
+                occurred_at=generated_at,
+                quotes={"L": {"price": 100.0}},
+            ),
+            generated_at=generated_at,
+            valuation_source="live_quote",
+        )
+
+        projection = service.PortfolioEngine().performance_projection(
+            request,
+            ledger_view=view,
+        )
+
+        self.assertEqual(projection.summary.cash, -1.0)
+        self.assertEqual(projection.summary.market_value, 200.0)
+        self.assertEqual(projection.summary.nav, 199.0)
+        self.assertEqual(projection.nav_history[-1].cash, -1.0)
+        self.assertEqual(projection.nav_history[-1].market_value, 200.0)
+        self.assertEqual(projection.nav_history[-1].nav, 199.0)
+        for invalid_cash in (math.nan, math.inf, -math.inf):
+            with self.subTest(invalid_cash=invalid_cash):
+                with self.assertRaises(ValueError):
+                    replace(projection.summary, cash=invalid_cash)
+                with self.assertRaises(ValueError):
+                    replace(projection.nav_history[-1], cash=invalid_cash)
+
     def test_performance_runtime_uses_canonical_batch_and_marks_missing_facts(self):
         event = contracts.PortfolioEvent(
             id="pipeline-event",

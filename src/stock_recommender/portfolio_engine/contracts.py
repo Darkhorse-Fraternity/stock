@@ -1828,7 +1828,8 @@ class PerformanceSummary(_DeeplyImmutable):
     def __post_init__(self) -> None:
         _require_positive_finite_number(self.initial_cash, "initial_cash")
         _require_nonnegative_finite_number(self.nav, "nav")
-        for field_name in ("cash", "reserved_cash", "market_value"):
+        _require_finite_number(self.cash, "cash")
+        for field_name in ("reserved_cash", "market_value"):
             _require_nonnegative_finite_number(getattr(self, field_name), field_name)
         _require_finite_number(self.cumulative_return_pct, "cumulative_return_pct")
         if self.maximum_drawdown_pct is not None:
@@ -1918,7 +1919,7 @@ class PerformanceNavPoint(_DeeplyImmutable):
     def __post_init__(self) -> None:
         _require_datetime(self.at, "at")
         _require_nonnegative_finite_number(self.nav, "nav")
-        _require_nonnegative_finite_number(self.cash, "cash")
+        _require_finite_number(self.cash, "cash")
         _require_nonnegative_finite_number(self.market_value, "market_value")
         _require_finite_number(self.cumulative_return_pct, "cumulative_return_pct")
         if self.drawdown_pct is not None:
