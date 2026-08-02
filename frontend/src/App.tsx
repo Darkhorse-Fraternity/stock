@@ -51,6 +51,9 @@ import {
   type ConfigPayload,
   type AllocationConfig,
   type ChatMessage,
+  type ExposureMode,
+  type ExposurePolicy,
+  type MarginPolicy,
   type Parameter,
   type ParameterStatus,
   type PortfolioConfig,
@@ -60,6 +63,7 @@ import {
   type StrategyLibrary,
   type StrategyRunStatus,
   type StrategySummary,
+  type ShortPolicy,
   type UsDataSourcePolicy,
   type UsMarketDataStatus,
 } from "@/lib/api"
@@ -548,7 +552,7 @@ function StrategyRunSheet({
       queryClient.invalidateQueries({ queryKey: ["strategy-runs", strategyId] })
       toast.success("策略已开始执行")
     },
-    onError: (error) => toast.error(error.message),
+    onError: (error) => { if (error.message !== "SAVE_CANCELLED") toast.error(error.message) },
   })
   const currentRun = runQuery.data
   const running = currentRun?.status === "queued" || currentRun?.status === "running"
@@ -688,6 +692,127 @@ function PortfolioSettings({ portfolio, allocation, strategyId, market, onChange
   )
 }
 
+function PolicyNumberField({ label, value, maximum, suffix = "%", disabled = false, step = 1, onChange }: { label: string; value: number; maximum: number; suffix?: string; disabled?: boolean; step?: number; onChange: (value: number) => void }) {
+  const id = `policy-${label.replaceAll(" ", "-")}`
+  return (
+    <label className={cn("grid gap-2 border-l-2 border-slate-200 bg-slate-50/65 px-3 py-3", disabled && "opacity-50")} htmlFor={id}>
+      <span className="flex items-start justify-between gap-3 text-xs">
+        <span className="font-medium text-foreground">{label}</span>
+        <span className="shrink-0 font-mono text-[10px] text-muted-foreground">系统上限 {maximum}{suffix}</span>
+      </span>
+      <span className="flex items-center gap-2">
+        <Input id={id} className="h-9 text-right font-mono tabular-nums" disabled={disabled} type="number" min={0} max={maximum} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+        <span className="min-w-8 text-xs text-muted-foreground">{suffix}</span>
+      </span>
+    </label>
+  )
+}
+
+function LongShortPolicySettings({ market, exposure, margin, short, onExposureChange, onMarginChange, onShortChange }: { market: "cn" | "us"; exposure: ExposurePolicy; margin: MarginPolicy; short: ShortPolicy; onExposureChange: (patch: Partial<ExposurePolicy>) => void; onMarginChange: (patch: Partial<MarginPolicy>) => void; onShortChange: (patch: Partial<ShortPolicy>) => void }) {
+  const locked = market !== "us"
+  const mode: ExposureMode = locked ? "LONG_ONLY" : exposure.mode
+  const shortDisabled = mode !== "LONG_SHORT"
+  const exposureField = (key: keyof ExposurePolicy) => (value: number) => onExposureChange({ [key]: value } as Partial<ExposurePolicy>)
+  const marginField = (key: keyof MarginPolicy) => (value: number) => onMarginChange({ [key]: value } as Partial<MarginPolicy>)
+  const shortField = (key: keyof ShortPolicy) => (value: number) => onShortChange({ [key]: value } as Partial<ShortPolicy>)
+  const gross = mode === "LONG_ONLY" ? Math.min(exposure.max_gross_exposure_pct, 100) : mode === "LONG_LEVERAGED" ? Math.min(exposure.max_gross_exposure_pct, 120) : exposure.max_gross_exposure_pct
+  const long = mode === "LONG_ONLY" ? Math.min(exposure.max_long_exposure_pct, 100) : exposure.max_long_exposure_pct
+  const shortLimit = mode === "LONG_SHORT" ? exposure.max_short_exposure_pct : 0
+
+  return (
+    <section className="risk-policy-panel overflow-hidden border border-slate-300 bg-background shadow-xs">
+      <div className="grid border-b border-slate-300 lg:grid-cols-[minmax(260px,0.8fr)_minmax(440px,1.4fr)]">
+        <div className="border-b bg-[#10243e] px-5 py-5 text-white lg:border-b-0 lg:border-r lg:border-slate-500">
+          <div className="font-mono text-[10px] font-semibold tracking-[0.18em] text-sky-200">RISK BOUNDARY / STRATEGY</div>
+          <h3 className="mt-2 text-lg font-semibold">多空与杠杆</h3>
+          <p className="mt-2 text-xs leading-5 text-slate-300">策略级风险边界独立于持仓 Pipeline。所有数值仍受系统硬上限约束。</p>
+          <div className="mt-5">
+            <label className="mb-2 block text-xs font-medium text-slate-200" htmlFor="exposure-mode">敞口模式</label>
+            <Select disabled={locked} value={mode} onValueChange={(value: ExposureMode) => onExposureChange({ mode: value })}>
+              <SelectTrigger id="exposure-mode" className="w-full border-slate-500 bg-slate-900/40 text-white"><SelectValue /></SelectTrigger>
+              <SelectContent>
+                <SelectItem value="LONG_ONLY">只做多 · 最高 100%</SelectItem>
+                <SelectItem value="LONG_LEVERAGED">杠杆做多 · 最高 120%</SelectItem>
+                <SelectItem value="LONG_SHORT">多空组合 · 总敞口最高 150%</SelectItem>
+              </SelectContent>
+            </Select>
+            {locked && <p className="mt-3 border-l-2 border-amber-300 pl-3 text-xs leading-5 text-amber-100">当前市场强制 LONG_ONLY：市场对应的融资与借券支持尚未接通。</p>}
+          </div>
+        </div>
+        <div className="exposure-tape grid grid-cols-2 divide-x divide-y divide-slate-200 sm:grid-cols-4 sm:divide-y-0" aria-label="策略敞口边界">
+          {[
+            ["LONG", long, "多头上限"],
+            ["SHORT", shortLimit, "空头上限"],
+            ["GROSS", gross, "总敞口"],
+            ["NET", exposure.max_net_exposure_pct, "净敞口"],
+          ].map(([key, value, label]) => (
+            <div key={String(key)} className="min-w-0 px-4 py-5">
+              <div className="font-mono text-[10px] tracking-[0.14em] text-muted-foreground">{key}</div>
+              <strong className="mt-2 block font-mono text-xl tabular-nums text-[#10243e]">{Number(value).toFixed(0)}%</strong>
+              <div className="mt-1 text-[11px] text-muted-foreground">{label}</div>
+              <div className="mt-3 h-1 overflow-hidden bg-slate-100"><span className={cn("block h-full", key === "SHORT" ? "bg-[#c83e4c]" : "bg-[#2866ae]")} style={{ width: `${Math.min(Number(value) / 1.5, 100)}%` }} /></div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-7 px-4 py-5 sm:px-6">
+        <div>
+          <h4 className="mb-3 font-mono text-[11px] font-semibold tracking-[0.12em] text-muted-foreground">EXPOSURE LIMITS</h4>
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+            <PolicyNumberField label="最多持仓" value={exposure.max_positions} maximum={10} suffix="只" onChange={exposureField("max_positions")} />
+            <PolicyNumberField label="总敞口" value={exposure.max_gross_exposure_pct} maximum={150} onChange={exposureField("max_gross_exposure_pct")} />
+            <PolicyNumberField label="净敞口" value={exposure.max_net_exposure_pct} maximum={120} onChange={exposureField("max_net_exposure_pct")} />
+            <PolicyNumberField label="多头敞口" value={exposure.max_long_exposure_pct} maximum={120} onChange={exposureField("max_long_exposure_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="空头敞口" value={exposure.max_short_exposure_pct} maximum={30} onChange={exposureField("max_short_exposure_pct")} />
+            <PolicyNumberField label="单只多头" value={exposure.max_long_position_pct} maximum={15} onChange={exposureField("max_long_position_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="单只空头" value={exposure.max_short_position_pct} maximum={5} onChange={exposureField("max_short_position_pct")} />
+          </div>
+        </div>
+
+        <div>
+          <h4 className="mb-3 font-mono text-[11px] font-semibold tracking-[0.12em] text-muted-foreground">MARGIN &amp; CARRY</h4>
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+            <PolicyNumberField label="维持保证金率" value={margin.maintenance_margin_pct} maximum={100} onChange={marginField("maintenance_margin_pct")} />
+            <PolicyNumberField label="清算缓冲" value={margin.liquidation_buffer_pct} maximum={100} onChange={marginField("liquidation_buffer_pct")} />
+            <PolicyNumberField label="融资年化" value={margin.financing_apr_pct} maximum={100} step={0.1} onChange={marginField("financing_apr_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="借券年化估算" value={short.estimated_borrow_apr_pct} maximum={100} step={0.1} onChange={shortField("estimated_borrow_apr_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="成本压力倍数" value={short.cost_stress_multiplier} maximum={100} suffix="×" step={0.1} onChange={shortField("cost_stress_multiplier")} />
+          </div>
+        </div>
+
+        <div className={cn(shortDisabled && "opacity-50")}>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h4 className="font-mono text-[11px] font-semibold tracking-[0.12em] text-muted-foreground">SHORT RISK ONLY</h4>
+            {shortDisabled && <span className="text-xs text-muted-foreground">切换到 LONG_SHORT 后可配置</span>}
+          </div>
+          <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+            <PolicyNumberField disabled={shortDisabled} label="空头止损" value={short.stop_loss_pct} maximum={100} step={0.5} onChange={shortField("stop_loss_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="追踪止盈激活" value={short.trailing_activation_pct} maximum={100} step={0.5} onChange={shortField("trailing_activation_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="追踪反弹退出" value={short.trailing_rebound_pct} maximum={100} step={0.5} onChange={shortField("trailing_rebound_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="事件禁入窗口" value={short.event_blackout_sessions} maximum={252} suffix="场" onChange={shortField("event_blackout_sessions")} />
+            <PolicyNumberField disabled={shortDisabled} label="逼空单日涨幅" value={short.squeeze_rise_pct} maximum={100} step={0.5} onChange={shortField("squeeze_rise_pct")} />
+            <PolicyNumberField disabled={shortDisabled} label="逼空量比" value={short.squeeze_volume_ratio} maximum={100} suffix="×" step={0.1} onChange={shortField("squeeze_volume_ratio")} />
+            <PolicyNumberField disabled={shortDisabled} label="20日波动率" value={short.maximum_volatility_20d_pct} maximum={1000} step={1} onChange={shortField("maximum_volatility_20d_pct")} />
+          </div>
+          <div className="mt-3 grid gap-2 md:grid-cols-3">
+            {([
+              ["require_shortable", "必须可卖空", short.require_shortable],
+              ["require_easy_to_borrow", "必须易借券", short.require_easy_to_borrow],
+              ["block_on_borrow_data_missing", "缺少借券数据时阻断", short.block_on_borrow_data_missing],
+            ] as [keyof ShortPolicy, string, boolean][]).map(([key, label, checked]) => (
+              <label key={String(key)} className="flex items-center justify-between gap-3 border border-slate-200 px-3 py-3 text-sm">
+                <span>{label}</span>
+                <Switch disabled={shortDisabled} checked={Boolean(checked)} onCheckedChange={(value) => onShortChange({ [key]: value } as Partial<ShortPolicy>)} />
+              </label>
+            ))}
+          </div>
+        </div>
+      </div>
+    </section>
+  )
+}
+
 function DeliverySettings({
   delivery,
   isActive,
@@ -779,6 +904,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [deliverySync, setDeliverySync] = useState<ConfigPayload["delivery_sync"] | null>(initialData.delivery_sync || null)
   const [dataSourceStatus, setDataSourceStatus] = useState(initialData.us_market_data)
+  const [savedExposureMode, setSavedExposureMode] = useState<ExposureMode>(initialData.config.exposure_policy.mode)
 
   const updateParameter = (id: string, patch: Partial<Parameter>) => {
     setParameters((current) => current.map((item) => item.id === id ? { ...item, ...patch, effective: (patch.enabled ?? item.enabled) && item.status !== "planned" } : item))
@@ -797,6 +923,21 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
 
   const updateAllocation = (patch: Partial<AllocationConfig>) => {
     setConfig((current) => ({ ...current, allocation: { ...current.allocation, ...patch } }))
+    setDirty(true)
+  }
+
+  const updateExposurePolicy = (patch: Partial<ExposurePolicy>) => {
+    setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, ...patch } }))
+    setDirty(true)
+  }
+
+  const updateMarginPolicy = (patch: Partial<MarginPolicy>) => {
+    setConfig((current) => ({ ...current, margin_policy: { ...current.margin_policy, ...patch } }))
+    setDirty(true)
+  }
+
+  const updateShortPolicy = (patch: Partial<ShortPolicy>) => {
+    setConfig((current) => ({ ...current, short_policy: { ...current.short_policy, ...patch } }))
     setDirty(true)
   }
 
@@ -826,16 +967,25 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
     return item
   }), [parameters, activeGroup, statusFilter, search, marketCode])
 
+  const safeConfig = marketCode === "us" ? config : { ...config, exposure_policy: { ...config.exposure_policy, mode: "LONG_ONLY" as const } }
+  const confirmPolicyTransition = () => {
+    const initialMode = savedExposureMode
+    return initialMode !== "LONG_ONLY"
+      || safeConfig.exposure_policy.mode === "LONG_ONLY"
+      || window.confirm("启用多空或杠杆会创建新的策略 revision，并重置回测与模拟盘审批。继续保存？")
+  }
+
   const saveMutation = useMutation({
     mutationFn: () => {
       const states = Object.fromEntries(parameters.map((item) => [item.id, { enabled: item.enabled, value: item.value }]))
-      return saveStrategy(config.id!, { ...config, parameters: states })
+      return saveStrategy(config.id!, { ...safeConfig, parameters: states })
     },
     onSuccess: (payload) => {
       setParameters(payload.parameters)
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
       setDataSourceStatus(payload.us_market_data)
+      setSavedExposureMode(payload.config.exposure_policy.mode)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
@@ -845,6 +995,15 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
     onError: (error) => toast.error(error.message),
   })
 
+  const saveIfConfirmed = () => {
+    if (!confirmPolicyTransition()) return
+    saveMutation.mutate()
+  }
+
+  const saveIfConfirmedAsync = () => confirmPolicyTransition()
+    ? saveMutation.mutateAsync()
+    : Promise.reject(new Error("SAVE_CANCELLED"))
+
   const resetMutation = useMutation({
     mutationFn: () => resetStrategy(config.id!),
     onSuccess: (payload) => {
@@ -852,6 +1011,7 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
       setConfig(payload.config)
       setDeliverySync(payload.delivery_sync || null)
       setDataSourceStatus(payload.us_market_data)
+      setSavedExposureMode(payload.config.exposure_policy.mode)
       setDirty(false)
       queryClient.setQueryData(["strategy", config.id], payload)
       queryClient.invalidateQueries({ queryKey: ["strategies"] })
@@ -891,10 +1051,11 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
   }
 
   const groups = initialData.groups
-  const navItems = [{ id: "all", label: "全部参数", description: "完整参数目录" }, ...groups, { id: "portfolio", label: "持仓 Pipeline", description: "组合、退出与风控" }, { id: "delivery", label: "报告推送", description: "定时与接收渠道" }]
+  const navItems = [{ id: "all", label: "全部参数", description: "完整参数目录" }, ...groups, { id: "exposure", label: "多空与杠杆", description: "敞口、保证金与借券" }, { id: "portfolio", label: "持仓 Pipeline", description: "组合、退出与风控" }, { id: "delivery", label: "报告推送", description: "定时与接收渠道" }]
   const deliveryView = activeGroup === "delivery"
+  const exposureView = activeGroup === "exposure"
   const portfolioView = activeGroup === "portfolio"
-  const settingsView = deliveryView || portfolioView
+  const settingsView = deliveryView || exposureView || portfolioView
 
   return (
     <div className="min-h-screen bg-muted/25 text-foreground">
@@ -907,12 +1068,12 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
         <nav className="p-3">
           <p className="px-2 pb-2 pt-1 text-[11px] font-medium text-muted-foreground">策略配置</p>
           {navItems.map((group) => {
-            const special = group.id === "delivery" || group.id === "portfolio"
+            const special = group.id === "delivery" || group.id === "exposure" || group.id === "portfolio"
             const count = special ? 0 : group.id === "all" ? parameters.length : parameters.filter((item) => item.group === group.id).length
             const enabled = special ? 0 : group.id === "all" ? activeCount : parameters.filter((item) => item.group === group.id && item.enabled).length
             return (
               <button key={group.id} className={cn("mb-0.5 flex w-full items-center justify-between rounded-md px-2.5 py-2 text-left text-sm transition-colors", activeGroup === group.id ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground" : "text-sidebar-foreground/75 hover:bg-sidebar-accent/60 hover:text-sidebar-foreground")} onClick={() => { setActiveGroup(group.id); setMobileNavOpen(false) }}>
-                <span>{group.label}</span>{group.id === "delivery" ? <BellRing className={cn("size-3.5", config.delivery.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : group.id === "portfolio" ? <Database className={cn("size-3.5", config.portfolio.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : <span className="font-mono text-[10px] text-muted-foreground">{enabled}/{count}</span>}
+                <span>{group.label}</span>{group.id === "delivery" ? <BellRing className={cn("size-3.5", config.delivery.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : group.id === "exposure" ? <SlidersHorizontal className="size-3.5 text-primary" /> : group.id === "portfolio" ? <Database className={cn("size-3.5", config.portfolio.enabled ? "text-emerald-600" : "text-muted-foreground")} /> : <span className="font-mono text-[10px] text-muted-foreground">{enabled}/{count}</span>}
               </button>
             )
           })}
@@ -939,16 +1100,16 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
           <div className="flex items-center gap-1 sm:gap-2">
             {!isActive && <Button variant="outline" size="sm" disabled={activateMutation.isPending} onClick={() => activateMutation.mutate()}><ShieldCheck />启用策略</Button>}
             <Button variant="outline" size="sm" className="hidden sm:inline-flex" disabled={resetMutation.isPending} onClick={() => window.confirm("恢复默认参数？") && resetMutation.mutate()}><RotateCcw />恢复默认</Button>
-            <StrategyRunSheet strategyId={config.id!} strategyName={config.name} compact pendingChanges={dirty} beforeRun={() => saveMutation.mutateAsync()} />
+            <StrategyRunSheet strategyId={config.id!} strategyName={config.name} compact pendingChanges={dirty} beforeRun={saveIfConfirmedAsync} />
             <StrategyMapper strategyId={config.id!} parameters={parameters} onApply={applyDraft} />
-            <Button size="sm" className="size-8 px-0 sm:w-auto sm:px-3" disabled={!dirty || saveMutation.isPending} onClick={() => saveMutation.mutate()}><Save /><span className="hidden sm:inline">{saveMutation.isPending ? "保存中" : "保存配置"}</span><span className="sr-only sm:hidden">保存配置</span></Button>
+            <Button size="sm" className="size-8 px-0 sm:w-auto sm:px-3" disabled={!dirty || saveMutation.isPending} onClick={saveIfConfirmed}><Save /><span className="hidden sm:inline">{saveMutation.isPending ? "保存中" : "保存配置"}</span><span className="sr-only sm:hidden">保存配置</span></Button>
           </div>
         </header>
 
         <main className="mx-auto max-w-[1500px] px-4 py-6 sm:px-6 lg:px-8">
           <section className="mb-6 border-b pb-6">
             <div className="flex flex-col justify-between gap-4 md:flex-row md:items-end">
-              <div><div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground"><ShieldCheck className="size-3.5" />{isActive ? "当前使用" : "未使用"}</div><h2 className="text-xl font-semibold tracking-tight">{deliveryView ? "报告推送" : portfolioView ? "持仓 Pipeline" : "筛选参数"}</h2><p className="mt-1.5 text-sm text-muted-foreground">{deliveryView ? "配置报告的推送时间、渠道和通知范围。" : portfolioView ? "配置每个策略独立的模拟组合、退出规则、回撤闸门和成交成本。" : "已接入参数会直接参与过滤；待接入参数用于保存下一版策略意图。"}</p></div>
+              <div><div className="mb-2 flex items-center gap-2 text-xs font-medium text-muted-foreground"><ShieldCheck className="size-3.5" />{isActive ? "当前使用" : "未使用"}</div><h2 className="text-xl font-semibold tracking-tight">{deliveryView ? "报告推送" : exposureView ? "多空与杠杆" : portfolioView ? "持仓 Pipeline" : "筛选参数"}</h2><p className="mt-1.5 text-sm text-muted-foreground">{deliveryView ? "配置报告的推送时间、渠道和通知范围。" : exposureView ? "定义策略的多空模式、敞口硬边界、保证金与借券风险。" : portfolioView ? "配置每个策略独立的模拟组合、退出规则、回撤闸门和成交成本。" : "已接入参数会直接参与过滤；待接入参数用于保存下一版策略意图。"}</p></div>
               {!settingsView && <div className="grid grid-cols-3 divide-x rounded-lg border bg-background px-1 shadow-xs">
                 <div className="px-4 py-2.5"><div className="font-mono text-lg font-semibold tabular-nums">{activeCount}</div><div className="text-[11px] text-muted-foreground">已启用</div></div>
                 <div className="px-4 py-2.5"><div className="font-mono text-lg font-semibold tabular-nums text-emerald-700">{effectiveCount}</div><div className="text-[11px] text-muted-foreground">实际生效</div></div>
@@ -957,7 +1118,9 @@ function Dashboard({ initialData, isActive, onBack }: { initialData: ConfigPaylo
             </div>
           </section>
 
-          {portfolioView ? (
+          {exposureView ? (
+            <LongShortPolicySettings market={marketCode} exposure={config.exposure_policy} margin={config.margin_policy} short={config.short_policy} onExposureChange={updateExposurePolicy} onMarginChange={updateMarginPolicy} onShortChange={updateShortPolicy} />
+          ) : portfolioView ? (
             <PortfolioSettings portfolio={config.portfolio} allocation={config.allocation} strategyId={config.id!} market={marketCode} onChange={updatePortfolio} onAllocationChange={updateAllocation} />
           ) : deliveryView ? (
             <DeliverySettings

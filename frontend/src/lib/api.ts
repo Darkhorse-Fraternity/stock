@@ -92,6 +92,126 @@ export interface PortfolioConfig {
   benchmark_name: string
 }
 
+export type ExposureMode = "LONG_ONLY" | "LONG_LEVERAGED" | "LONG_SHORT"
+
+export interface ExposurePolicy {
+  mode: ExposureMode
+  max_positions: number
+  max_gross_exposure_pct: number
+  max_net_exposure_pct: number
+  max_long_exposure_pct: number
+  max_short_exposure_pct: number
+  max_long_position_pct: number
+  max_short_position_pct: number
+}
+
+export interface MarginPolicy {
+  maintenance_margin_pct: number
+  liquidation_buffer_pct: number
+  financing_apr_pct: number
+  accrual_mode: "DAILY"
+}
+
+export interface ShortPolicy {
+  signal_model: string
+  require_shortable: boolean
+  require_easy_to_borrow: boolean
+  estimated_borrow_apr_pct: number
+  cost_stress_multiplier: number
+  block_on_borrow_data_missing: boolean
+  stop_loss_pct: number
+  trailing_activation_pct: number
+  trailing_rebound_pct: number
+  event_blackout_sessions: number
+  squeeze_rise_pct: number
+  squeeze_volume_ratio: number
+  maximum_volatility_20d_pct: number
+}
+
+export interface PortfolioPerformanceSummary {
+  initial_cash: number
+  nav: number
+  cash: number
+  reserved_cash: number
+  market_value: number
+  long_market_value: number
+  short_liability: number
+  gross_exposure_pct: number | null
+  net_exposure_pct: number | null
+  margin_rate_pct: number | null
+  buying_power: number
+  margin_loan: number
+  financing_cost: number
+  borrow_cost: number
+  cumulative_return_pct: number
+  maximum_drawdown_pct: number | null
+  realized_pnl: number | null
+  unrealized_pnl: number
+  position_count: number
+  max_positions: number
+  target_exposure_pct: number | null
+  closed_trade_count: number | null
+  win_rate_pct: number | null
+}
+
+export interface PortfolioPerformancePosition {
+  slot_id: number
+  name: string
+  symbol: string
+  first_entry_price: number | null
+  first_entry_at: string | null
+  current_price: number
+  day_change_pct: number | null
+  return_pct: number
+  unrealized_pnl: number
+  weight_pct: number
+  quantity: number
+  sellable_quantity: number | null
+  trailing_active: boolean
+  signal_invalid_days: number | null
+  exit_distance_pct: number | null
+  market_value: number
+  average_cost: number
+  position_side: "LONG" | "SHORT"
+  side: "LONG" | "SHORT"
+  position_mode: string
+  borrow_rate_pct: number | null
+  borrow_rate_source: "strategy_estimate" | "unavailable"
+  borrow_rate_estimated: boolean
+  margin_used: number
+}
+
+export interface PortfolioPerformanceEvent {
+  id: string
+  type: string
+  occurred_at: string
+  message: string
+  strategy_revision: number | null
+  key?: string | null
+  data: Record<string, unknown>
+}
+
+export interface StrategyPerformancePayload {
+  generated_at: string
+  quote_error: string | null
+  strategy: {
+    id: string
+    name: string
+    revision: number
+    stage: string
+    market: "cn" | "us"
+    market_label: string
+    currency: string
+    currency_symbol: string
+    exposure_policy: ExposurePolicy
+    margin_policy: MarginPolicy
+    short_policy: ShortPolicy
+  }
+  summary: PortfolioPerformanceSummary
+  positions: PortfolioPerformancePosition[]
+  events: PortfolioPerformanceEvent[]
+}
+
 export interface SignalConfig {
   model: "factor_rank_v1"
   run_time: string
@@ -144,6 +264,9 @@ export interface StrategyConfig {
   allocation: AllocationConfig
   delivery: ReportDelivery
   portfolio: PortfolioConfig
+  exposure_policy: ExposurePolicy
+  margin_policy: MarginPolicy
+  short_policy: ShortPolicy
   parameters: Record<string, { enabled: boolean; value: unknown }>
 }
 
