@@ -4,6 +4,10 @@ import type { ConfigPayload, ExposureMode, StrategyConfig } from "@/lib/api"
 
 const transitionMessage = "启用多空或杠杆会创建新的策略 revision，并重置回测与模拟盘审批。继续保存？"
 
+export function shouldSuppressStrategyRunError(error: unknown): boolean {
+  return error instanceof Error && ["SAVE_CANCELLED", "SAVE_REQUIRES_RESAVE"].includes(error.message)
+}
+
 export function snapshotStrategyConfig(
   config: StrategyConfig,
   market: "cn" | "us",

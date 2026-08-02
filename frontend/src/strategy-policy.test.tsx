@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import type { ConfigPayload, ExposureMode, StrategyConfig } from "@/lib/api"
-import { parseBoundedNumber, PolicyNumberInput, useStrategySaveFlow } from "@/strategy-policy"
+import { parseBoundedNumber, PolicyNumberInput, shouldSuppressStrategyRunError, useStrategySaveFlow } from "@/strategy-policy"
 
 function draft(mode: ExposureMode = "LONG_ONLY"): StrategyConfig {
   return {
@@ -24,6 +24,7 @@ function Harness({ market = "us", confirm = vi.fn(() => true), save, run = vi.fn
   const [config, setConfig] = useState(() => draft())
   const [generation, setGeneration] = useState(0)
   const [dirty, setDirty] = useState(false)
+  const [notices, setNotices] = useState<string[]>([])
   const editMode = (mode: ExposureMode) => {
     setConfig((current) => ({ ...current, exposure_policy: { ...current.exposure_policy, mode } }))
     setGeneration((current) => current + 1)
@@ -41,6 +42,7 @@ function Harness({ market = "us", confirm = vi.fn(() => true), save, run = vi.fn
         setDirty(false)
       } else {
         setConfig((current) => ({ ...current, revision: payload.config.revision, updated_at: payload.config.updated_at }))
+        setNotices((current) => [...current, "保存期间有新的修改，请再次保存后再运行"])
       }
     },
   })
@@ -48,8 +50,11 @@ function Harness({ market = "us", confirm = vi.fn(() => true), save, run = vi.fn
     <button onClick={() => editMode("LONG_SHORT")}>short</button>
     <button onClick={() => editMode("LONG_ONLY")}>long</button>
     <button onClick={() => void flow.save()}>save</button>
-    <button onClick={() => void flow.beforeRun().then(run).catch(() => undefined)}>run</button>
+    <button onClick={() => void flow.beforeRun().then(run).catch((error: unknown) => {
+      if (!shouldSuppressStrategyRunError(error)) setNotices((current) => [...current, String(error)])
+    })}>run</button>
     <output data-dirty={dirty}>{config.exposure_policy.mode}</output>
+    <aside aria-label="用户提示">{notices.map((notice, index) => <p role="status" key={`${notice}-${index}`}>{notice}</p>)}</aside>
   </>
 }
 
@@ -114,6 +119,9 @@ describe("strategy policy save flow", () => {
     expect(document.querySelector("output")?.textContent).toBe("LONG_ONLY")
     expect(document.querySelector("output")?.getAttribute("data-dirty")).toBe("true")
     expect(run).not.toHaveBeenCalled()
+    expect(document.querySelectorAll('[role="status"]')).toHaveLength(1)
+    expect(document.querySelector('[role="status"]')?.textContent).toBe("保存期间有新的修改，请再次保存后再运行")
+    expect(document.body.textContent).not.toContain("SAVE_REQUIRES_RESAVE")
 
     await click("save")
     expect(save).toHaveBeenCalledTimes(2)

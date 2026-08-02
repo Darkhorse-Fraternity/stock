@@ -178,6 +178,24 @@ export function parseStrategyPerformancePayload(input: unknown): StrategyPerform
     literal(position.borrow_rate_source, borrowSources, `${path}.borrow_rate_source`)
     truth(position.trailing_active, `${path}.trailing_active`)
     truth(position.borrow_rate_estimated, `${path}.borrow_rate_estimated`)
+    if ((position.first_entry_price === null) !== (position.first_entry_at === null)) {
+      throw new TypeError(`${path} first_entry_price and first_entry_at must be present together`)
+    }
+    if (position.side === "LONG" && (
+      position.borrow_rate_pct !== null
+      || position.borrow_rate_source !== "unavailable"
+      || position.borrow_rate_estimated !== false
+    )) {
+      throw new TypeError(`${path} LONG borrow contract is contradictory`)
+    }
+    if (position.side === "SHORT" && (
+      position.borrow_rate_pct === null
+      || number(position.borrow_rate_pct) < 0
+      || position.borrow_rate_source !== "strategy_estimate"
+      || position.borrow_rate_estimated !== true
+    )) {
+      throw new TypeError(`${path} SHORT borrow contract is contradictory`)
+    }
   })
   list(payload.orders, "orders").forEach((item, index) => {
     const path = `orders[${index}]`

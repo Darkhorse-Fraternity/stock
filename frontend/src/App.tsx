@@ -68,7 +68,7 @@ import {
   type UsMarketDataStatus,
 } from "@/lib/api"
 import { cn } from "@/lib/utils"
-import { PolicyNumberInput, useStrategySaveFlow } from "@/strategy-policy"
+import { PolicyNumberInput, shouldSuppressStrategyRunError, useStrategySaveFlow } from "@/strategy-policy"
 
 type StatusFilter = "all" | "enabled" | "available" | "planned"
 const usInapplicableParameters = new Set([
@@ -553,7 +553,7 @@ function StrategyRunSheet({
       queryClient.invalidateQueries({ queryKey: ["strategy-runs", strategyId] })
       toast.success("策略已开始执行")
     },
-    onError: (error) => { if (error.message !== "SAVE_CANCELLED") toast.error(error.message) },
+    onError: (error) => { if (!shouldSuppressStrategyRunError(error)) toast.error(error.message) },
   })
   const currentRun = runQuery.data
   const running = currentRun?.status === "queued" || currentRun?.status === "running"

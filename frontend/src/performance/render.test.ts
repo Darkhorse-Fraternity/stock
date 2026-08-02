@@ -169,6 +169,31 @@ describe("strategy performance runtime", () => {
   })
 
   it.each([
+    ["entry price without time", (position: Record<string, unknown>) => { position.first_entry_at = null }],
+    ["entry time without price", (position: Record<string, unknown>) => { position.first_entry_price = null }],
+    ["LONG borrow rate", (position: Record<string, unknown>) => { position.position_side = "LONG"; position.side = "LONG"; position.borrow_rate_source = "unavailable"; position.borrow_rate_estimated = false }],
+    ["LONG borrow source", (position: Record<string, unknown>) => { position.position_side = "LONG"; position.side = "LONG"; position.borrow_rate_pct = null; position.borrow_rate_estimated = false }],
+    ["LONG estimated borrow", (position: Record<string, unknown>) => { position.position_side = "LONG"; position.side = "LONG"; position.borrow_rate_pct = null; position.borrow_rate_source = "unavailable" }],
+    ["SHORT missing borrow rate", (position: Record<string, unknown>) => { position.borrow_rate_pct = null }],
+    ["SHORT negative borrow rate", (position: Record<string, unknown>) => { position.borrow_rate_pct = -0.01 }],
+    ["SHORT unavailable borrow source", (position: Record<string, unknown>) => { position.borrow_rate_source = "unavailable" }],
+    ["SHORT unestimated borrow", (position: Record<string, unknown>) => { position.borrow_rate_estimated = false }],
+  ])("rejects contradictory position contract: %s", (_label, mutate) => {
+    const malformed = structuredClone(fixture) as unknown as Record<string, unknown>
+    mutate((malformed.positions as unknown[])[0] as Record<string, unknown>)
+    expect(() => parseStrategyPerformancePayload(malformed)).toThrow(/position/i)
+  })
+
+  it.each([
+    ["SHORT", (position: Record<string, unknown>) => { void position.side }],
+    ["LONG", (position: Record<string, unknown>) => { Object.assign(position, { position_side: "LONG", side: "LONG", position_mode: "NORMAL", borrow_rate_pct: null, borrow_rate_source: "unavailable", borrow_rate_estimated: false }) }],
+  ])("accepts exact %s borrow contract", (side, mutate) => {
+    const valid = structuredClone(fixture) as unknown as Record<string, unknown>
+    mutate((valid.positions as unknown[])[0] as Record<string, unknown>)
+    expect(parseStrategyPerformancePayload(valid).positions[0].side).toBe(side)
+  })
+
+  it.each([
     ["payload market", (value: Record<string, unknown>) => { value.market = "hk" }],
     ["strategy market mismatch", (value: Record<string, unknown>) => { (value.strategy as Record<string, unknown>).market = "cn" }],
     ["exposure mode", (value: Record<string, unknown>) => { ((value.strategy as Record<string, unknown>).exposure_policy as Record<string, unknown>).mode = "FLAT" }],
