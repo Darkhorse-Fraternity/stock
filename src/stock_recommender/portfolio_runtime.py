@@ -17,6 +17,7 @@ from .portfolio_engine.contracts import (
     DecisionBatch,
     MarketSnapshot,
     PerformanceProjectionRequest,
+    PortfolioPerformanceLedgerView,
     PerformanceStrategySource,
     RevisionTransition,
     StrategyPerformanceProjection,
@@ -93,6 +94,14 @@ class MarketAdapterQuoteProvider:
         symbols: tuple[str, ...],
         occurred_at: datetime,
     ) -> MarketSnapshot:
+        snapshot, _ = self.snapshot_with_warning(symbols, occurred_at)
+        return snapshot
+
+    def snapshot_with_warning(
+        self,
+        symbols: tuple[str, ...],
+        occurred_at: datetime,
+    ) -> tuple[MarketSnapshot, str | None]:
         captured_at = _utc_datetime(occurred_at)
         rows, error = self._adapter.fetch_watchlist(
             ({"symbol": symbol} for symbol in symbols),
@@ -139,11 +148,13 @@ class MarketAdapterQuoteProvider:
         if symbols and not quotes:
             raise RuntimeError(error or "portfolio quote snapshot is empty")
         market = strategy_market(self._strategy)
-        return MarketSnapshot(
+        snapshot = MarketSnapshot(
             id=_snapshot_id(market, captured_at, quotes),
             occurred_at=captured_at,
             quotes=quotes,
         )
+        warning = None if error is None else str(error)
+        return snapshot, warning
 
 
 class FailClosedBorrowProvider:
@@ -360,13 +371,13 @@ def project_strategy_performance(
     strategy_id = source.id
     persistent_store = JsonLedgerStore(portfolio_ledger_path(path))
     try:
-        account = persistent_store.load(strategy_id)
+        ledger_view = persistent_store.load_performance_view(strategy_id)
         store = persistent_store
     except KeyError:
         revision = strategy.get("revision")
         if type(revision) is not int or revision < 1:
             raise ValueError("strategy.revision must be positive")
-        store = InMemoryLedgerStore()
+        store = InMemoryLedgerStore(persistent_store.path)
         account = store.create_account(
             AccountSnapshot(
                 id=f"account-{strategy_id}",
@@ -377,20 +388,29 @@ def project_strategy_performance(
                 snapshot_id=f"projection-{strategy_id}-r{revision}",
             )
         )
+        ledger_view = PortfolioPerformanceLedgerView(account=account)
+    account = ledger_view.account
     symbols = tuple(held.symbol for held in account.positions)
     quote_error = None
     valuation_source = "live_quote"
     if symbols:
         try:
-            live_market = MarketAdapterQuoteProvider(adapter, strategy).snapshot(
+            live_market, adapter_warning = MarketAdapterQuoteProvider(
+                adapter,
+                strategy,
+            ).snapshot_with_warning(
                 symbols,
                 captured_at,
             )
             quotes = {symbol: dict(value) for symbol, value in live_market.quotes.items()}
             missing = [symbol for symbol in symbols if symbol not in quotes]
+            warnings = [adapter_warning] if adapter_warning else []
             if missing:
-                quote_error = "missing live quotes: " + ", ".join(missing)
+                warnings.append("missing live quotes: " + ", ".join(missing))
                 valuation_source = "mixed_live_and_persisted_quotes"
+            elif adapter_warning:
+                valuation_source = "degraded_live_quote"
+            quote_error = "; ".join(warnings) or None
             market_id = live_market.id
         except Exception as exc:
             quotes = {}
@@ -422,7 +442,8 @@ def project_strategy_performance(
             generated_at=captured_at,
             valuation_source=valuation_source,
             quote_error=quote_error,
-        )
+        ),
+        ledger_view=ledger_view,
     )
 
 

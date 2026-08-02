@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+import stock_recommender.portfolio_engine.ledger as ledger_module
 from stock_recommender.parameters import default_strategy_config
 from stock_recommender.portfolio_engine.contracts import (
     AccrualLifecycle,
@@ -25,6 +26,7 @@ from stock_recommender.portfolio_runtime import (
     MarketAdapterQuoteProvider,
     open_portfolio_runtime,
     process_portfolio_runtime,
+    project_strategy_performance,
 )
 from stock_recommender.reports import format_portfolio_snapshot
 
@@ -60,6 +62,30 @@ class Adapter:
 
 
 class PortfolioRuntimeTests(unittest.TestCase):
+    def _create_performance_account(self, path: Path) -> JsonLedgerStore:
+        store = JsonLedgerStore(path)
+        store.create_account(
+            AccountSnapshot(
+                id="account-runtime-us",
+                strategy_id="runtime-us",
+                strategy_revision=2,
+                occurred_at=NOW,
+                available_cash=99_000.0,
+                positions=(
+                    PositionSnapshot(
+                        symbol="AAPL",
+                        side=PositionSide.LONG,
+                        quantity=10,
+                        average_cost=100.0,
+                        current_price=100.0,
+                        sellable_quantity=10,
+                    ),
+                ),
+                snapshot_id="runtime-performance-snapshot",
+            )
+        )
+        return store
+
     def test_runtime_boundaries_reject_naive_time_and_normalize_aware_time_to_utc(self):
         naive = NOW.replace(tzinfo=None)
         with self.assertRaisesRegex(ValueError, "timezone-aware"):
@@ -110,6 +136,64 @@ class PortfolioRuntimeTests(unittest.TestCase):
             },
         )
         self.assertEqual(adapter.calls[0][0], ({"symbol": "AAPL"},))
+
+    def test_performance_request_reads_one_consistent_ledger_view_and_decodes_batches_once(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            store = self._create_performance_account(path)
+            store.commit(
+                DecisionBatch(
+                    run_key="runtime-performance-run",
+                    strategy_id="runtime-us",
+                    strategy_revision=2,
+                    portfolio_snapshot_id="runtime-performance-snapshot",
+                    market_snapshot_id="runtime-performance-market",
+                    request_fingerprint="runtime-performance-request",
+                )
+            )
+            original_read = JsonLedgerStore._read_store_payload
+            original_decode = ledger_module._batch_from_canonical_json
+            counts = {"read": 0, "decode": 0}
+
+            def counted_read(bound_store, **kwargs):
+                counts["read"] += 1
+                return original_read(bound_store, **kwargs)
+
+            def counted_decode(payload):
+                counts["decode"] += 1
+                return original_decode(payload)
+
+            with patch.object(JsonLedgerStore, "_read_store_payload", counted_read), patch.object(
+                ledger_module,
+                "_batch_from_canonical_json",
+                counted_decode,
+            ):
+                project_strategy_performance(
+                    strategy(),
+                    path=path,
+                    adapter=Adapter([{"symbol": "AAPL", "price": 110.0}]),
+                    occurred_at=NOW + timedelta(minutes=5),
+                )
+
+        self.assertEqual(counts, {"read": 1, "decode": 1})
+
+    def test_complete_us_fallback_rows_preserve_warning_and_degraded_source(self):
+        with TemporaryDirectory() as temporary:
+            path = Path(temporary) / "portfolio-v2.json"
+            self._create_performance_account(path)
+            projection = project_strategy_performance(
+                strategy(),
+                path=path,
+                adapter=Adapter(
+                    [{"symbol": "AAPL", "price": 111.0, "percent": 1.5}],
+                    error="alpaca fallback served complete rows",
+                ),
+                occurred_at=NOW + timedelta(minutes=5),
+            )
+
+        self.assertEqual(projection.quote_error, "alpaca fallback served complete rows")
+        self.assertEqual(projection.nav_history[-1].source, "degraded_live_quote")
+        self.assertEqual(projection.positions[0].current_price, 111.0)
 
     def test_snapshot_id_is_bound_to_complete_canonical_quote_content(self):
         first_rows = [

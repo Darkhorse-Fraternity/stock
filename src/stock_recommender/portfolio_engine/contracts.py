@@ -1759,6 +1759,8 @@ class PerformanceStrategySource(_DeeplyImmutable):
         ):
             _require_string(getattr(self, field_name), field_name)
         _require_integer(self.revision, "revision")
+        if self.revision <= 0:
+            raise ValueError("revision must be positive")
         _require_positive_finite_number(self.initial_cash, "initial_cash")
         _require_integer(self.max_positions, "max_positions")
         if self.max_positions <= 0:
@@ -1823,6 +1825,40 @@ class PerformanceSummary(_DeeplyImmutable):
     closed_trade_count: int | None
     win_rate_pct: float | None
 
+    def __post_init__(self) -> None:
+        _require_positive_finite_number(self.initial_cash, "initial_cash")
+        _require_nonnegative_finite_number(self.nav, "nav")
+        for field_name in ("cash", "reserved_cash", "market_value"):
+            _require_nonnegative_finite_number(getattr(self, field_name), field_name)
+        _require_finite_number(self.cumulative_return_pct, "cumulative_return_pct")
+        if self.maximum_drawdown_pct is not None:
+            _require_nonnegative_finite_number(
+                self.maximum_drawdown_pct,
+                "maximum_drawdown_pct",
+            )
+        if self.realized_pnl is not None:
+            _require_finite_number(self.realized_pnl, "realized_pnl")
+        _require_finite_number(self.unrealized_pnl, "unrealized_pnl")
+        for field_name in ("position_count", "max_positions"):
+            value = getattr(self, field_name)
+            _require_integer(value, field_name)
+            if value < 0:
+                raise ValueError(f"{field_name} must be nonnegative")
+        if self.max_positions == 0:
+            raise ValueError("max_positions must be positive")
+        if self.position_count > self.max_positions:
+            raise ValueError("position_count must not exceed max_positions")
+        if self.target_exposure_pct is not None:
+            _require_finite_number(self.target_exposure_pct, "target_exposure_pct")
+        if self.closed_trade_count is not None:
+            _require_integer(self.closed_trade_count, "closed_trade_count")
+            if self.closed_trade_count < 0:
+                raise ValueError("closed_trade_count must be nonnegative")
+        if self.win_rate_pct is not None:
+            _require_nonnegative_finite_number(self.win_rate_pct, "win_rate_pct")
+            if self.win_rate_pct > 100:
+                raise ValueError("win_rate_pct must not exceed 100")
+
 
 @dataclass(frozen=True)
 class PerformanceRuntime(_DeeplyImmutable):
@@ -1846,6 +1882,8 @@ class PerformanceRuntime(_DeeplyImmutable):
             _require_string(self.last_successful_pipeline_run_id, "last_successful_pipeline_run_id")
         if self.last_pipeline_admitted is not None:
             _require_integer(self.last_pipeline_admitted, "last_pipeline_admitted")
+            if self.last_pipeline_admitted < 0:
+                raise ValueError("last_pipeline_admitted must be nonnegative")
         if self.last_pipeline_stages is not None:
             stages = _mapping_tuple(self.last_pipeline_stages, "last_pipeline_stages")
             object.__setattr__(
@@ -1877,6 +1915,20 @@ class PerformanceNavPoint(_DeeplyImmutable):
     trading_mode: str | None
     source: str
 
+    def __post_init__(self) -> None:
+        _require_datetime(self.at, "at")
+        _require_nonnegative_finite_number(self.nav, "nav")
+        _require_nonnegative_finite_number(self.cash, "cash")
+        _require_nonnegative_finite_number(self.market_value, "market_value")
+        _require_finite_number(self.cumulative_return_pct, "cumulative_return_pct")
+        if self.drawdown_pct is not None:
+            _require_nonnegative_finite_number(self.drawdown_pct, "drawdown_pct")
+        for field_name in ("risk_level", "trading_mode"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_string(value, field_name)
+        _require_string(self.source, "source")
+
 
 @dataclass(frozen=True)
 class PerformancePosition(_DeeplyImmutable):
@@ -1898,6 +1950,46 @@ class PerformancePosition(_DeeplyImmutable):
     market_value: float
     average_cost: float
     position_side: str
+
+    def __post_init__(self) -> None:
+        _require_integer(self.slot_id, "slot_id")
+        if self.slot_id <= 0:
+            raise ValueError("slot_id must be positive")
+        _require_string(self.name, "name")
+        _require_string(self.symbol, "symbol")
+        if (self.first_entry_price is None) != (self.first_entry_at is None):
+            raise ValueError("first_entry_price and first_entry_at must be present together")
+        if self.first_entry_price is not None:
+            _require_positive_finite_number(self.first_entry_price, "first_entry_price")
+            _require_datetime(self.first_entry_at, "first_entry_at")
+        _require_positive_finite_number(self.current_price, "current_price")
+        for field_name in (
+            "day_change_pct",
+            "exit_distance_pct",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_finite_number(value, field_name)
+        for field_name in ("return_pct", "unrealized_pnl", "weight_pct"):
+            _require_finite_number(getattr(self, field_name), field_name)
+        _require_integer(self.quantity, "quantity")
+        if self.quantity <= 0:
+            raise ValueError("quantity must be positive")
+        if self.sellable_quantity is not None:
+            _require_integer(self.sellable_quantity, "sellable_quantity")
+            if not 0 <= self.sellable_quantity <= self.quantity:
+                raise ValueError("sellable_quantity must be between zero and quantity")
+        if type(self.trailing_active) is not bool:
+            raise TypeError("trailing_active must be a boolean")
+        if self.signal_invalid_days is not None:
+            _require_integer(self.signal_invalid_days, "signal_invalid_days")
+            if self.signal_invalid_days < 0:
+                raise ValueError("signal_invalid_days must be nonnegative")
+        _require_nonnegative_finite_number(self.market_value, "market_value")
+        _require_positive_finite_number(self.average_cost, "average_cost")
+        _require_string(self.position_side, "position_side")
+        if self.position_side not in {item.value for item in PositionSide}:
+            raise ValueError("position_side must be LONG or SHORT")
 
 
 @dataclass(frozen=True)
@@ -1931,6 +2023,66 @@ class PerformanceOrder(_DeeplyImmutable):
     replacement_candidate: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
+        for field_name in ("id", "symbol", "name", "reason"):
+            _require_string(getattr(self, field_name), field_name)
+        _require_string(self.side, "side")
+        if self.side not in {item.value for item in OrderSide}:
+            raise ValueError("side must be BUY or SELL")
+        _require_integer(self.quantity, "quantity")
+        if self.quantity <= 0:
+            raise ValueError("quantity must be positive")
+        _require_integer(self.filled_quantity, "filled_quantity")
+        if not 0 <= self.filled_quantity <= self.quantity:
+            raise ValueError("filled_quantity must be between zero and quantity")
+        _require_string(self.status, "status")
+        if self.status not in {"INTENDED", "PARTIAL", "FILLED", "CANCELLED", "EXPIRED"}:
+            raise ValueError("unsupported order status")
+        if self.status == "INTENDED" and self.filled_quantity != 0:
+            raise ValueError("INTENDED order must not have fills")
+        if self.status == "PARTIAL" and not 0 < self.filled_quantity < self.quantity:
+            raise ValueError("PARTIAL order must be partially filled")
+        if self.status == "FILLED" and self.filled_quantity != self.quantity:
+            raise ValueError("FILLED order quantity must be complete")
+        _require_datetime(self.created_at, "created_at")
+        _require_datetime(self.updated_at, "updated_at")
+        if self.updated_at < self.created_at:
+            raise ValueError("updated_at must not precede created_at")
+        for field_name in (
+            "filled_notional",
+            "commission_charged",
+            "fees_charged",
+        ):
+            _require_nonnegative_finite_number(getattr(self, field_name), field_name)
+        if self.commission_charged > self.fees_charged:
+            raise ValueError("commission_charged must not exceed fees_charged")
+        if self.strategy_revision is not None:
+            _require_integer(self.strategy_revision, "strategy_revision")
+            if self.strategy_revision <= 0:
+                raise ValueError("strategy_revision must be positive")
+        _require_string(self.position_side, "position_side")
+        if self.position_side not in {item.value for item in PositionSide}:
+            raise ValueError("position_side must be LONG or SHORT")
+        _require_string(self.position_effect, "position_effect")
+        if self.position_effect not in {item.value for item in PositionEffect}:
+            raise ValueError("unsupported position_effect")
+        for field_name in ("key", "purpose", "valid_date", "valid_session_date", "cancel_reason"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_string(value, field_name)
+        if self.purpose is not None and self.purpose not in {"ENTRY", "EXIT"}:
+            raise ValueError("purpose must be ENTRY or EXIT")
+        for field_name in ("control_epoch", "slot_id"):
+            value = getattr(self, field_name)
+            if value is not None:
+                _require_integer(value, field_name)
+                if value <= 0:
+                    raise ValueError(f"{field_name} must be positive")
+        if self.signal_price is not None:
+            _require_positive_finite_number(self.signal_price, "signal_price")
+        if self.score is not None:
+            _require_finite_number(self.score, "score")
+        if self.reserved_cash is not None:
+            _require_nonnegative_finite_number(self.reserved_cash, "reserved_cash")
         if self.replacement_candidate is not None:
             _require_mapping(self.replacement_candidate, "replacement_candidate")
             object.__setattr__(
@@ -1955,6 +2107,24 @@ class PerformanceClosedTrade(_DeeplyImmutable):
     strategy_revision: int
     position_side: str
 
+    def __post_init__(self) -> None:
+        for field_name in ("id", "name", "symbol", "reason"):
+            _require_string(getattr(self, field_name), field_name)
+        _require_positive_finite_number(self.entry_price, "entry_price")
+        _require_positive_finite_number(self.exit_price, "exit_price")
+        _require_integer(self.quantity, "quantity")
+        if self.quantity <= 0:
+            raise ValueError("quantity must be positive")
+        _require_finite_number(self.realized_pnl, "realized_pnl")
+        _require_finite_number(self.return_pct, "return_pct")
+        _require_datetime(self.closed_at, "closed_at")
+        _require_integer(self.strategy_revision, "strategy_revision")
+        if self.strategy_revision <= 0:
+            raise ValueError("strategy_revision must be positive")
+        _require_string(self.position_side, "position_side")
+        if self.position_side not in {item.value for item in PositionSide}:
+            raise ValueError("position_side must be LONG or SHORT")
+
 
 @dataclass(frozen=True)
 class PerformanceEventView(_DeeplyImmutable):
@@ -1967,6 +2137,15 @@ class PerformanceEventView(_DeeplyImmutable):
     data: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        for field_name in ("id", "type", "message"):
+            _require_string(getattr(self, field_name), field_name)
+        _require_datetime(self.occurred_at, "occurred_at")
+        if self.strategy_revision is not None:
+            _require_integer(self.strategy_revision, "strategy_revision")
+            if self.strategy_revision <= 0:
+                raise ValueError("strategy_revision must be positive")
+        if self.key is not None:
+            _require_string(self.key, "key")
         _require_mapping(self.data, "data")
         object.__setattr__(self, "data", _deep_freeze(self.data))
 

@@ -470,6 +470,20 @@ class PortfolioEngineServiceTests(unittest.TestCase):
         self.assertEqual(trades[0].exit_price, 110.0)
         self.assertEqual(trades[0].realized_pnl, 50.0)
 
+        lifecycle = service._replay_portfolio_lifecycle(
+            (opened, closed),
+            progress,
+            {opened.id: 3, closed.id: 3},
+            source,
+            3,
+            True,
+            None,
+            expected_positions=(expected_position,),
+        )
+        current_lot = lifecycle.current_lots[("L", PositionSide.LONG)]
+        self.assertEqual(current_lot.first_entry_price, 120.0)
+        self.assertEqual(current_lot.first_entry_at, NOW + timedelta(minutes=30))
+
         trades, complete, reason = service._replay_closed_trades(
             (opened, closed),
             progress,
@@ -710,6 +724,200 @@ class PortfolioEngineServiceTests(unittest.TestCase):
             "StrategyPerformanceProjection",
         ):
             self.assertIs(getattr(public_portfolio_engine, name), getattr(contracts, name))
+
+    def test_performance_contracts_reject_invalid_types_values_and_naive_time(self):
+        valid_order = contracts.PerformanceOrder(
+            id="order-1",
+            side="BUY",
+            symbol="AAPL",
+            name="Apple",
+            quantity=2,
+            filled_quantity=1,
+            status="PARTIAL",
+            reason="signal",
+            created_at=NOW,
+            updated_at=NOW,
+            filled_notional=100.0,
+            commission_charged=0.1,
+            fees_charged=0.2,
+            strategy_revision=3,
+            position_side="LONG",
+            position_effect="OPEN",
+        )
+        with self.assertRaises(TypeError):
+            replace(valid_order, quantity="2")
+        with self.assertRaises(ValueError):
+            replace(valid_order, quantity=0)
+        with self.assertRaises(ValueError):
+            replace(valid_order, filled_quantity=-1)
+
+        valid_nav = contracts.PerformanceNavPoint(
+            at=NOW,
+            nav=100_000.0,
+            cash=99_000.0,
+            market_value=1_000.0,
+            cumulative_return_pct=0.0,
+            drawdown_pct=0.0,
+            risk_level=None,
+            trading_mode=None,
+            source="live_quote",
+        )
+        with self.assertRaises(ValueError):
+            replace(valid_nav, nav=math.nan)
+        with self.assertRaises(ValueError):
+            replace(valid_nav, at=NOW.replace(tzinfo=None))
+
+        with self.assertRaises(ValueError):
+            contracts.PerformanceRuntime(last_pipeline_admitted=-1)
+
+        payload = {"nested": {"value": 1}}
+        event = contracts.PerformanceEventView(
+            id="event-1",
+            type="ORDER_CANCELLED",
+            occurred_at=NOW,
+            message="cancelled",
+            strategy_revision=3,
+            data=payload,
+        )
+        payload["nested"]["value"] = 2
+        self.assertEqual(event.data["nested"]["value"], 1)
+        with self.assertRaises(TypeError):
+            event.data["new"] = "not mutable"
+
+    def test_revision_transition_is_terminal_for_unfilled_and_partial_orders(self):
+        unfilled = contracts.OrderIntent(
+            id="revision-unfilled",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=contracts.OrderSide.BUY,
+            position_effect=contracts.PositionEffect.OPEN,
+            quantity=2,
+            reason="entry signal",
+            created_snapshot_id="market-before-revision",
+            created_market_at=NOW,
+        )
+        partial = replace(
+            unfilled,
+            id="revision-partial",
+            symbol="MSFT",
+            created_market_at=NOW + timedelta(minutes=1),
+        )
+        fill_at = NOW + timedelta(minutes=2)
+        fill_id = contracts.stable_execution_progress_fill_id(
+            intent_id=partial.id,
+            symbol=partial.symbol,
+            position_side=partial.position_side,
+            order_side=partial.order_side,
+            snapshot_id="market-partial",
+            occurred_at=fill_at,
+            quantity=1,
+            price=100.0,
+            fees=0.0,
+            commission=0.0,
+            status="PARTIAL",
+        )
+        progress = contracts.OrderExecutionProgress(
+            intent_id=partial.id,
+            symbol=partial.symbol,
+            position_side=partial.position_side,
+            order_side=partial.order_side,
+            intent_quantity=2,
+            execution_policy_fingerprint="revision-policy",
+            fills=(
+                contracts.ExecutionProgressFill(
+                    id=fill_id,
+                    intent_id=partial.id,
+                    symbol=partial.symbol,
+                    position_side=partial.position_side,
+                    order_side=partial.order_side,
+                    snapshot_id="market-partial",
+                    occurred_at=fill_at,
+                    quantity=1,
+                    price=100.0,
+                    fees=0.0,
+                    commission=0.0,
+                    status="PARTIAL",
+                ),
+            ),
+        )
+        transitioned_at = NOW + timedelta(minutes=10)
+        transition = contracts.PortfolioEvent(
+            id="revision-transition",
+            type="REVISION_TRANSITIONED",
+            occurred_at=transitioned_at,
+            data={
+                "from_revision": 3,
+                "to_revision": 4,
+                "cancelled_intent_ids": (unfilled.id, partial.id),
+            },
+        )
+        current_account = replace(
+            account("revision-account"),
+            strategy_revision=4,
+            occurred_at=transitioned_at,
+        )
+        batch = contracts.DecisionBatch(
+            run_key="revision-orders",
+            strategy_id="strategy-us",
+            strategy_revision=3,
+            portfolio_snapshot_id="revision-account",
+            market_snapshot_id="market-before-revision",
+            intents=(unfilled, partial),
+        )
+        view = contracts.PortfolioPerformanceLedgerView(
+            account=current_account,
+            intents=(unfilled, partial),
+            execution_progress=(progress,),
+            events=(transition,),
+            batches=(batch,),
+            lifecycle_complete=False,
+            lifecycle_reason="fixture omits account-open lifecycle",
+        )
+        source = contracts.PerformanceStrategySource(
+            id="strategy-us",
+            name="revision projection",
+            revision=4,
+            stage="paper",
+            market="us",
+            market_label="美股",
+            currency="USD",
+            currency_symbol="$",
+            initial_cash=100_000.0,
+            max_positions=10,
+        )
+        request = contracts.PerformanceProjectionRequest(
+            strategy=source,
+            market=MarketSnapshot(id="revision-market", occurred_at=transitioned_at, quotes={}),
+            generated_at=transitioned_at,
+            valuation_source="persisted_quote_fallback",
+        )
+        engine = service.PortfolioEngine()
+        projection = engine.performance_projection(request, ledger_view=view)
+        with self.assertRaisesRegex(ValueError, "strategy_id"):
+            engine.performance_projection(
+                request,
+                ledger_view=replace(
+                    view,
+                    account=replace(current_account, strategy_id="another-strategy"),
+                ),
+            )
+        with self.assertRaisesRegex(ValueError, "strategy_revision"):
+            engine.performance_projection(
+                request,
+                ledger_view=replace(
+                    view,
+                    account=replace(current_account, strategy_revision=3),
+                ),
+            )
+
+        by_id = {order.id: order for order in projection.orders}
+        self.assertEqual(by_id[unfilled.id].status, "CANCELLED")
+        self.assertEqual(by_id[unfilled.id].filled_quantity, 0)
+        self.assertEqual(by_id[partial.id].status, "CANCELLED")
+        self.assertEqual(by_id[partial.id].filled_quantity, 1)
+        for order in by_id.values():
+            self.assertEqual(order.updated_at, transitioned_at)
+            self.assertEqual(order.cancel_reason, "STRATEGY_REVISION_TRANSITION")
 
     def _built_in_short_decision(
         self,

@@ -951,7 +951,11 @@ def _validate_account(account: AccountSnapshot) -> None:
         raise LedgerError("reserved_cash exceeds available_cash")
 
 
-def validate_ledger_payload(payload: object) -> dict[str, Any]:
+def validate_ledger_payload(
+    payload: object,
+    *,
+    decoded_run_results: dict[str, tuple[DecisionBatch, ...]] | None = None,
+) -> dict[str, Any]:
     """Validate a decoded v2 payload without reading or mutating a store."""
 
     if not isinstance(payload, dict):
@@ -1225,6 +1229,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                 "committed batches and canonical risk facts must be append-only one-to-one"
             )
         run_result_keys: set[str] = set()
+        account_run_results: list[DecisionBatch] = []
         for index, raw_result in enumerate(item["run_results"]):
             result = _require_mapping(raw_result, f"run_results[{index}]")
             _require_keys(
@@ -1260,6 +1265,7 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
             if committed_batch is None:
                 raise LedgerSchemaError("run result references an uncommitted run")
             decoded_batch = _batch_from_canonical_json(result["batch"])
+            account_run_results.append(decoded_batch)
             if canonical_graph(decoded_batch) != result["batch"]:
                 raise LedgerSchemaError("run result batch graph is not canonical")
             if (
@@ -1289,10 +1295,16 @@ def validate_ledger_payload(payload: object) -> dict[str, Any]:
                     "canonical run result fingerprint differs from committed batch"
                 )
             run_result_keys.add(run_key)
+        if decoded_run_results is not None:
+            decoded_run_results[strategy_id] = tuple(account_run_results)
     return payload
 
 
-def _read_store(path: Path) -> dict[str, Any]:
+def _read_store(
+    path: Path,
+    *,
+    decoded_run_results: dict[str, tuple[DecisionBatch, ...]] | None = None,
+) -> dict[str, Any]:
     try:
         raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1308,7 +1320,7 @@ def _read_store(path: Path) -> dict[str, Any]:
         )
     except json.JSONDecodeError as exc:
         raise LedgerSchemaError(f"ledger JSON cannot be parsed: {exc.msg}") from exc
-    return validate_ledger_payload(payload)
+    return validate_ledger_payload(payload, decoded_run_results=decoded_run_results)
 
 
 def _atomic_write(path: Path, payload: Mapping[str, Any]) -> None:
@@ -2189,8 +2201,12 @@ class JsonLedgerStore:
     def __init__(self, path: str | Path):
         self.path = Path(path).expanduser()
 
-    def _read_store_payload(self) -> dict[str, Any]:
-        return _read_store(self.path)
+    def _read_store_payload(
+        self,
+        *,
+        decoded_run_results: dict[str, tuple[DecisionBatch, ...]] | None = None,
+    ) -> dict[str, Any]:
+        return _read_store(self.path, decoded_run_results=decoded_run_results)
 
     def _validate_store_for_write(self, payload: Mapping[str, Any]) -> None:
         validate_ledger_payload(payload)
@@ -2428,7 +2444,8 @@ class JsonLedgerStore:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
         with _PROCESS_LOCK, transaction_guard((self.path,)):
-            store = self._read_store_payload()
+            decoded_run_results: dict[str, tuple[DecisionBatch, ...]] = {}
+            store = self._read_store_payload(decoded_run_results=decoded_run_results)
             try:
                 payload = _require_mapping(store["accounts"][strategy_id], "account")
             except KeyError as exc:
@@ -2453,13 +2470,8 @@ class JsonLedgerStore:
                 payload["committed_batches"],
                 "account.committed_batches",
             )
-            results = _require_list(payload["run_results"], "account.run_results")
-            batches = tuple(
-                _batch_from_canonical_json(
-                    _require_mapping(item, "account.run_results.item")["batch"]
-                )
-                for item in results
-            )
+            _require_list(payload["run_results"], "account.run_results")
+            batches = decoded_run_results.get(strategy_id, ())
             intents_by_id: dict[str, OrderIntent] = {}
             lifecycle_complete = len(batches) == len(committed)
             reason = (
@@ -2765,7 +2777,16 @@ class InMemoryLedgerStore(JsonLedgerStore):
             "accounts": {},
         }
 
-    def _read_store_payload(self) -> dict[str, Any]:
+    def _read_store_payload(
+        self,
+        *,
+        decoded_run_results: dict[str, tuple[DecisionBatch, ...]] | None = None,
+    ) -> dict[str, Any]:
+        if decoded_run_results is not None:
+            validate_ledger_payload(
+                self._payload,
+                decoded_run_results=decoded_run_results,
+            )
         return self._payload
 
     def _validate_store_for_write(self, payload: Mapping[str, Any]) -> None:

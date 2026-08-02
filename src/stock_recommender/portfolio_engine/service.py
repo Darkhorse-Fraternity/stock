@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import Any, Callable, Iterable, Mapping
 
 from ..markets import market_date
@@ -38,6 +39,7 @@ from .contracts import (
     PerformanceSummary,
     PlanRequest,
     PortfolioSnapshot,
+    PortfolioPerformanceLedgerView,
     PositionEffect,
     PositionRiskUpdate,
     PositionSide,
@@ -343,7 +345,29 @@ def _exit_distance_pct(position: object, config: Mapping[str, Any]) -> float | N
     return ((min(thresholds) - price) / price * 100.0) if thresholds else None
 
 
-def _replay_closed_trades(
+@dataclass(frozen=True)
+class _CurrentLotLifecycle:
+    symbol: str
+    position_side: PositionSide
+    quantity: int
+    average_cost: float
+    first_entry_price: float
+    first_entry_at: datetime
+
+
+@dataclass(frozen=True)
+class _PortfolioLifecycleReplay:
+    closed_trades: tuple[PerformanceClosedTrade, ...]
+    current_lots: Mapping[tuple[str, PositionSide], _CurrentLotLifecycle]
+    complete: bool
+    reason: str | None
+
+
+def _unavailable_lifecycle(reason: str | None) -> _PortfolioLifecycleReplay:
+    return _PortfolioLifecycleReplay((), MappingProxyType({}), False, reason)
+
+
+def _replay_portfolio_lifecycle(
     intents: tuple[OrderIntent, ...],
     progress_by_intent: Mapping[str, object],
     revision_by_intent: Mapping[str, int],
@@ -353,19 +377,19 @@ def _replay_closed_trades(
     lifecycle_reason: str | None,
     *,
     expected_positions: tuple[object, ...] | None = None,
-) -> tuple[tuple[PerformanceClosedTrade, ...], bool, str | None]:
+) -> _PortfolioLifecycleReplay:
     """Replay canonical fills with the same weighted-average position accounting."""
 
     if not lifecycle_complete:
-        return (), False, lifecycle_reason
-    states: dict[tuple[str, PositionSide], dict[str, float | int | str]] = {}
+        return _unavailable_lifecycle(lifecycle_reason)
+    states: dict[tuple[str, PositionSide], dict[str, object]] = {}
     trades: list[PerformanceClosedTrade] = []
     intent_by_id = {intent.id: intent for intent in intents}
     timeline: list[tuple[object, OrderIntent, object]] = []
     for progress in progress_by_intent.values():
         intent = intent_by_id.get(progress.intent_id)
         if intent is None:
-            return (), False, "execution progress has no canonical intent"
+            return _unavailable_lifecycle("execution progress has no canonical intent")
         for fill in progress.fills:
             timeline.append((fill, intent, progress))
     timeline.sort(
@@ -383,7 +407,9 @@ def _replay_closed_trades(
         if intent.position_effect in {PositionEffect.OPEN, PositionEffect.INCREASE}:
             if state is None:
                 if intent.position_effect is PositionEffect.INCREASE:
-                    return (), False, "an increase has no reconstructable open position"
+                    return _unavailable_lifecycle(
+                        "an increase has no reconstructable open position"
+                    )
                 state = {
                     "quantity": 0,
                     "average_cost": 0.0,
@@ -395,13 +421,17 @@ def _replay_closed_trades(
                     "exit_fees": 0.0,
                     "raw_realized": 0.0,
                     "open_intent_id": intent.id,
+                    "first_entry_price": fill.price,
+                    "first_entry_at": fill.occurred_at,
                 }
                 states[key] = state
             elif (
                 intent.position_effect is PositionEffect.OPEN
                 and state.get("open_intent_id") != intent.id
             ):
-                return (), False, "an open fill overlaps a reconstructed position"
+                return _unavailable_lifecycle(
+                    "an open fill overlaps a reconstructed position"
+                )
             quantity = int(state["quantity"])
             average_cost = float(state["average_cost"])
             next_quantity = quantity + fill.quantity
@@ -416,11 +446,11 @@ def _replay_closed_trades(
             state["entry_fees"] = float(state["entry_fees"]) + fill.fees
             continue
         if state is None:
-            return (), False, "an exit has no reconstructable open position"
+            return _unavailable_lifecycle("an exit has no reconstructable open position")
         direction = 1.0 if intent.position_side is PositionSide.LONG else -1.0
         quantity = int(state["quantity"])
         if fill.quantity > quantity:
-            return (), False, "exit fills exceed the reconstructed position"
+            return _unavailable_lifecycle("exit fills exceed the reconstructed position")
         average_cost = float(state["average_cost"])
         state["raw_realized"] = float(state["raw_realized"]) + (
             direction * (fill.price - average_cost) * fill.quantity
@@ -433,13 +463,17 @@ def _replay_closed_trades(
         state["exit_fees"] = float(state["exit_fees"]) + fill.fees
         if int(state["quantity"]) == 0:
             if intent.position_effect is not PositionEffect.CLOSE:
-                return (), False, "a reduce fill flattened the reconstructed position"
+                return _unavailable_lifecycle(
+                    "a reduce fill flattened the reconstructed position"
+                )
             entry_notional = float(state["entry_notional"])
             entry_quantity = int(state["entry_quantity"])
             exit_notional = float(state["exit_notional"])
             exit_quantity = int(state["exit_quantity"])
             if entry_quantity <= 0 or exit_quantity != entry_quantity:
-                return (), False, "closed lifecycle quantities do not reconcile"
+                return _unavailable_lifecycle(
+                    "closed lifecycle quantities do not reconcile"
+                )
             realized = (
                 float(state["raw_realized"])
                 - float(state["entry_fees"])
@@ -470,7 +504,9 @@ def _replay_closed_trades(
             and fill is progress.fills[-1]
             and progress.status == "FILLED"
         ):
-            return (), False, "a completed close did not flatten the reconstructed position"
+            return _unavailable_lifecycle(
+                "a completed close did not flatten the reconstructed position"
+            )
 
     if expected_positions is not None:
         expected = {
@@ -478,20 +514,66 @@ def _replay_closed_trades(
             for position in expected_positions
         }
         if set(states) != set(expected):
-            return (), False, "current positions are not explained by canonical fills"
+            return _unavailable_lifecycle(
+                "current positions are not explained by canonical fills"
+            )
         for key, position in expected.items():
             state = states[key]
             if int(state["quantity"]) != position.quantity:
-                return (), False, "current position quantity differs from canonical fills"
+                return _unavailable_lifecycle(
+                    "current position quantity differs from canonical fills"
+                )
             if not math.isclose(
                 float(state["average_cost"]),
                 position.average_cost,
                 rel_tol=1e-12,
                 abs_tol=1e-9,
             ):
-                return (), False, "current position average cost differs from canonical fills"
+                return _unavailable_lifecycle(
+                    "current position average cost differs from canonical fills"
+                )
     trades.sort(key=lambda item: item.closed_at, reverse=True)
-    return tuple(trades), True, None
+    current_lots = {
+        key: _CurrentLotLifecycle(
+            symbol=key[0],
+            position_side=key[1],
+            quantity=int(state["quantity"]),
+            average_cost=float(state["average_cost"]),
+            first_entry_price=float(state["first_entry_price"]),
+            first_entry_at=state["first_entry_at"],
+        )
+        for key, state in states.items()
+    }
+    return _PortfolioLifecycleReplay(
+        tuple(trades),
+        MappingProxyType(current_lots),
+        True,
+        None,
+    )
+
+
+def _replay_closed_trades(
+    intents: tuple[OrderIntent, ...],
+    progress_by_intent: Mapping[str, object],
+    revision_by_intent: Mapping[str, int],
+    source: object,
+    default_revision: int,
+    lifecycle_complete: bool,
+    lifecycle_reason: str | None,
+    *,
+    expected_positions: tuple[object, ...] | None = None,
+) -> tuple[tuple[PerformanceClosedTrade, ...], bool, str | None]:
+    replay = _replay_portfolio_lifecycle(
+        intents,
+        progress_by_intent,
+        revision_by_intent,
+        source,
+        default_revision,
+        lifecycle_complete,
+        lifecycle_reason,
+        expected_positions=expected_positions,
+    )
+    return replay.closed_trades, replay.complete, replay.reason
 
 
 class PortfolioEngine:
@@ -1148,16 +1230,42 @@ class PortfolioEngine:
     def performance_projection(
         self,
         request: PerformanceProjectionRequest,
+        *,
+        ledger_view: PortfolioPerformanceLedgerView | None = None,
     ) -> StrategyPerformanceProjection:
         """Project the complete report contract from typed ledger and market facts."""
 
         if type(request) is not PerformanceProjectionRequest:
             raise TypeError("request must be PerformanceProjectionRequest")
-        if self._ledger is None:
-            raise RuntimeError("PortfolioEngine requires a ledger_store for performance")
         source = request.strategy
-        snapshot = self.performance(source.id, request.market)
-        view = self._ledger.load_performance_view(source.id)
+        if ledger_view is not None and type(ledger_view) is not PortfolioPerformanceLedgerView:
+            raise TypeError("ledger_view must be PortfolioPerformanceLedgerView")
+        if ledger_view is None:
+            if self._ledger is None:
+                raise RuntimeError("PortfolioEngine requires a ledger_store for performance")
+            view = self._ledger.load_performance_view(source.id)
+        else:
+            view = ledger_view
+        if view.account.strategy_id != source.id:
+            raise ValueError("ledger_view strategy_id differs from performance strategy")
+        if view.account.strategy_revision != source.revision:
+            raise ValueError("ledger_view strategy_revision differs from performance strategy")
+        prices = {
+            held.symbol: request.market.quotes[held.symbol]["price"]
+            for held in view.account.positions
+            if held.symbol in request.market.quotes
+            and isinstance(request.market.quotes[held.symbol], Mapping)
+            and request.market.quotes[held.symbol].get("price") is not None
+        }
+        valuation = value_account(view.account, prices)
+        valued_account = replace(view.account, positions=valuation.positions)
+        snapshot = PortfolioSnapshot(
+            account=valued_account,
+            metrics=valuation.metrics,
+            positions=valuation.positions,
+            open_intents=(),
+            recent_events=view.events,
+        )
         progress_by_intent = {
             item.intent_id: item for item in view.execution_progress
         }
@@ -1166,18 +1274,19 @@ class PortfolioEngine:
             for batch in view.batches
             for intent in batch.intents
         }
-        entry_fills: dict[tuple[str, PositionSide], list[object]] = {}
-        for intent in view.intents:
-            if intent.position_effect not in {PositionEffect.OPEN, PositionEffect.INCREASE}:
-                continue
-            progress = progress_by_intent.get(intent.id)
-            if progress is None:
-                continue
-            entry_fills.setdefault((intent.symbol, intent.position_side), []).extend(
-                progress.fills
-            )
-        for fills in entry_fills.values():
-            fills.sort(key=lambda item: item.occurred_at)
+        lifecycle = _replay_portfolio_lifecycle(
+            view.intents,
+            progress_by_intent,
+            revision_by_intent,
+            source,
+            snapshot.account.strategy_revision,
+            view.lifecycle_complete,
+            view.lifecycle_reason,
+            expected_positions=view.account.positions,
+        )
+        closed_trades = lifecycle.closed_trades
+        lifecycle_complete = lifecycle.complete
+        lifecycle_reason = lifecycle.reason
 
         positions = []
         for slot_id, held in enumerate(snapshot.positions, start=1):
@@ -1193,16 +1302,17 @@ class PortfolioEngine:
                 if isinstance(quote, Mapping)
                 else None
             )
-            first_fills = entry_fills.get((held.symbol, held.side), [])
-            first_fill = first_fills[0] if first_fills else None
+            current_lot = lifecycle.current_lots.get((held.symbol, held.side))
             positions.append(
                 PerformancePosition(
                     slot_id=slot_id,
                     name=source.symbol_names.get(held.symbol, held.symbol),
                     symbol=held.symbol,
-                    first_entry_price=first_fill.price if first_fill is not None else None,
+                    first_entry_price=(
+                        current_lot.first_entry_price if current_lot is not None else None
+                    ),
                     first_entry_at=(
-                        first_fill.occurred_at if first_fill is not None else None
+                        current_lot.first_entry_at if current_lot is not None else None
                     ),
                     current_price=held.current_price,
                     day_change_pct=day_change,
@@ -1224,28 +1334,51 @@ class PortfolioEngine:
                 )
             )
 
-        cancellation_by_intent = {
-            str(event.data["intent_id"]): event
-            for event in view.events
-            if event.type in {"ORDER_CANCELLED", "ORDER_EXPIRED"}
-            and event.data.get("intent_id")
-        }
+        cancellation_by_intent: dict[str, tuple[object, str, str | None]] = {}
+        for event in view.events:
+            terminal_status = None
+            intent_ids: tuple[str, ...] = ()
+            cancellation_reason = None
+            if event.type in {"ORDER_CANCELLED", "ORDER_EXPIRED"} and event.data.get(
+                "intent_id"
+            ):
+                terminal_status = event.type.removeprefix("ORDER_")
+                intent_ids = (str(event.data["intent_id"]),)
+                if event.data.get("reason"):
+                    cancellation_reason = str(event.data["reason"])
+            elif event.type == "REVISION_TRANSITIONED":
+                raw_ids = event.data.get("cancelled_intent_ids", ())
+                if isinstance(raw_ids, tuple):
+                    intent_ids = tuple(str(intent_id) for intent_id in raw_ids)
+                terminal_status = "CANCELLED"
+                cancellation_reason = "STRATEGY_REVISION_TRANSITION"
+            if terminal_status is None:
+                continue
+            for intent_id in intent_ids:
+                current = cancellation_by_intent.get(intent_id)
+                if current is None or event.occurred_at >= current[0].occurred_at:
+                    cancellation_by_intent[intent_id] = (
+                        event,
+                        terminal_status,
+                        cancellation_reason,
+                    )
         orders = []
         for intent in view.intents:
             progress = progress_by_intent.get(intent.id)
-            cancelled = cancellation_by_intent.get(intent.id)
+            cancellation = cancellation_by_intent.get(intent.id)
+            cancelled = cancellation[0] if cancellation is not None else None
             status = (
-                progress.status
+                cancellation[1]
+                if cancellation is not None
+                else progress.status
                 if progress is not None
-                else cancelled.type.removeprefix("ORDER_")
-                if cancelled is not None
                 else "INTENDED"
             )
             updated_at = (
-                progress.fills[-1].occurred_at
-                if progress is not None
-                else cancelled.occurred_at
+                cancelled.occurred_at
                 if cancelled is not None
+                else progress.fills[-1].occurred_at
+                if progress is not None
                 else intent.created_market_at
             )
             orders.append(
@@ -1285,25 +1418,14 @@ class PortfolioEngine:
                     valid_date=None,
                     valid_session_date=None,
                     cancel_reason=(
-                        str(cancelled.data.get("reason"))
-                        if cancelled is not None and cancelled.data.get("reason")
+                        cancellation[2]
+                        if cancellation is not None
                         else None
                     ),
                     replacement_candidate=None,
                 )
             )
         orders.sort(key=lambda item: item.updated_at, reverse=True)
-
-        closed_trades, lifecycle_complete, lifecycle_reason = _replay_closed_trades(
-            view.intents,
-            progress_by_intent,
-            revision_by_intent,
-            source,
-            snapshot.account.strategy_revision,
-            view.lifecycle_complete,
-            view.lifecycle_reason,
-            expected_positions=view.account.positions,
-        )
 
         opened_events = [event for event in view.events if event.type == "ACCOUNT_OPENED"]
         opened = min(opened_events, key=lambda item: item.occurred_at) if opened_events else None
