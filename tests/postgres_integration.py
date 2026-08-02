@@ -62,24 +62,32 @@ def non_test_schemas(database_url: str) -> tuple[str, ...]:
             return tuple(str(row[0]) for row in cursor.fetchall())
 
 
-def non_test_database_fingerprint(database_url: str) -> tuple[tuple, ...]:
-    """Hash every user table definition and row multiset without returning data."""
+def non_test_database_fingerprint(
+    database_url: str,
+    *,
+    relations: tuple[tuple[str, str], ...] | None = None,
+) -> tuple[tuple, ...]:
+    """Hash selected existing user tables without returning any row content."""
 
     psycopg, sql = _psycopg()
     result = []
     with psycopg.connect(database_url) as connection:
-        tables = connection.execute(
-            r"""
-            SELECT n.nspname, c.relname
-            FROM pg_class AS c
-            JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            WHERE c.relkind IN ('r', 'p')
-              AND n.nspname <> 'information_schema'
-              AND n.nspname !~ '^pg_'
-              AND n.nspname !~ '^stock_agent_test_'
-            ORDER BY n.nspname, c.relname
-            """
-        ).fetchall()
+        tables = (
+            connection.execute(
+                r"""
+                SELECT n.nspname, c.relname
+                FROM pg_class AS c
+                JOIN pg_namespace AS n ON n.oid = c.relnamespace
+                WHERE c.relkind IN ('r', 'p')
+                  AND n.nspname <> 'information_schema'
+                  AND n.nspname !~ '^pg_'
+                  AND n.nspname !~ '^stock_agent_test_'
+                ORDER BY n.nspname, c.relname
+                """
+            ).fetchall()
+            if relations is None
+            else relations
+        )
         for schema_name, table_name in tables:
             definition_rows = connection.execute(
                 r"""

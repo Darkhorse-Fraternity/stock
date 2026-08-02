@@ -265,7 +265,7 @@ def _backtest_daily_fingerprint(
     live = store.load_view(strategy_id)
     history = store.load_performance_view(strategy_id)
     snapshot = engine.performance(strategy_id, market)
-    batches = tuple(sorted(history.batches, key=lambda item: item.run_key))
+    batches = history.batches
     runs = tuple(
         (
             batch.run_key,
@@ -385,7 +385,7 @@ def _postgres_daily_fingerprint(
                     "SELECT run_key,strategy_revision,source_snapshot_id,"
                     "result_snapshot_id,market_snapshot_id,request_fingerprint,"
                     "batch_fingerprint,batch_payload FROM {}.committed_runs "
-                    "WHERE strategy_id=%s ORDER BY run_key"
+                    "WHERE strategy_id=%s ORDER BY commit_ordinal"
                 ).format(schema),
                 (strategy_id,),
             ).fetchall()
@@ -397,7 +397,7 @@ def _postgres_daily_fingerprint(
                     "SELECT i.run_key,i.ordinal,i.payload FROM "
                     "{}.order_intents AS i JOIN {}.committed_runs AS r ON "
                     "r.strategy_id=i.strategy_id AND r.run_key=i.run_key "
-                    "WHERE i.strategy_id=%s ORDER BY r.committed_at,i.run_key,"
+                    "WHERE i.strategy_id=%s ORDER BY r.commit_ordinal,"
                     "i.ordinal,i.intent_id"
                 ).format(schema, schema),
                 (strategy_id,),
@@ -407,9 +407,11 @@ def _postgres_daily_fingerprint(
             (row[0], row[1], row[2])
             for row in connection.execute(
                 sql.SQL(
-                    "SELECT run_key,ordinal,payload FROM {}.execution_progress "
-                    "WHERE strategy_id=%s ORDER BY run_key,ordinal,intent_id"
-                ).format(schema),
+                    "SELECT p.run_key,p.ordinal,p.payload FROM "
+                    "{}.execution_progress AS p JOIN {}.committed_runs AS r ON "
+                    "r.strategy_id=p.strategy_id AND r.run_key=p.run_key "
+                    "WHERE p.strategy_id=%s ORDER BY r.commit_ordinal,p.ordinal,p.intent_id"
+                ).format(schema, schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -417,9 +419,11 @@ def _postgres_daily_fingerprint(
             (row[0], row[1], row[2])
             for row in connection.execute(
                 sql.SQL(
-                    "SELECT run_key,ordinal,payload FROM {}.fills WHERE strategy_id=%s "
-                    "ORDER BY run_key,ordinal,progress_fill_id"
-                ).format(schema),
+                    "SELECT f.run_key,f.ordinal,f.payload FROM {}.fills AS f "
+                    "JOIN {}.committed_runs AS r ON r.strategy_id=f.strategy_id "
+                    "AND r.run_key=f.run_key WHERE f.strategy_id=%s "
+                    "ORDER BY r.commit_ordinal,f.ordinal,f.progress_fill_id"
+                ).format(schema, schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -440,9 +444,11 @@ def _postgres_daily_fingerprint(
                     "f.portfolio_snapshot_id,f.market_snapshot_id,f.occurred_at,"
                     "f.ordinal,u.payload FROM {}.position_risk_facts AS f JOIN "
                     "{}.position_risk_updates AS u ON u.strategy_id=f.strategy_id "
-                    "AND u.fact_id=f.fact_id WHERE f.strategy_id=%s "
-                    "ORDER BY f.run_key,f.ordinal,f.fact_id"
-                ).format(schema, schema),
+                    "AND u.fact_id=f.fact_id JOIN {}.committed_runs AS r ON "
+                    "r.strategy_id=f.strategy_id AND r.run_key=f.run_key "
+                    "WHERE f.strategy_id=%s "
+                    "ORDER BY r.commit_ordinal,f.ordinal,f.fact_id"
+                ).format(schema, schema, schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -450,9 +456,11 @@ def _postgres_daily_fingerprint(
             (row[0], row[1], row[2])
             for row in connection.execute(
                 sql.SQL(
-                    "SELECT run_key,ordinal,payload FROM {}.settlement_updates "
-                    "WHERE strategy_id=%s ORDER BY run_key,ordinal,symbol"
-                ).format(schema),
+                    "SELECT s.run_key,s.ordinal,s.payload FROM "
+                    "{}.settlement_updates AS s JOIN {}.committed_runs AS r ON "
+                    "r.strategy_id=s.strategy_id AND r.run_key=s.run_key "
+                    "WHERE s.strategy_id=%s ORDER BY r.commit_ordinal,s.ordinal,s.symbol"
+                ).format(schema, schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -460,9 +468,11 @@ def _postgres_daily_fingerprint(
             (row[0], row[1], row[2])
             for row in connection.execute(
                 sql.SQL(
-                    "SELECT run_key,ordinal,payload FROM {}.carry_accruals "
-                    "WHERE strategy_id=%s ORDER BY run_key,ordinal,accrual_id"
-                ).format(schema),
+                    "SELECT c.run_key,c.ordinal,c.payload FROM {}.carry_accruals AS c "
+                    "JOIN {}.committed_runs AS r ON r.strategy_id=c.strategy_id "
+                    "AND r.run_key=c.run_key WHERE c.strategy_id=%s "
+                    "ORDER BY r.commit_ordinal,c.ordinal,c.accrual_id"
+                ).format(schema, schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -471,13 +481,9 @@ def _postgres_daily_fingerprint(
             for row in connection.execute(
                 sql.SQL(
                     "SELECT e.strategy_revision,e.run_key,e.ordinal,e.payload "
-                    "FROM {}.events AS e "
-                    "LEFT JOIN {}.committed_runs AS r ON "
-                    "r.strategy_id=e.strategy_id AND r.run_key=e.run_key "
-                    "WHERE e.strategy_id=%s ORDER BY "
-                    "COALESCE(r.committed_at,e.occurred_at),"
-                    "e.run_key NULLS FIRST,e.ordinal,e.event_id"
-                ).format(schema, schema),
+                    "FROM {}.events AS e WHERE e.strategy_id=%s "
+                    "ORDER BY e.event_ordinal"
+                ).format(schema),
                 (strategy_id,),
             ).fetchall()
         )
@@ -861,6 +867,47 @@ def run_paper_postgres_22_sessions(store, *, strategy: dict) -> dict:
     }
 
 
+def _simple_batch(
+    account: AccountSnapshot,
+    *,
+    run_key: str,
+    intent_id: str,
+    market_snapshot_id: str,
+) -> DecisionBatch:
+    intent = OrderIntent(
+        id=intent_id,
+        symbol="L0",
+        position_side=PositionSide.LONG,
+        order_side=OrderSide.BUY,
+        position_effect=PositionEffect.OPEN,
+        quantity=1,
+        reason="REBALANCE",
+        created_snapshot_id=market_snapshot_id,
+        created_market_at=account.occurred_at,
+    )
+    return DecisionBatch(
+        run_key=run_key,
+        strategy_id=account.strategy_id,
+        strategy_revision=account.strategy_revision,
+        portfolio_snapshot_id=account.snapshot_id,
+        market_snapshot_id=market_snapshot_id,
+        request_fingerprint=f"request-{run_key}",
+        intents=(intent,),
+        events=(
+            PortfolioEvent(
+                id=f"event-{run_key}",
+                type="PIPELINE_COMPLETED",
+                occurred_at=account.occurred_at,
+                data={
+                    "run_key": run_key,
+                    "market_snapshot_id": market_snapshot_id,
+                },
+            ),
+        ),
+        diagnostics=({"code": "TEST_BATCH", "run_key": run_key},),
+    )
+
+
 @unittest.skipUnless(DATABASE_URL, "requires Docker PostgreSQL")
 class MonthLongShortIntegrationTests(unittest.TestCase):
     @classmethod
@@ -998,6 +1045,232 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 store.list_accounts(),
                 (financed, empty),
+            )
+
+    def test_normalized_fact_rows_are_required_to_rebuild_batches(self):
+        mutations = {
+            "missing_fact": (
+                "DELETE FROM {}.order_intents WHERE strategy_id=%s AND run_key=%s",
+                (),
+            ),
+            "modified_payload": (
+                "UPDATE {}.order_intents SET payload=jsonb_set("
+                "payload,'{{quantity}}','2'::jsonb) "
+                "WHERE strategy_id=%s AND run_key=%s",
+                (),
+            ),
+            "ordinal_gap": (
+                "UPDATE {}.order_intents SET ordinal=2 "
+                "WHERE strategy_id=%s AND run_key=%s",
+                (),
+            ),
+            "extra_fact": (
+                """
+                INSERT INTO {}.order_intents
+                (strategy_id,intent_id,run_key,strategy_revision,ordinal,
+                 batch_ordinal,symbol,position_side,order_side,position_effect,
+                 quantity,reason,created_snapshot_id,created_market_at,
+                 cancelled_revision,payload)
+                SELECT strategy_id,'normalized-authority-extra',run_key,
+                       strategy_revision,1,NULL,symbol,position_side,order_side,
+                       position_effect,quantity,reason,created_snapshot_id,
+                       created_market_at,cancelled_revision,
+                       jsonb_set(payload,'{{id}}',to_jsonb(
+                           'normalized-authority-extra'::text))
+                FROM {}.order_intents
+                WHERE strategy_id=%s AND run_key=%s
+                """,
+                ("double_schema",),
+            ),
+            "audit_payload": (
+                "UPDATE {}.committed_runs SET batch_payload='{{}}'::jsonb "
+                "WHERE strategy_id=%s AND run_key=%s",
+                (),
+            ),
+            "invalid_event_source": (
+                "UPDATE {}.events SET source_kind='SYSTEM' "
+                "WHERE strategy_id=%s AND run_key=%s AND source_kind='BATCH'",
+                (),
+            ),
+        }
+        import psycopg
+        from psycopg import sql
+
+        for mutation, (statement, options) in mutations.items():
+            with self.subTest(mutation=mutation):
+                with isolated_postgres_schema(DATABASE_URL) as schema:
+                    store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+                    account = AccountSnapshot(
+                        id="account-normalized-authority",
+                        strategy_id="normalized-authority",
+                        strategy_revision=1,
+                        occurred_at=START,
+                        available_cash=100_000.0,
+                        snapshot_id="normalized-authority-bootstrap",
+                    )
+                    store.create_account(account)
+                    batch = _simple_batch(
+                        account,
+                        run_key="normalized-authority-run",
+                        intent_id="normalized-authority-intent",
+                        market_snapshot_id="normalized-authority-market",
+                    )
+                    store.commit(batch)
+                    self.assertEqual(
+                        store.load_committed_batch(
+                            account.strategy_id,
+                            batch.run_key,
+                            batch.request_fingerprint,
+                        ),
+                        batch,
+                    )
+                    identifiers = [sql.Identifier(schema)]
+                    if options:
+                        identifiers.append(sql.Identifier(schema))
+                    with psycopg.connect(DATABASE_URL) as connection:
+                        connection.execute(
+                            sql.SQL(statement).format(*identifiers),
+                            (account.strategy_id, batch.run_key),
+                        )
+
+                    readers = (
+                        lambda: store.load_committed_batch(
+                            account.strategy_id,
+                            batch.run_key,
+                            batch.request_fingerprint,
+                        ),
+                        lambda: store.load_performance_view(account.strategy_id),
+                    )
+                    for reader in readers:
+                        with self.subTest(reader=reader), self.assertRaises(ValueError):
+                            reader()
+
+    def test_create_account_round_trips_financing_and_borrow_carry_history(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            financing = AccrualLifecycle(
+                id="financing-create-carry",
+                started_on=START.date(),
+            )
+            borrow = AccrualLifecycle(
+                id="borrow-create-carry-S0",
+                started_on=START.date(),
+            )
+            account = AccountSnapshot(
+                id="account-create-carry",
+                strategy_id="create-carry",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=100_000.0,
+                margin_loan=1_000.0,
+                accrued_financing_cost=1.25,
+                accrued_borrow_cost=0.75,
+                financing_lifecycle=financing,
+                positions=(
+                    PositionSnapshot(
+                        symbol="S0",
+                        side=PositionSide.SHORT,
+                        quantity=10,
+                        average_cost=100.0,
+                        current_price=99.0,
+                        borrow_lifecycle=borrow,
+                    ),
+                ),
+                carry_accruals=(
+                    CarryAccrualRecord(
+                        account_id="account-create-carry",
+                        cost_type=CarryCostType.FINANCING,
+                        accrual_date=START.date(),
+                        elapsed_days=1,
+                        amount=1.25,
+                        lifecycle_id=financing.id,
+                    ),
+                    CarryAccrualRecord(
+                        account_id="account-create-carry",
+                        cost_type=CarryCostType.BORROW,
+                        accrual_date=START.date(),
+                        elapsed_days=1,
+                        amount=0.75,
+                        lifecycle_id=borrow.id,
+                        symbol="S0",
+                    ),
+                ),
+                snapshot_id="create-carry-bootstrap",
+            )
+            store.create_account(account)
+            self.assertEqual(store.load(account.strategy_id), account)
+            self.assertEqual(store.load_view(account.strategy_id).account, account)
+            self.assertEqual(
+                store.load_performance_view(account.strategy_id).account,
+                account,
+            )
+            self.assertEqual(store.create_account(account), account)
+
+    def test_committed_batches_and_facts_keep_database_commit_order(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-commit-order",
+                strategy_id="commit-order",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=100_000.0,
+                snapshot_id="commit-order-bootstrap",
+            )
+            store.create_account(account)
+            z_batch = _simple_batch(
+                account,
+                run_key="z-run",
+                intent_id="z-intent",
+                market_snapshot_id="z-market",
+            )
+            z_result = store.commit(z_batch)
+            a_batch = _simple_batch(
+                z_result,
+                run_key="a-run",
+                intent_id="a-intent",
+                market_snapshot_id="a-market",
+            )
+            a_result = store.commit(a_batch)
+
+            import psycopg
+            from psycopg import sql
+
+            def commit_ordinals():
+                with psycopg.connect(DATABASE_URL) as connection:
+                    return tuple(
+                        row[0]
+                        for row in connection.execute(
+                            sql.SQL(
+                                "SELECT commit_ordinal FROM {}.committed_runs "
+                                "WHERE strategy_id=%s ORDER BY commit_ordinal"
+                            ).format(sql.Identifier(schema)),
+                            (account.strategy_id,),
+                        ).fetchall()
+                    )
+
+            before_retry = commit_ordinals()
+            self.assertEqual(store.commit(a_batch), a_result)
+            self.assertEqual(commit_ordinals(), before_retry)
+            self.assertEqual(len(before_retry), 2)
+            self.assertLess(before_retry[0], before_retry[1])
+
+            performance = store.load_performance_view(account.strategy_id)
+            self.assertEqual(
+                tuple(item.run_key for item in performance.batches),
+                ("z-run", "a-run"),
+            )
+            self.assertEqual(
+                tuple(item.id for item in performance.intents),
+                ("z-intent", "a-intent"),
+            )
+            self.assertEqual(
+                tuple(
+                    item.id
+                    for item in performance.events
+                    if item.type == "PIPELINE_COMPLETED"
+                ),
+                ("event-z-run", "event-a-run"),
             )
 
     def test_normalized_single_run_revision_idempotency_and_rollback(self):
@@ -1228,11 +1501,15 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
         for schema in created:
             self.assertIsNotNone(schema)
             self.assertFalse(schema_exists(DATABASE_URL, schema))
-        self.assertEqual(non_test_schemas(DATABASE_URL), before)
+        self.assertTrue(set(before).issubset(non_test_schemas(DATABASE_URL)))
 
     def test_one_month_replay_is_isolated_and_respects_all_caps(self):
         before = non_test_schemas(DATABASE_URL)
         before_database = non_test_database_fingerprint(DATABASE_URL)
+        baseline_relations = tuple(
+            (schema_name, table_name)
+            for schema_name, table_name, *_rest in before_database
+        )
         self.assertEqual(count_test_schemas(DATABASE_URL), 0)
         with isolated_postgres_schema(DATABASE_URL) as schema:
             pg_store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
@@ -1308,8 +1585,17 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             )
             self.assertIn("SHORT_STOP_LOSS", daily[12]["intent_reasons"])
         self.assertFalse(schema_exists(DATABASE_URL, schema))
-        self.assertEqual(non_test_schemas(DATABASE_URL), before)
-        self.assertEqual(non_test_database_fingerprint(DATABASE_URL), before_database)
+        self.assertTrue(set(before).issubset(non_test_schemas(DATABASE_URL)))
+        # The PostgreSQL instance is shared: unrelated test schemas may appear
+        # concurrently. Every table that existed before this replay must still
+        # exist with identical definition, row count, and row multiset hash.
+        self.assertEqual(
+            non_test_database_fingerprint(
+                DATABASE_URL,
+                relations=baseline_relations,
+            ),
+            before_database,
+        )
         self.assertEqual(count_test_schemas(DATABASE_URL), 0)
 
     def test_concurrent_duplicate_commit_is_idempotent(self):

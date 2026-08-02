@@ -18,6 +18,8 @@ from .contracts import (
     CarryAccrualRecord,
     CarryCostType,
     DecisionBatch,
+    ExecutionFill,
+    ExecutionProgressFill,
     OrderExecutionProgress,
     OrderIntent,
     PortfolioEvent,
@@ -26,6 +28,8 @@ from .contracts import (
     PositionSide,
     PositionSnapshot,
     PositionEffect,
+    PositionRiskUpdate,
+    PositionSettlementUpdate,
     RevisionTransition,
 )
 from .canonical import canonical_graph
@@ -41,6 +45,7 @@ from .ledger import (
     _batch_from_canonical_json,
     _batch_fingerprint,
     _canonical_batch_facts,
+    _carry_from_json,
     _carry_to_json,
     _derived_revision_transition_event,
     _event_from_json,
@@ -48,12 +53,14 @@ from .ledger import (
     _execution_account_fact,
     _intent_from_json,
     _intent_to_json,
+    _progress_fill_from_json,
     _progress_fill_to_json,
     _progress_from_json,
     _progress_to_json,
     _reconcile_batch_events,
     _revision_transition_result_snapshot_id,
     _risk_fact_for_batch,
+    _risk_update_from_json,
     _risk_update_to_json,
     _stable_snapshot_id,
     _validate_carry_event_pairs,
@@ -84,6 +91,76 @@ def _schema_name(value: str) -> str:
     if value.startswith("pg_") or value == "information_schema":
         raise ValueError("system PostgreSQL schemas are not ledger targets")
     return value
+
+
+def _public_ordinal(item: Any, items: tuple, *, fact_kind: str) -> int | None:
+    matches = [ordinal for ordinal, candidate in enumerate(items) if candidate == item]
+    if len(matches) > 1:
+        raise LedgerError(f"duplicate public {fact_kind} facts are not supported")
+    return None if not matches else matches[0]
+
+
+def _require_contiguous_ordinals(rows: tuple, *, table: str) -> None:
+    ordinals = tuple(int(row[0]) for row in rows)
+    if ordinals != tuple(range(len(rows))):
+        raise LedgerError(f"{table} ordinals are not contiguous")
+
+
+def _public_items(rows: tuple[tuple[int | None, Any], ...], *, table: str) -> tuple:
+    selected = sorted(
+        ((ordinal, item) for ordinal, item in rows if ordinal is not None),
+        key=lambda pair: pair[0],
+    )
+    ordinals = tuple(int(pair[0]) for pair in selected)
+    if ordinals != tuple(range(len(selected))):
+        raise LedgerError(f"{table} public ordinals are not contiguous")
+    return tuple(item for _ordinal, item in selected)
+
+
+def _settlement_from_json(value: object) -> PositionSettlementUpdate:
+    if not isinstance(value, dict):
+        raise LedgerError("invalid settlement update payload")
+    try:
+        sellable_on = value["sellable_on"]
+        return PositionSettlementUpdate(
+            symbol=value["symbol"],
+            side=PositionSide(value["side"]),
+            quantity=value["quantity"],
+            sellable_quantity=value["sellable_quantity"],
+            sellable_on=(
+                None
+                if sellable_on is None
+                else datetime.fromisoformat(f"{sellable_on}T00:00:00").date()
+            ),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise LedgerError("invalid settlement update payload") from exc
+
+
+def _execution_fill_from_detail(detail: ExecutionProgressFill) -> ExecutionFill:
+    return ExecutionFill(
+        intent_id=detail.intent_id,
+        symbol=detail.symbol,
+        quantity=detail.quantity,
+        price=detail.price,
+        fees=detail.fees,
+        status=detail.status,
+    )
+
+
+def _batch_metadata_payload(batch: DecisionBatch) -> dict:
+    return canonical_graph(
+        replace(
+            batch,
+            intents=(),
+            fills=(),
+            events=(),
+            execution_progress=(),
+            position_risk_updates=(),
+            position_settlement_updates=(),
+            carry_accruals=(),
+        )
+    )
 
 
 _DDL = (
@@ -146,6 +223,7 @@ _DDL = (
         strategy_id TEXT NOT NULL REFERENCES {schema}.accounts(strategy_id)
             ON DELETE CASCADE,
         run_key TEXT NOT NULL,
+        commit_ordinal BIGINT GENERATED ALWAYS AS IDENTITY,
         strategy_revision INTEGER NOT NULL,
         source_snapshot_id TEXT NOT NULL,
         result_snapshot_id TEXT NOT NULL,
@@ -153,8 +231,10 @@ _DDL = (
         request_fingerprint TEXT,
         batch_fingerprint TEXT NOT NULL,
         committed_at TIMESTAMPTZ NOT NULL,
+        metadata_payload JSONB NOT NULL,
         batch_payload JSONB NOT NULL,
         PRIMARY KEY (strategy_id, run_key),
+        UNIQUE (strategy_id, commit_ordinal),
         UNIQUE (strategy_id, run_key, batch_fingerprint)
     )
     """,
@@ -165,6 +245,7 @@ _DDL = (
         run_key TEXT NOT NULL,
         strategy_revision INTEGER NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         symbol TEXT NOT NULL,
         position_side TEXT NOT NULL,
         order_side TEXT NOT NULL,
@@ -189,6 +270,7 @@ _DDL = (
         run_key TEXT NOT NULL,
         intent_id TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         status TEXT NOT NULL,
         last_occurred_at TIMESTAMPTZ NOT NULL,
         payload JSONB NOT NULL,
@@ -207,6 +289,7 @@ _DDL = (
         run_key TEXT NOT NULL,
         intent_id TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         symbol TEXT NOT NULL,
         position_side TEXT NOT NULL,
         order_side TEXT NOT NULL,
@@ -233,6 +316,7 @@ _DDL = (
         run_key TEXT NOT NULL,
         strategy_revision INTEGER NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         portfolio_snapshot_id TEXT NOT NULL,
         market_snapshot_id TEXT NOT NULL,
         symbol TEXT NOT NULL,
@@ -269,6 +353,7 @@ _DDL = (
         run_key TEXT NOT NULL,
         symbol TEXT NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         side TEXT NOT NULL,
         quantity INTEGER NOT NULL,
         sellable_quantity INTEGER,
@@ -288,6 +373,7 @@ _DDL = (
         accrual_id TEXT NOT NULL,
         run_key TEXT,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
         account_id TEXT NOT NULL,
         cost_type TEXT NOT NULL,
         lifecycle_id TEXT NOT NULL,
@@ -311,10 +397,14 @@ _DDL = (
         run_key TEXT,
         strategy_revision INTEGER NOT NULL,
         ordinal INTEGER NOT NULL,
+        batch_ordinal INTEGER,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('BATCH', 'DERIVED', 'SYSTEM')),
+        event_ordinal BIGINT GENERATED ALWAYS AS IDENTITY,
         event_type TEXT NOT NULL,
         occurred_at TIMESTAMPTZ NOT NULL,
         payload JSONB NOT NULL,
         PRIMARY KEY (strategy_id, event_id),
+        UNIQUE (event_ordinal),
         UNIQUE (strategy_id, run_key, ordinal),
         FOREIGN KEY (strategy_id, run_key)
             REFERENCES {schema}.committed_runs(strategy_id, run_key) ON DELETE CASCADE,
@@ -434,13 +524,16 @@ class PostgresLedgerStore:
         cursor.execute(
             sql.SQL(
                 """
-                SELECT account_id, cost_type, accrual_date, elapsed_days,
-                       amount, lifecycle_id, symbol
-                FROM {}.carry_accruals
-                WHERE strategy_id = %s
-                ORDER BY accrual_date, run_key NULLS FIRST, ordinal, accrual_id
+                SELECT c.account_id, c.cost_type, c.accrual_date, c.elapsed_days,
+                       c.amount, c.lifecycle_id, c.symbol
+                FROM {}.carry_accruals AS c
+                LEFT JOIN {}.committed_runs AS r
+                  ON r.strategy_id=c.strategy_id AND r.run_key=c.run_key
+                WHERE c.strategy_id = %s
+                ORDER BY (c.run_key IS NOT NULL), r.commit_ordinal,
+                         c.ordinal, c.accrual_id
                 """
-            ).format(schema),
+            ).format(schema, schema),
             (strategy_id,),
         )
         carry = tuple(
@@ -606,6 +699,40 @@ class PostgresLedgerStore:
                     ),
                 )
                 self._write_current_account(cursor, account)
+                carry_keys = [item.idempotency_key for item in account.carry_accruals]
+                if len(set(carry_keys)) != len(carry_keys):
+                    raise LedgerError("account carry history contains duplicate facts")
+                for ordinal, accrual in enumerate(account.carry_accruals):
+                    if accrual.account_id != account.id:
+                        raise LedgerError("account carry history has a different account_id")
+                    material = "|".join(str(item) for item in accrual.idempotency_key)
+                    accrual_id = "carry-" + hashlib.sha256(
+                        material.encode("utf-8")
+                    ).hexdigest()[:24]
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            INSERT INTO {}.carry_accruals
+                            (strategy_id,accrual_id,run_key,ordinal,batch_ordinal,
+                             account_id,cost_type,lifecycle_id,accrual_date,
+                             elapsed_days,amount,symbol,payload)
+                            VALUES (%s,%s,NULL,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s)
+                            """
+                        ).format(schema),
+                        (
+                            account.strategy_id,
+                            accrual_id,
+                            ordinal,
+                            accrual.account_id,
+                            accrual.cost_type.value,
+                            accrual.lifecycle_id,
+                            accrual.accrual_date,
+                            accrual.elapsed_days,
+                            accrual.amount,
+                            accrual.symbol,
+                            Jsonb(_carry_to_json(accrual)),
+                        ),
+                    )
                 opened = PortfolioEvent(
                     id="account-opened-"
                     + hashlib.sha256(
@@ -629,8 +756,8 @@ class PostgresLedgerStore:
                         """
                         INSERT INTO {}.events
                         (strategy_id,event_id,run_key,strategy_revision,ordinal,
-                         event_type,occurred_at,payload)
-                        VALUES (%s,%s,NULL,%s,0,%s,%s,%s)
+                         batch_ordinal,source_kind,event_type,occurred_at,payload)
+                        VALUES (%s,%s,NULL,%s,0,NULL,'SYSTEM',%s,%s,%s)
                         """
                     ).format(schema),
                     (
@@ -660,7 +787,7 @@ class PostgresLedgerStore:
                 "SELECT i.payload, i.cancelled_revision "
                 "FROM {}.order_intents AS i JOIN {}.committed_runs AS r "
                 "ON r.strategy_id=i.strategy_id AND r.run_key=i.run_key "
-                "WHERE i.strategy_id=%s ORDER BY r.committed_at,i.run_key,"
+                "WHERE i.strategy_id=%s ORDER BY r.commit_ordinal,"
                 "i.ordinal,i.intent_id"
             ).format(schema, schema),
             (strategy_id,),
@@ -675,11 +802,21 @@ class PostgresLedgerStore:
         cursor.execute(
             sql.SQL(
                 """
-                SELECT DISTINCT ON (intent_id) intent_id, payload
-                FROM {}.execution_progress WHERE strategy_id=%s
-                ORDER BY intent_id, last_occurred_at DESC, run_key DESC
+                SELECT intent_id, payload FROM (
+                    SELECT p.intent_id, p.payload, r.commit_ordinal, p.ordinal,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY p.intent_id
+                               ORDER BY r.commit_ordinal DESC, p.ordinal DESC
+                           ) AS latest
+                    FROM {}.execution_progress AS p
+                    JOIN {}.committed_runs AS r
+                      ON r.strategy_id=p.strategy_id AND r.run_key=p.run_key
+                    WHERE p.strategy_id=%s
+                ) AS ranked
+                WHERE latest=1
+                ORDER BY intent_id
                 """
-            ).format(schema),
+            ).format(schema, schema),
             (strategy_id,),
         )
         progress = tuple(_progress_from_json(item[1]) for item in cursor.fetchall())
@@ -700,16 +837,362 @@ class PostgresLedgerStore:
         cursor.execute(
             sql.SQL(
                 "SELECT e.payload FROM {}.events AS e "
-                "LEFT JOIN {}.committed_runs AS r "
-                "ON r.strategy_id=e.strategy_id AND r.run_key=e.run_key "
-                "WHERE e.strategy_id=%s "
-                "ORDER BY COALESCE(r.committed_at,e.occurred_at), "
-                "e.run_key NULLS FIRST, e.ordinal, e.event_id"
-            ).format(schema, schema),
+                "WHERE e.strategy_id=%s ORDER BY e.event_ordinal"
+            ).format(schema),
             (strategy_id,),
         )
         events = tuple(_event_from_json(item[0]) for item in cursor.fetchall())
         return intents, progress, open_intents, open_progress, events
+
+    def _load_normalized_batch_cursor(self, cursor: Any, row: tuple) -> DecisionBatch:
+        (
+            strategy_id,
+            run_key,
+            _commit_ordinal,
+            strategy_revision,
+            source_snapshot_id,
+            _result_snapshot_id,
+            market_snapshot_id,
+            request_fingerprint,
+            batch_fingerprint,
+            metadata_payload,
+            audit_payload,
+        ) = row
+        skeleton = _batch_from_canonical_json(metadata_payload)
+        if any(
+            (
+                skeleton.intents,
+                skeleton.fills,
+                skeleton.events,
+                skeleton.execution_progress,
+                skeleton.position_risk_updates,
+                skeleton.position_settlement_updates,
+                skeleton.carry_accruals,
+            )
+        ):
+            raise LedgerError("committed run metadata contains normalized facts")
+        if (
+            skeleton.strategy_id != strategy_id
+            or skeleton.run_key != run_key
+            or skeleton.strategy_revision != strategy_revision
+            or skeleton.portfolio_snapshot_id != source_snapshot_id
+            or skeleton.market_snapshot_id != market_snapshot_id
+            or skeleton.request_fingerprint != request_fingerprint
+        ):
+            raise LedgerError("committed run metadata does not match SQL columns")
+
+        _psycopg, sql, _Jsonb = _driver()
+        schema = sql.Identifier(self.schema)
+        key = (strategy_id, run_key)
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,intent_id,strategy_revision,symbol,
+                       position_side,order_side,position_effect,quantity,reason,
+                       created_snapshot_id,created_market_at,payload
+                FROM {}.order_intents
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        intent_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(intent_rows, table="order_intents")
+        intents = []
+        intent_public = []
+        for item in intent_rows:
+            intent = _intent_from_json(item[12])
+            if item[12] != _intent_to_json(intent) or (
+                intent.id,
+                strategy_revision,
+                intent.symbol,
+                intent.position_side.value,
+                intent.order_side.value,
+                intent.position_effect.value,
+                intent.quantity,
+                intent.reason,
+                intent.created_snapshot_id,
+                intent.created_market_at,
+            ) != item[2:12]:
+                raise LedgerError("order_intents columns differ from payload")
+            intents.append(intent)
+            intent_public.append((item[1], intent))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,intent_id,status,last_occurred_at,payload
+                FROM {}.execution_progress
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        progress_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(progress_rows, table="execution_progress")
+        progress = []
+        progress_public = []
+        for item in progress_rows:
+            entry = _progress_from_json(item[5])
+            if item[5] != _progress_to_json(entry) or (
+                entry.intent_id,
+                entry.status,
+                entry.fills[-1].occurred_at,
+            ) != item[2:5]:
+                raise LedgerError("execution_progress columns differ from payload")
+            progress.append(entry)
+            progress_public.append((item[1], entry))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,progress_fill_id,intent_id,symbol,
+                       position_side,order_side,snapshot_id,occurred_at,quantity,
+                       price,fees,commission,status,payload
+                FROM {}.fills
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        fill_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(fill_rows, table="fills")
+        fill_details = []
+        fill_summaries = []
+        fill_public = []
+        for item in fill_rows:
+            detail = _progress_fill_from_json(item[14])
+            if item[14] != _progress_fill_to_json(detail) or (
+                detail.id,
+                detail.intent_id,
+                detail.symbol,
+                detail.position_side.value,
+                detail.order_side.value,
+                detail.snapshot_id,
+                detail.occurred_at,
+                detail.quantity,
+                detail.price,
+                detail.fees,
+                detail.commission,
+                detail.status,
+            ) != item[2:14]:
+                raise LedgerError("fills columns differ from payload")
+            summary = _execution_fill_from_detail(detail)
+            fill_details.append(detail)
+            fill_summaries.append(summary)
+            fill_public.append((item[1], summary))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT f.ordinal,f.batch_ordinal,f.fact_id,f.strategy_revision,
+                       f.portfolio_snapshot_id,f.market_snapshot_id,f.symbol,
+                       f.side,f.occurred_at,u.symbol,u.side,u.peak_price,
+                       u.trough_price,u.trailing_active,u.position_mode,u.payload
+                FROM {}.position_risk_facts AS f
+                JOIN {}.position_risk_updates AS u
+                  ON u.strategy_id=f.strategy_id AND u.fact_id=f.fact_id
+                WHERE f.strategy_id=%s AND f.run_key=%s
+                ORDER BY f.ordinal
+                """
+            ).format(schema, schema),
+            key,
+        )
+        risk_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(risk_rows, table="position_risk_facts")
+        risk_updates = []
+        risk_public = []
+        for item in risk_rows:
+            update = _risk_update_from_json(item[15])
+            if item[15] != _risk_update_to_json(update) or (
+                update.symbol,
+                update.side.value,
+                update.peak_price,
+                update.trough_price,
+                update.trailing_active,
+                update.position_mode,
+            ) != item[9:15]:
+                raise LedgerError("position risk columns differ from payload")
+            risk_updates.append(update)
+            risk_public.append((item[1], update))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,symbol,side,quantity,
+                       sellable_quantity,sellable_on,payload
+                FROM {}.settlement_updates
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        settlement_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(settlement_rows, table="settlement_updates")
+        settlement = []
+        settlement_public = []
+        for item in settlement_rows:
+            update = _settlement_from_json(item[7])
+            expected_payload = {
+                "symbol": update.symbol,
+                "side": update.side.value,
+                "quantity": update.quantity,
+                "sellable_quantity": update.sellable_quantity,
+                "sellable_on": (
+                    None if update.sellable_on is None else update.sellable_on.isoformat()
+                ),
+            }
+            if item[7] != expected_payload or (
+                update.symbol,
+                update.side.value,
+                update.quantity,
+                update.sellable_quantity,
+                update.sellable_on,
+            ) != item[2:7]:
+                raise LedgerError("settlement columns differ from payload")
+            settlement.append(update)
+            settlement_public.append((item[1], update))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,account_id,cost_type,accrual_date,
+                       elapsed_days,amount,lifecycle_id,symbol,payload
+                FROM {}.carry_accruals
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        carry_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(carry_rows, table="carry_accruals")
+        carry = []
+        carry_public = []
+        for item in carry_rows:
+            accrual = _carry_from_json(item[9])
+            if item[9] != _carry_to_json(accrual) or (
+                accrual.account_id,
+                accrual.cost_type.value,
+                accrual.accrual_date,
+                accrual.elapsed_days,
+                accrual.amount,
+                accrual.lifecycle_id,
+                accrual.symbol,
+            ) != item[2:9]:
+                raise LedgerError("carry columns differ from payload")
+            carry.append(accrual)
+            carry_public.append((item[1], accrual))
+
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT ordinal,batch_ordinal,source_kind,event_id,event_type,
+                       occurred_at,payload
+                FROM {}.events
+                WHERE strategy_id=%s AND run_key=%s
+                ORDER BY ordinal
+                """
+            ).format(schema),
+            key,
+        )
+        event_rows = tuple(cursor.fetchall())
+        _require_contiguous_ordinals(event_rows, table="events")
+        stored_events = []
+        batch_event_public = []
+        for item in event_rows:
+            event = _event_from_json(item[6])
+            if item[6] != _event_to_json(event) or (
+                event.id,
+                event.type,
+                event.occurred_at,
+            ) != item[3:6]:
+                raise LedgerError("event columns differ from payload")
+            if item[2] == "BATCH":
+                batch_event_public.append((item[1], event))
+            elif item[2] != "DERIVED" or item[1] is not None:
+                raise LedgerError("batch-derived event has invalid source metadata")
+            stored_events.append(event)
+
+        batch = replace(
+            skeleton,
+            intents=_public_items(tuple(intent_public), table="order_intents"),
+            fills=_public_items(tuple(fill_public), table="fills"),
+            events=_public_items(tuple(batch_event_public), table="events"),
+            execution_progress=_public_items(
+                tuple(progress_public), table="execution_progress"
+            ),
+            position_risk_updates=_public_items(
+                tuple(risk_public), table="position_risk_facts"
+            ),
+            position_settlement_updates=_public_items(
+                tuple(settlement_public), table="settlement_updates"
+            ),
+            carry_accruals=_public_items(tuple(carry_public), table="carry_accruals"),
+        )
+        facts = _canonical_batch_facts(batch)
+        normalized_facts = (
+            tuple(intents),
+            tuple(fill_summaries),
+            tuple(progress),
+            tuple(risk_updates),
+            tuple(settlement),
+            tuple(carry),
+        )
+        if facts != normalized_facts:
+            raise LedgerError("normalized facts do not match batch metadata")
+
+        risk_facts = []
+        for item, update in zip(risk_rows, risk_updates):
+            fact = _risk_fact_for_batch(batch, update, item[8])
+            if (
+                fact.fact_id,
+                batch.strategy_revision,
+                batch.portfolio_snapshot_id,
+                batch.market_snapshot_id,
+                update.symbol,
+                update.side.value,
+                fact.occurred_at,
+            ) != item[2:9]:
+                raise LedgerError("position risk fact columns are inconsistent")
+            risk_facts.append(fact)
+        expected_events = _reconcile_batch_events(
+            batch,
+            tuple(zip(fill_details, fill_summaries)),
+            tuple(risk_facts),
+        )
+        if tuple(stored_events) != expected_events:
+            raise LedgerError("stored events do not match reconstructed batch events")
+        if canonical_graph(batch) != audit_payload:
+            raise LedgerError("normalized batch differs from audit payload")
+        if _batch_fingerprint(batch, facts) != batch_fingerprint:
+            raise LedgerError("normalized batch fingerprint mismatch")
+        return batch
+
+    def _load_batches_cursor(self, cursor: Any, strategy_id: str) -> tuple[DecisionBatch, ...]:
+        _psycopg, sql, _Jsonb = _driver()
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT strategy_id,run_key,commit_ordinal,strategy_revision,
+                       source_snapshot_id,result_snapshot_id,market_snapshot_id,
+                       request_fingerprint,batch_fingerprint,metadata_payload,
+                       batch_payload
+                FROM {}.committed_runs
+                WHERE strategy_id=%s ORDER BY commit_ordinal
+                """
+            ).format(sql.Identifier(self.schema)),
+            (strategy_id,),
+        )
+        return tuple(
+            self._load_normalized_batch_cursor(cursor, row)
+            for row in cursor.fetchall()
+        )
 
     def load_view(self, strategy_id: str) -> PortfolioLedgerView:
         psycopg, _sql, _Jsonb = _driver()
@@ -737,17 +1220,7 @@ class PostgresLedgerStore:
                 intents, progress, _open, _open_progress, events = (
                     self._load_intents_progress_events(cursor, strategy_id)
                 )
-                cursor.execute(
-                    sql.SQL(
-                        "SELECT batch_payload FROM {}.committed_runs "
-                        "WHERE strategy_id=%s ORDER BY run_key"
-                    ).format(sql.Identifier(self.schema)),
-                    (strategy_id,),
-                )
-                batches = tuple(
-                    _batch_from_canonical_json(item[0])
-                    for item in cursor.fetchall()
-                )
+                batches = self._load_batches_cursor(cursor, strategy_id)
         return PortfolioPerformanceLedgerView(
             account=account,
             intents=intents,
@@ -781,18 +1254,28 @@ class PostgresLedgerStore:
     ) -> DecisionBatch | None:
         psycopg, sql, _Jsonb = _driver()
         with psycopg.connect(self._database_url) as connection:
-            row = connection.execute(
-                sql.SQL(
-                    "SELECT request_fingerprint, batch_payload "
-                    "FROM {}.committed_runs WHERE strategy_id=%s AND run_key=%s"
-                ).format(sql.Identifier(self.schema)),
-                (strategy_id, run_key),
-            ).fetchone()
-        if row is None:
-            return None
-        if row[0] != request_fingerprint:
-            raise LedgerError("run_key was already committed with a different request")
-        return _batch_from_canonical_json(row[1])
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        """
+                        SELECT strategy_id,run_key,commit_ordinal,strategy_revision,
+                               source_snapshot_id,result_snapshot_id,
+                               market_snapshot_id,request_fingerprint,
+                               batch_fingerprint,metadata_payload,batch_payload
+                        FROM {}.committed_runs
+                        WHERE strategy_id=%s AND run_key=%s
+                        """
+                    ).format(sql.Identifier(self.schema)),
+                    (strategy_id, run_key),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return None
+                if row[7] != request_fingerprint:
+                    raise LedgerError(
+                        "run_key was already committed with a different request"
+                    )
+                return self._load_normalized_batch_cursor(cursor, row)
 
     def transition_revision(self, transition: RevisionTransition) -> AccountSnapshot:
         if type(transition) is not RevisionTransition:
@@ -994,8 +1477,8 @@ class PostgresLedgerStore:
                         INSERT INTO {}.committed_runs
                         (strategy_id,run_key,strategy_revision,source_snapshot_id,
                          result_snapshot_id,market_snapshot_id,request_fingerprint,
-                         batch_fingerprint,committed_at,batch_payload)
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                         batch_fingerprint,committed_at,metadata_payload,batch_payload)
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                         """
                     ).format(schema),
                     (
@@ -1008,6 +1491,7 @@ class PostgresLedgerStore:
                         batch.request_fingerprint,
                         fingerprint,
                         current.occurred_at,
+                        Jsonb(_batch_metadata_payload(batch)),
                         Jsonb(canonical_graph(batch)),
                     ),
                 )
@@ -1095,6 +1579,8 @@ class PostgresLedgerStore:
         strategy_revision: int,
         run_key: str | None,
         ordinal: int,
+        batch_ordinal: int | None = None,
+        source_kind: str = "SYSTEM",
     ) -> None:
         _psycopg, sql, Jsonb = _driver()
         cursor.execute(
@@ -1102,8 +1588,8 @@ class PostgresLedgerStore:
                 """
                 INSERT INTO {}.events
                 (strategy_id,event_id,run_key,strategy_revision,ordinal,
-                 event_type,occurred_at,payload)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 batch_ordinal,source_kind,event_type,occurred_at,payload)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (strategy_id,event_id) DO NOTHING
                 """
             ).format(sql.Identifier(self.schema)),
@@ -1113,6 +1599,8 @@ class PostgresLedgerStore:
                 run_key,
                 strategy_revision,
                 ordinal,
+                batch_ordinal,
+                source_kind,
                 event.type,
                 event.occurred_at,
                 Jsonb(_event_to_json(event)),
@@ -1140,10 +1628,10 @@ class PostgresLedgerStore:
                     """
                     INSERT INTO {}.order_intents
                     (strategy_id,intent_id,run_key,strategy_revision,ordinal,
-                     symbol,position_side,order_side,position_effect,quantity,
+                     batch_ordinal,symbol,position_side,order_side,position_effect,quantity,
                      reason,created_snapshot_id,created_market_at,
                      cancelled_revision,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULL,%s)
                     ON CONFLICT (strategy_id,intent_id) DO NOTHING
                     """
                 ).format(schema),
@@ -1153,6 +1641,7 @@ class PostgresLedgerStore:
                     batch.run_key,
                     batch.strategy_revision,
                     ordinal,
+                    _public_ordinal(intent, batch.intents, fact_kind="order_intent"),
                     intent.symbol,
                     intent.position_side.value,
                     intent.order_side.value,
@@ -1169,9 +1658,9 @@ class PostgresLedgerStore:
                 sql.SQL(
                     """
                     INSERT INTO {}.execution_progress
-                    (strategy_id,run_key,intent_id,ordinal,status,
+                    (strategy_id,run_key,intent_id,ordinal,batch_ordinal,status,
                      last_occurred_at,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
                     """
                 ).format(schema),
                 (
@@ -1179,20 +1668,25 @@ class PostgresLedgerStore:
                     batch.run_key,
                     item.intent_id,
                     ordinal,
+                    _public_ordinal(
+                        item,
+                        batch.execution_progress,
+                        fact_kind="execution_progress",
+                    ),
                     item.status,
                     item.fills[-1].occurred_at,
                     Jsonb(_progress_to_json(item)),
                 ),
             )
-        for ordinal, (detail, _summary) in enumerate(paired_fills):
+        for ordinal, (detail, summary) in enumerate(paired_fills):
             cursor.execute(
                 sql.SQL(
                     """
                     INSERT INTO {}.fills
                     (strategy_id,progress_fill_id,run_key,intent_id,ordinal,
-                     symbol,position_side,order_side,snapshot_id,occurred_at,
+                     batch_ordinal,symbol,position_side,order_side,snapshot_id,occurred_at,
                      quantity,price,fees,commission,status,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """
                 ).format(schema),
                 (
@@ -1201,6 +1695,7 @@ class PostgresLedgerStore:
                     batch.run_key,
                     detail.intent_id,
                     ordinal,
+                    _public_ordinal(summary, batch.fills, fact_kind="fill"),
                     detail.symbol,
                     detail.position_side.value,
                     detail.order_side.value,
@@ -1220,8 +1715,9 @@ class PostgresLedgerStore:
                     """
                     INSERT INTO {}.position_risk_facts
                     (strategy_id,fact_id,run_key,strategy_revision,ordinal,
-                     portfolio_snapshot_id,market_snapshot_id,symbol,side,occurred_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                     batch_ordinal,portfolio_snapshot_id,market_snapshot_id,
+                     symbol,side,occurred_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """
                 ).format(schema),
                 (
@@ -1230,6 +1726,11 @@ class PostgresLedgerStore:
                     batch.run_key,
                     batch.strategy_revision,
                     ordinal,
+                    _public_ordinal(
+                        update,
+                        batch.position_risk_updates,
+                        fact_kind="position_risk_update",
+                    ),
                     batch.portfolio_snapshot_id,
                     batch.market_snapshot_id,
                     update.symbol,
@@ -1263,9 +1764,9 @@ class PostgresLedgerStore:
                 sql.SQL(
                     """
                     INSERT INTO {}.settlement_updates
-                    (strategy_id,run_key,symbol,ordinal,side,quantity,
+                    (strategy_id,run_key,symbol,ordinal,batch_ordinal,side,quantity,
                      sellable_quantity,sellable_on,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     """
                 ).format(schema),
                 (
@@ -1273,6 +1774,11 @@ class PostgresLedgerStore:
                     batch.run_key,
                     update.symbol,
                     ordinal,
+                    _public_ordinal(
+                        update,
+                        batch.position_settlement_updates,
+                        fact_kind="settlement_update",
+                    ),
                     update.side.value,
                     update.quantity,
                     update.sellable_quantity,
@@ -1301,9 +1807,10 @@ class PostgresLedgerStore:
                 sql.SQL(
                     """
                     INSERT INTO {}.carry_accruals
-                    (strategy_id,accrual_id,run_key,ordinal,account_id,cost_type,
+                    (strategy_id,accrual_id,run_key,ordinal,batch_ordinal,
+                     account_id,cost_type,
                      lifecycle_id,accrual_date,elapsed_days,amount,symbol,payload)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT (strategy_id,accrual_id) DO NOTHING
                     """
                 ).format(schema),
@@ -1312,6 +1819,11 @@ class PostgresLedgerStore:
                     accrual_id,
                     batch.run_key,
                     ordinal,
+                    _public_ordinal(
+                        accrual,
+                        batch.carry_accruals,
+                        fact_kind="carry_accrual",
+                    ),
                     accrual.account_id,
                     accrual.cost_type.value,
                     accrual.lifecycle_id,
@@ -1330,6 +1842,12 @@ class PostgresLedgerStore:
                 strategy_revision=batch.strategy_revision,
                 run_key=batch.run_key,
                 ordinal=ordinal,
+                batch_ordinal=_public_ordinal(
+                    event,
+                    batch.events,
+                    fact_kind="event",
+                ),
+                source_kind=("BATCH" if event in batch.events else "DERIVED"),
             )
 
 
