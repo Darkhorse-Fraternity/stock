@@ -12,6 +12,7 @@ dependencies = []
 [project.optional-dependencies]
 tick = ["akshare"]
 analysis = ["akshare>=1.18.64"]
+integration = ["psycopg[binary]>=3.2"]
 
 [project.scripts]
 stock-agent = "stock_recommender.cli:main"

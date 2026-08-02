@@ -14,6 +14,7 @@ from .contracts import (
     MarketSnapshot,
     OrderIntent,
     PortfolioLedgerView,
+    PortfolioPerformanceLedgerView,
     RevisionTransition,
 )
 
@@ -48,6 +49,11 @@ class LedgerStore(Protocol):
     def load(self, strategy_id: str) -> AccountSnapshot: ...
 
     def load_view(self, strategy_id: str) -> PortfolioLedgerView: ...
+
+    def load_performance_view(
+        self,
+        strategy_id: str,
+    ) -> PortfolioPerformanceLedgerView: ...
 
     def transition_revision(
         self,

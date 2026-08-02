@@ -148,6 +148,96 @@ def transition_revision_from_process(
 
 
 class PortfolioLedgerV2Tests(unittest.TestCase):
+    def test_fill_replay_clears_financing_lifecycle_when_close_repays_loan(self):
+        financed = AccountSnapshot(
+            id="account-strategy",
+            strategy_id="strategy",
+            strategy_revision=2,
+            occurred_at=NOW,
+            available_cash=0.0,
+            margin_loan=150.0,
+            financing_lifecycle=AccrualLifecycle(
+                "financing-close",
+                date(2026, 7, 30),
+            ),
+            positions=(
+                PositionSnapshot(
+                    symbol="AAPL",
+                    side=PositionSide.LONG,
+                    quantity=2,
+                    average_cost=100.0,
+                    current_price=100.0,
+                ),
+            ),
+        )
+        payload = json.loads(self.path.read_text(encoding="utf-8"))
+        payload["accounts"]["strategy"].update(encode_account_snapshot(financed))
+        payload["accounts"]["strategy"]["portfolio_snapshot_id"] = "snapshot-0"
+        self.path.write_text(json.dumps(payload), encoding="utf-8")
+        intent = OrderIntent(
+            id="close-financed-long",
+            symbol="AAPL",
+            position_side=PositionSide.LONG,
+            order_side=OrderSide.SELL,
+            position_effect=PositionEffect.CLOSE,
+            quantity=2,
+            reason="MARGIN_CALL",
+            created_snapshot_id="market-0",
+        )
+        values = {
+            "intent_id": intent.id,
+            "symbol": intent.symbol,
+            "position_side": intent.position_side,
+            "order_side": intent.order_side,
+            "snapshot_id": "market-1",
+            "occurred_at": NOW,
+            "quantity": 2,
+            "price": 100.0,
+            "fees": 0.0,
+            "commission": 0.0,
+            "status": "FILLED",
+        }
+        detail = ExecutionProgressFill(
+            id=stable_execution_progress_fill_id(**values),
+            **values,
+        )
+        progress = OrderExecutionProgress(
+            intent_id=intent.id,
+            symbol=intent.symbol,
+            position_side=intent.position_side,
+            order_side=intent.order_side,
+            intent_quantity=intent.quantity,
+            execution_policy_fingerprint="policy-close",
+            fills=(detail,),
+        )
+
+        committed = JsonLedgerStore(self.path).commit(
+            DecisionBatch(
+                run_key="close-financing",
+                strategy_id="strategy",
+                strategy_revision=2,
+                portfolio_snapshot_id="snapshot-0",
+                market_snapshot_id="market-1",
+                intents=(intent,),
+                fills=(
+                    ExecutionFill(
+                        intent.id,
+                        intent.symbol,
+                        2,
+                        100.0,
+                        0.0,
+                        "FILLED",
+                    ),
+                ),
+                execution_progress=(progress,),
+            )
+        )
+
+        self.assertEqual(committed.margin_loan, 0.0)
+        self.assertIsNone(committed.financing_lifecycle)
+        self.assertEqual(committed.available_cash, 50.0)
+        self.assertEqual(committed.positions, ())
+
     def test_performance_view_replays_lifecycle_and_marks_unreplayable_runs(self):
         with TemporaryDirectory() as temporary:
             replayable_path = Path(temporary) / "replayable.json"

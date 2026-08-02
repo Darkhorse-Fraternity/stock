@@ -3,11 +3,12 @@ import math
 import unittest
 from copy import deepcopy
 from dataclasses import FrozenInstanceError, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from stock_recommender.pipeline import PipelineContractError, PipelineRunner, StageInput
 from stock_recommender.portfolio_engine.config import MarginPolicy, ShortPolicy
 from stock_recommender.portfolio_engine.contracts import (
+    AccrualLifecycle,
     AccountSnapshot,
     DecisionBatch,
     MarketSnapshot,
@@ -627,6 +628,37 @@ class PortfolioDrawdownRiskTests(unittest.TestCase):
 
 
 class ForcedDeleveragingTests(unittest.TestCase):
+    def test_financed_account_projects_all_required_closes_without_lifecycle_errors(self):
+        stressed = replace(
+            account(
+                position(symbol="A", current=None, quantity=1),
+                position(symbol="B", current=None, quantity=1),
+                position(symbol="C", current=None, quantity=1),
+                loan=250.0,
+            ),
+            financing_lifecycle=AccrualLifecycle(
+                id="financing-main",
+                started_on=date(2026, 7, 30),
+            ),
+        )
+
+        result = evaluate_forced_deleveraging(
+            stressed,
+            {"A": 100.0, "B": 100.0, "C": 100.0},
+        )
+
+        self.assertEqual([item.symbol for item in result.intents], ["A", "B"])
+        self.assertFalse(
+            any(
+                item.get("code") in {
+                    "CANDIDATE_PROJECTION_FAILED",
+                    "DELEVERAGING_PROJECTION_FAILED",
+                }
+                for item in result.diagnostics
+            )
+        )
+        self.assertIsNotNone(stressed.financing_lifecycle)
+
     def test_margin_call_returns_only_risk_reducing_full_closes(self):
         held = position(symbol="A", current=None, quantity=1)
         stressed = account(held, loan=70.001)

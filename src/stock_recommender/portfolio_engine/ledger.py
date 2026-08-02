@@ -1696,6 +1696,7 @@ def _apply_progress(
             ):
                 raise LedgerError("execution progress history is not append-only")
         for progress_fill in item.fills[len(previous_fills) :]:
+            prior_financing_lifecycle = current.financing_lifecycle
             held = next(
                 (position for position in current.positions if position.symbol == intent.symbol),
                 None,
@@ -1706,10 +1707,27 @@ def _apply_progress(
             if effect is PositionEffect.CLOSE and held is not None and progress_fill.quantity < held.quantity:
                 effect = PositionEffect.REDUCE
             applied = replace(intent, quantity=progress_fill.quantity, position_effect=effect)
+            projection_account = current
+            if not applied.increases_risk and current.financing_lifecycle is not None:
+                # ``project_account_for_intent`` validates snapshots eagerly.
+                # A reduction may repay the final loan, so temporarily remove
+                # the lifecycle exactly as the execution simulator does.
+                projection_account = replace(current, financing_lifecycle=None)
             current = project_account_for_intent(
-                current, applied, {intent.symbol: progress_fill.price}
+                projection_account,
+                applied,
+                {intent.symbol: progress_fill.price},
             )
             current = _charge_fee(current, progress_fill.fees)
+            if (
+                current.margin_loan > 0
+                and current.financing_lifecycle is None
+                and prior_financing_lifecycle is not None
+            ):
+                current = replace(
+                    current,
+                    financing_lifecycle=prior_financing_lifecycle,
+                )
             current = _touch_position_after_fill(current, intent, progress_fill)
         merged[item.intent_id] = item
     current = replace(

@@ -828,6 +828,30 @@ def _margin_state(
     return NORMAL
 
 
+def _project_deleveraging_intent(
+    account: AccountSnapshot,
+    intent: OrderIntent,
+    raw_prices: Mapping[str, object],
+) -> AccountSnapshot:
+    """Project a close without retaining a lifecycle after its loan is repaid."""
+
+    financing_lifecycle = account.financing_lifecycle
+    projection_account = account
+    if financing_lifecycle is not None:
+        projection_account = replace(account, financing_lifecycle=None)
+    projected = project_account_for_intent(
+        projection_account,
+        intent,
+        raw_prices,
+    )
+    if projected.margin_loan > 0 and financing_lifecycle is not None:
+        projected = replace(
+            projected,
+            financing_lifecycle=financing_lifecycle,
+        )
+    return projected
+
+
 def evaluate_forced_deleveraging(
     account: AccountSnapshot,
     prices: MarketSnapshot | Mapping[str, object],
@@ -890,7 +914,11 @@ def evaluate_forced_deleveraging(
             created_market_at,
         )
         try:
-            candidate_account = project_account_for_intent(account, intent, raw_prices)
+            candidate_account = _project_deleveraging_intent(
+                account,
+                intent,
+                raw_prices,
+            )
             _value_risk_account(
                 candidate_account,
                 raw_prices,
@@ -934,7 +962,7 @@ def evaluate_forced_deleveraging(
     planned: list[OrderIntent] = []
     for candidate in candidates:
         try:
-            projected_account = project_account_for_intent(
+            projected_account = _project_deleveraging_intent(
                 projected_account,
                 candidate.intent,
                 raw_prices,

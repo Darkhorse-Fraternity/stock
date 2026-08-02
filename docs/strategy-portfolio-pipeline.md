@@ -97,3 +97,34 @@ Hermes 可通过以下环境变量同步三个现有任务：
 - 策略 API：`/api/strategies/{strategy_id}/portfolio`。
 - 策略页面：`/strategies/{strategy_id}/portfolio`。
 - 页面展示当前净值、累计收益、最大回撤、退出胜率、当前持仓、订单、退出记录和事件账本。
+
+## 多空、杠杆与硬限制
+
+敞口、融资和借券是三个独立策略块：`exposure_policy` 决定持仓方向与敞口，`margin_policy` 决定维持保证金、清算缓冲及融资日息，`short_policy` 决定借券准入、成本和空头风险。修改任一策略块都必须创建新 revision，并重新通过回测和 Paper 审批；运行中的账户不得在原 revision 上静默换参数。
+
+系统硬限制不可由策略配置放大：最多 10 个持仓，总敞口不高于 150%，净敞口绝对值不高于 120%，多头不高于 120%，空头不高于 30%，单一多头不高于 15%，单一空头不高于 5%。`LONG_ONLY`、`LONG_LEVERAGED` 和 `LONG_SHORT` 共用同一 Pipeline 与账本，方向差异只由策略块输入决定。
+
+借券数据缺失时采用 fail-closed：禁止新增空头。已有空头遇到借券撤销、不可借或数据退化时进入 `COVER_ONLY`，只能回补，不能增仓。估算借券利率必须标注来源，不能作为逐证券实际利率展示。保证金缓冲触发后只允许降低风险；低于维持线时产生可追踪的 `MARGIN_CALL` 强制去杠杆意图。融资费和借券费按独立 lifecycle 逐日计提。
+
+部署不会自动修改现有策略。迁移后的所有既有策略继续保持 `LONG_ONLY`；启用杠杆或空头必须显式创建新 revision 并重新审批。
+
+## PostgreSQL 迁移与隔离集成测试
+
+`PostgresLedgerStore` 是可选适配器，生产 JSON 账本不依赖 Psycopg。PostgreSQL 仍保存同一份严格 canonical ledger graph，并用事务、行锁和数据库主键 `(strategy_id, run_key)` 保证跨进程幂等。策略表现读取仍返回 `PortfolioPerformanceLedgerView`，不向服务层暴露数据库 JSON。
+
+迁移前先执行 preflight：确认目标 PostgreSQL 版本和容量、校验连接账户只拥有目标应用 schema 的权限、检查当前 JSON 账本完整性，并分别对应用目录、策略配置和组合账本创建带时间戳的备份。先在空的预演 schema 执行建表和全量校验；只有 preflight 全部通过才允许 apply。schema 与表标识符必须使用 Psycopg `Identifier`，不得拼接用户输入。
+
+隔离测试只允许创建 `stock_agent_test_<32位小写十六进制>` schema。fixture 在 `finally` 中使用独立连接执行精确 `DROP SCHEMA ... CASCADE`；禁止删除或修改 `public`、既有 schema、既有表或业务数据。运行方式：
+
+```bash
+python3 -m venv /private/tmp/stock-agent-integration
+/private/tmp/stock-agent-integration/bin/python -m pip install -e '.[integration]'
+env STOCK_AGENT_TEST_DATABASE_URL="$STOCK_AGENT_TEST_DATABASE_URL" \
+  PYTHONPATH=src:tests \
+  /private/tmp/stock-agent-integration/bin/python -m unittest \
+  tests.test_month_long_short_integration -v
+```
+
+不设置 `STOCK_AGENT_TEST_DATABASE_URL` 时测试必须明确显示 `requires Docker PostgreSQL` 并跳过，不能伪装成已验证。一个月集成场景固定重放 22 个 session，逐日比较 PostgreSQL Paper 与内存回测的 canonical event、fill、position 和 NAV 指纹，并覆盖缺失/撤销借券、逼空、部分成交、融资费、借券费、保证金缓冲和强制风控。
+
+apply 失败或发布后校验失败时立即停止写入，保留失败现场用于诊断；从迁移前的时间戳备份恢复应用目录、策略配置和组合账本，再校验原 JSON 账本及现有 `LONG_ONLY` 策略可读。不得用空账本覆盖生产账本，也不得在未验证备份可恢复前删除旧数据。
