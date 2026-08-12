@@ -49,7 +49,7 @@ from .contracts import (
     TargetPosition,
 )
 from .execution import (
-    ExecutionSimulationStage,
+    ExecutionStage,
     RebalanceIntentStage,
     accrue_carry_costs,
     execution_policy,
@@ -60,6 +60,7 @@ from .pre_execution import (
     PreExecutionAdmissionStage,
     hard_cap_breaches,
 )
+from .ports import BrokerExecutionPort
 from .risk import PortfolioRiskStage
 from .request_identity import request_fingerprint
 from .signal_ports import (
@@ -674,6 +675,7 @@ class PortfolioEngine:
         borrow_provider: object | None = None,
         calendar_provider: object | None = None,
         ledger_store: object | None = None,
+        broker_execution: BrokerExecutionPort | None = None,
     ) -> None:
         self._signal_registry = dict(signal_registry or SIGNAL_MODELS)
         self._exposure_normalizer = exposure_normalizer
@@ -683,6 +685,7 @@ class PortfolioEngine:
         self._borrow_provider = borrow_provider
         self._calendar_provider = calendar_provider
         self._ledger = ledger_store
+        self._broker_execution = broker_execution
 
     def _policies(
         self,
@@ -1080,10 +1083,11 @@ class PortfolioEngine:
         admitted_progress = tuple(
             item for item in progress if item.intent_id in admitted_intent_ids
         )
-        execution_output = ExecutionSimulationStage(
+        execution_output = ExecutionStage(
             request.account,
             request.market,
             resolved_execution_policy,
+            self._broker_execution,
         ).evaluate(
             _stage_input(
                 request,
@@ -1101,6 +1105,7 @@ class PortfolioEngine:
         )
         if type(execution_account) is not AccountSnapshot:
             raise TypeError("execution stage must return AccountSnapshot")
+        post_execution_breaches = ()
         if any(item.increases_risk for item in admitted_for_execution):
             post_execution_breaches = hard_cap_breaches(
                 execution_account,
@@ -1109,7 +1114,7 @@ class PortfolioEngine:
                 margin_policy,
                 baseline_account=request.account,
             )
-            if post_execution_breaches:
+            if post_execution_breaches and self._broker_execution is None:
                 raise RuntimeError(
                     "post-execution hard-cap breach: "
                     + ", ".join(item.code for item in post_execution_breaches)
@@ -1213,6 +1218,14 @@ class PortfolioEngine:
             PositionRiskUpdate,
         )
         diagnostics: list[Mapping[str, Any]] = []
+        for item in post_execution_breaches:
+            diagnostics.append(
+                {
+                    "code": item.code,
+                    "stage": "post_execution_hard_cap",
+                    "symbol": "",
+                }
+            )
         for item in _fact(
             pre_execution_output,
             "pre_execution_diagnostics",
@@ -1232,7 +1245,7 @@ class PortfolioEngine:
                 diagnostics.append(
                     {
                         "code": str(item.get("reason") or "EXECUTION_SKIPPED"),
-                        "stage": "execution_simulation",
+                        "stage": execution_output.stage,
                         "symbol": str(item.get("symbol") or ""),
                     }
                 )

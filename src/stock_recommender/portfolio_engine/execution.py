@@ -35,6 +35,7 @@ from .contracts import (
 )
 from .margin import IntentSemanticsError, project_account_for_intent
 from .money import charge_cash_or_margin
+from .ports import BrokerExecutionPort
 
 
 def _finite_nonnegative(value: object, field_name: str) -> float:
@@ -182,7 +183,7 @@ class ExecutionDiagnostic:
 
 
 @dataclass(frozen=True)
-class ExecutionSimulationResult:
+class ExecutionResult:
     account: AccountSnapshot
     fills: tuple[ExecutionFill, ...] = ()
     diagnostics: tuple[ExecutionDiagnostic, ...] = ()
@@ -1258,8 +1259,9 @@ def execute_intents(
     policy: ExecutionPolicy,
     *,
     prior_progress: Iterable[OrderExecutionProgress] = (),
-) -> ExecutionSimulationResult:
-    """Simulate and account for an intent batch without persisting it."""
+    broker: BrokerExecutionPort | None = None,
+) -> ExecutionResult:
+    """Account for an intent batch using either simulated or broker fills."""
 
     if type(account) is not AccountSnapshot:
         raise TypeError("account must be AccountSnapshot")
@@ -1378,19 +1380,78 @@ def execute_intents(
             prior_notional_decimal,
             policy,
         )
-        fill = _simulate_fill_unchecked(
-            executable,
-            quote if isinstance(quote, Mapping) else None,
-            policy,
-            current_snapshot_id=market.id,
-            previous_filled_notional=float(prior_notional_decimal),
-        )
+        if broker is None:
+            fill = _simulate_fill_unchecked(
+                executable,
+                quote if isinstance(quote, Mapping) else None,
+                policy,
+                current_snapshot_id=market.id,
+                previous_filled_notional=float(prior_notional_decimal),
+            )
+            broker_reason = None
+        else:
+            observation = broker.place_or_get(original)
+            if (
+                observation.client_order_id == ""
+                or observation.symbol != original.symbol
+                or observation.side != original.order_side.value.lower()
+                or observation.quantity != original.quantity
+            ):
+                raise RuntimeError("broker order identity does not match intent")
+            if not previously_filled <= observation.filled_quantity <= original.quantity:
+                raise RuntimeError("broker cumulative fill quantity is inconsistent")
+            delta_quantity = observation.filled_quantity - previously_filled
+            if delta_quantity == 0:
+                fill = None
+            else:
+                average = observation.filled_average_price
+                if average is None or not math.isfinite(average) or average <= 0:
+                    raise RuntimeError("broker filled order has no valid average price")
+                delta_notional = (
+                    Decimal(str(average)) * observation.filled_quantity
+                    - prior_notional_decimal
+                )
+                delta_price = float(delta_notional / delta_quantity)
+                fill = ExecutionFill(
+                    intent_id=original.id,
+                    symbol=original.symbol,
+                    quantity=delta_quantity,
+                    price=delta_price,
+                    fees=0.0,
+                    status=(
+                        "FILLED"
+                        if observation.filled_quantity == original.quantity
+                        else "PARTIAL"
+                    ),
+                )
+            broker_reason = "BROKER_ORDER_" + observation.status.upper()
+            if observation.rejection_reason:
+                broker_reason += ":" + observation.rejection_reason
+            if (
+                fill is None
+                and observation.filled_quantity < original.quantity
+                and observation.status.lower()
+                in {
+                    "canceled",
+                    "done_for_day",
+                    "expired",
+                    "rejected",
+                    "replaced",
+                    "stopped",
+                    "suspended",
+                }
+            ):
+                raise RuntimeError(
+                    "broker order became terminal before the intent was filled: "
+                    + broker_reason
+                )
         if fill is None:
             diagnostics.append(
                 ExecutionDiagnostic(
                     original.id,
                     original.symbol,
-                    _fill_failure_reason(original, market, quote),
+                    broker_reason
+                    or _fill_failure_reason(original, market, quote),
                 )
             )
             continue
@@ -1503,7 +1564,7 @@ def execute_intents(
                 else None
             ),
         )
-    return ExecutionSimulationResult(
+    return ExecutionResult(
         current,
         tuple(fills),
         tuple(diagnostics),
@@ -1519,8 +1580,8 @@ def execute_intents(
     )
 
 
-class ExecutionSimulationStage:
-    """Pure pipeline adapter for paper fills and account projections."""
+class ExecutionStage:
+    """Pipeline adapter for simulated fills or broker-owned order state."""
 
     name = "execution_simulation"
     component_version = "2.0.0"
@@ -1530,6 +1591,7 @@ class ExecutionSimulationStage:
         account: AccountSnapshot,
         market: MarketSnapshot,
         policy: ExecutionPolicy,
+        broker: BrokerExecutionPort | None = None,
     ) -> None:
         if type(account) is not AccountSnapshot:
             raise TypeError("account must be AccountSnapshot")
@@ -1540,10 +1602,14 @@ class ExecutionSimulationStage:
         self._account = account
         self._market = market
         self._policy = policy
+        self._broker = broker
+        self.name = "execution_simulation" if broker is None else broker.name
 
     def evaluate(self, stage_input: StageInput) -> StageOutput:
         if type(stage_input) is not StageInput:
             raise TypeError("stage_input must be StageInput")
+        if self._broker is not None:
+            self._broker.assert_ready(self._account)
         pre_execution_admitted = [
             fact
             for fact in stage_input.upstream_facts
@@ -1590,6 +1656,7 @@ class ExecutionSimulationStage:
                 self._market,
                 self._policy,
                 prior_progress=progress,
+                broker=self._broker,
             )
         except (TypeError, ValueError) as exc:
             raise PipelineContractError(str(exc)) from exc
@@ -1904,8 +1971,8 @@ __all__ = (
     "CarryAccrualResult",
     "ExecutionPolicy",
     "ExecutionDiagnostic",
-    "ExecutionSimulationResult",
-    "ExecutionSimulationStage",
+    "ExecutionResult",
+    "ExecutionStage",
     "OrderExecutionProgress",
     "IntentPlanningResult",
     "PlanningDiagnostic",

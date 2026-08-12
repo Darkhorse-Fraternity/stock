@@ -695,7 +695,7 @@ class AccountExecutionTests(unittest.TestCase):
         intent = execution.intent_for_delta(
             None, target(), target_quantity=1, created_snapshot_id="market-1"
         )
-        stage = execution.ExecutionSimulationStage(
+        stage = execution.ExecutionStage(
             original,
             self._market("market-2", NOW + timedelta(minutes=5), "AAPL", 100.0),
             policy,
@@ -1324,7 +1324,7 @@ class AccountExecutionTests(unittest.TestCase):
         intent = execution.intent_for_delta(
             None, target("AAPL"), target_quantity=1, created_snapshot_id="market-1"
         )
-        stage = execution.ExecutionSimulationStage(
+        stage = execution.ExecutionStage(
             account(),
             self._market("market-2", NOW + timedelta(minutes=5), "AAPL", 100.0),
             self._zero_cost_policy(),

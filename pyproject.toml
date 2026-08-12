@@ -7,7 +7,7 @@ name = "stock-recommender"
 version = "0.1.0"
 description = "A-share stock recommendation pipeline with market data fallback and LLM reporting."
 requires-python = ">=3.11"
-dependencies = ["psycopg[binary]>=3.2"]
+dependencies = ["alpaca-py>=0.43.5,<0.44", "psycopg[binary]>=3.2"]
 
 [project.optional-dependencies]
 tick = ["akshare"]

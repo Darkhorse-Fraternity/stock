@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
@@ -10,7 +11,6 @@ from .contracts import (
     AccountSnapshot,
     DecisionBatch,
     EventCalendar,
-    ExecutionFill,
     MarketSnapshot,
     OrderIntent,
     PortfolioLedgerView,
@@ -72,10 +72,26 @@ class LedgerStore(Protocol):
     def list_accounts(self) -> tuple[AccountSnapshot, ...]: ...
 
 
-class BrokerExecutionPort(Protocol):
-    """Future broker boundary; simulation does not depend on this port."""
+@dataclass(frozen=True)
+class BrokerOrderSnapshot:
+    """Broker-owned cumulative order state, independent of any vendor SDK."""
 
-    def submit(
-        self,
-        intents: tuple[OrderIntent, ...],
-    ) -> tuple[ExecutionFill, ...]: ...
+    order_id: str
+    client_order_id: str
+    symbol: str
+    side: str
+    quantity: int
+    filled_quantity: int
+    filled_average_price: float | None
+    status: str
+    rejection_reason: str | None = None
+
+
+class BrokerExecutionPort(Protocol):
+    """Idempotent boundary for submitting or reconciling one broker order."""
+
+    name: str
+
+    def assert_ready(self, account: AccountSnapshot) -> None: ...
+
+    def place_or_get(self, intent: OrderIntent) -> BrokerOrderSnapshot: ...

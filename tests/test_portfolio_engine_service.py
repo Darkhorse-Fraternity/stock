@@ -38,6 +38,7 @@ from stock_recommender.portfolio_engine.contracts import (
 )
 from stock_recommender.portfolio_engine.ledger import JsonLedgerStore, LedgerError
 from stock_recommender.portfolio_engine.pre_execution import HardCapBreach
+from stock_recommender.portfolio_engine.ports import BrokerOrderSnapshot
 from stock_recommender.portfolio_engine.risk import COVER_ONLY
 from stock_recommender.pipeline import StageOutput
 from stock_recommender.recommendation import RecommendationPlan
@@ -89,6 +90,25 @@ def market(snapshot_id: str = "market-1", *, occurred_at: datetime = NOW) -> Mar
             "S": {"price": 50.0, "bar_open": 50.0, "bar_high": 51.0, "bar_low": 49.0, "bar_volume": 100_000},
         },
     )
+
+
+class FilledBroker:
+    name = "test_broker_execution"
+
+    def assert_ready(self, account):
+        self.ready_account = account
+
+    def place_or_get(self, intent):
+        return BrokerOrderSnapshot(
+            order_id=f"broker:{intent.id}",
+            client_order_id=f"client:{intent.id}",
+            symbol=intent.symbol,
+            side=intent.order_side.value.lower(),
+            quantity=intent.quantity,
+            filled_quantity=intent.quantity,
+            filled_average_price=100.0,
+            status="filled",
+        )
 
 
 class StaticSignalModel:
@@ -1997,6 +2017,55 @@ class PortfolioEngineServiceTests(unittest.TestCase):
                 checked.call_args.kwargs["baseline_account"],
                 before.account,
             )
+
+    def test_broker_fill_is_committed_when_post_execution_cap_is_breached(self):
+        long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")
+        with TemporaryDirectory() as temporary:
+            ledger = CountingLedger(Path(temporary) / "portfolio-v2.json")
+            ledger.create_account(account())
+            engine = service.PortfolioEngine(
+                signal_registry={long_model.model_id: long_model},
+                ledger_store=ledger,
+                broker_execution=FilledBroker(),
+            )
+            engine.plan_and_commit(
+                PlanRequest(
+                    run_key="plan:broker-post-cap",
+                    strategy=strategy("LONG_ONLY"),
+                    account=ledger.load("strategy-us"),
+                    analyzed_rows=({"symbol": "L"},),
+                    market=market("broker-post-cap-plan"),
+                    borrow=BorrowSnapshot.unavailable(),
+                    event_calendar={},
+                )
+            )
+            before = ledger.load_view("strategy-us")
+            commit_calls_before = ledger.commit_calls
+            breach = HardCapBreach(
+                code="GROSS_EXPOSURE_CAP",
+                key=("GROSS_EXPOSURE_CAP",),
+                actual=Decimal("101"),
+                maximum=Decimal("100"),
+            )
+
+            with patch.object(service, "hard_cap_breaches", return_value=(breach,)):
+                batch = engine.process_and_commit(
+                    ProcessRequest(
+                        run_key="process:broker-post-cap",
+                        strategy=strategy("LONG_ONLY"),
+                        account=before.account,
+                        market=market(
+                            "broker-post-cap-current",
+                            occurred_at=NOW + timedelta(minutes=1),
+                        ),
+                        borrow=BorrowSnapshot.unavailable(),
+                    )
+                )
+
+            self.assertTrue(batch.fills)
+            self.assertIn("GROSS_EXPOSURE_CAP", batch.diagnostic_codes)
+            self.assertEqual(ledger.commit_calls, commit_calls_before + 1)
+            self.assertNotEqual(ledger.load_view("strategy-us"), before)
 
     def test_process_accrues_short_carry_once_per_market_day(self):
         long_model = StaticSignalModel("long-test-v1", PositionSide.LONG, "L")

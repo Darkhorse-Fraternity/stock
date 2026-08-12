@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from .alpaca_paper_broker import execution_backend_for_strategy
 from .markets import market_profile, strategy_market
 from .portfolio_engine import PortfolioEngine
 from .portfolio_engine.borrow import BorrowSnapshot
@@ -245,6 +246,7 @@ def open_portfolio_runtime(
         borrow_provider=FailClosedBorrowProvider(),
         calendar_provider=EmptyEventCalendarProvider(),
         ledger_store=ledger,
+        broker_execution=execution_backend_for_strategy(strategy),
     )
     return engine, account
 
