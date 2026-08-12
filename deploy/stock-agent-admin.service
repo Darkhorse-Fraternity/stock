@@ -8,7 +8,7 @@ WorkingDirectory=%h/internal-tools/apps/stock-agent
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONPATH=src
 EnvironmentFile=-%h/internal-tools/apps/stock-agent/.env
-ExecStart=/usr/bin/python3 -m stock_recommender.admin --host 0.0.0.0 --port 8765
+ExecStart=%h/internal-tools/apps/stock-agent/.venv/bin/python -m stock_recommender.admin --host 0.0.0.0 --port 8765
 Restart=on-failure
 RestartSec=3
 

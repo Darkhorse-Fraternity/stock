@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
@@ -23,6 +25,7 @@ from .reports import (
     render_report_result,
 )
 from .runtime import assert_strategy_runnable
+from .runtime_runs import record_runtime_run
 from .schedule import (
     parse_publish_hours,
     should_publish_at_market_open,
@@ -60,7 +63,7 @@ def _persist_scheduled_plan(
     )
 
 
-def main() -> None:
+def _run() -> None:
     run_started = time.monotonic()
     publish_hours = parse_publish_hours(os.getenv("STOCK_AGENT_PUBLISH_HOURS", ""))
     schedule_guard = os.getenv("STOCK_AGENT_SCHEDULE_GUARD", "0").strip().lower() in {"1", "true", "yes"}
@@ -243,6 +246,35 @@ def main() -> None:
     delivery_allowed = execution_kind == "scheduled" and (mode in {"track", "risk"} or should_deliver_report(report, strategy))
     if os.getenv("STOCK_AGENT_DELIVERY_RUN", "0") != "1" or delivery_allowed:
         print(report)
+
+
+def main() -> None:
+    started_monotonic = time.perf_counter()
+    started_at = datetime.now(timezone.utc).isoformat()
+    error: BaseException | None = None
+    try:
+        _run()
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        record = {
+            "started_at": started_at,
+            "status": "failed" if error is not None else "succeeded",
+            "mode": os.getenv("STOCK_AGENT_MODE", "report").strip().lower(),
+            "strategy_id": os.getenv("STOCK_AGENT_STRATEGY_ID", "").strip() or None,
+            "ledger_backend": os.getenv("STOCK_AGENT_LEDGER_BACKEND", "json")
+            .strip()
+            .lower(),
+            "duration_seconds": round(time.perf_counter() - started_monotonic, 6),
+            "pid": os.getpid(),
+            "error_type": None if error is None else type(error).__name__,
+            "error": None if error is None else str(error)[:1_000],
+        }
+        try:
+            record_runtime_run(record)
+        except Exception as log_error:
+            print(f"runtime run journal failed: {log_error}", file=sys.stderr)
 
 
 if __name__ == "__main__":

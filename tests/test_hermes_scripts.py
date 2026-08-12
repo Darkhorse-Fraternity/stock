@@ -49,6 +49,10 @@ class HermesScriptRegressionTests(unittest.TestCase):
         service = (ROOT / "deploy" / "stock-agent-admin.service").read_text(encoding="utf-8")
 
         self.assertIn("EnvironmentFile=-%h/internal-tools/apps/stock-agent/.env", service)
+        self.assertIn(
+            "ExecStart=%h/internal-tools/apps/stock-agent/.venv/bin/python",
+            service,
+        )
         self.assertNotIn("192.168.", service)
         self.assertNotIn("STOCK_AGENT_DEFAULT_DELIVERY_TARGET=", service)
         self.assertNotIn("STOCK_AGENT_LLM_API_KEY=", service)

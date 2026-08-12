@@ -11,9 +11,9 @@ from .market_adapters import get_market_adapter
 from .markets import market_date, order_session_date
 from .parameters import record_paper_session
 from .performance import upsert_recommendation_history
-from .portfolio_engine.ledger import JsonLedgerStore
 from .portfolio_engine.contracts import DecisionBatch
 from .portfolio_engine.service import PortfolioEngine
+from .portfolio_store import open_portfolio_store
 from .recommendation import RecommendationPlan, recommendation_tracking_entries
 from .reports import append_performance_link, format_recommendation_snapshot
 from .runtime import assert_strategy_runnable
@@ -106,7 +106,7 @@ def save_daily_selection(
     }
     if portfolio_required:
         engine = portfolio_engine or PortfolioEngine(
-            ledger_store=JsonLedgerStore(portfolio_path)
+            ledger_store=open_portfolio_store(portfolio_path)
         )
         account = engine.commit(decision)
         payload["portfolio_account_id"] = account.id

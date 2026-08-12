@@ -7,18 +7,20 @@ name = "stock-recommender"
 version = "0.1.0"
 description = "A-share stock recommendation pipeline with market data fallback and LLM reporting."
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["psycopg[binary]>=3.2"]
 
 [project.optional-dependencies]
 tick = ["akshare"]
 analysis = ["akshare>=1.18.64"]
-integration = ["psycopg[binary]>=3.2"]
+integration = []
 
 [project.scripts]
 stock-agent = "stock_recommender.cli:main"
 stock-agent-admin = "stock_recommender.admin:main"
 stock-backtest-data = "stock_recommender.historical_data_cli:main"
 stock-portfolio-migrate = "stock_recommender.portfolio_migration_cli:main"
+stock-portfolio-bootstrap-postgres = "stock_recommender.postgres_migration_cli:main"
+stock-runtime-runs = "stock_recommender.runtime_runs_cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

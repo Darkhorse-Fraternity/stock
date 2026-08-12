@@ -1,7 +1,7 @@
-"""Normalized optional PostgreSQL portfolio ledger adapter.
+"""Normalized PostgreSQL portfolio ledger adapter.
 
-The adapter is independent from the JSON ledger. Psycopg remains a lazy
-optional dependency so JSON-only production deployments are unaffected.
+The adapter is independent from the legacy JSON ledger. Psycopg remains a lazy
+dependency so local JSON tooling can still validate and archive migration data.
 """
 
 from __future__ import annotations
@@ -34,6 +34,10 @@ from .contracts import (
     RevisionTransition,
 )
 from .canonical import canonical_graph
+from .progress_state import (
+    ProgressStateConflict,
+    merge_latest_execution_progress,
+)
 from .ledger import (
     LedgerError,
     StalePortfolioSnapshotError,
@@ -267,6 +271,29 @@ _DDL = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS {schema}.open_intents_current (
+        strategy_id TEXT NOT NULL,
+        intent_id TEXT NOT NULL,
+        payload JSONB NOT NULL,
+        PRIMARY KEY (strategy_id, intent_id),
+        FOREIGN KEY (strategy_id, intent_id)
+            REFERENCES {schema}.order_intent_definitions(strategy_id, intent_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS {schema}.execution_progress_current (
+        strategy_id TEXT NOT NULL,
+        intent_id TEXT NOT NULL,
+        last_occurred_at TIMESTAMPTZ NOT NULL,
+        payload JSONB NOT NULL,
+        PRIMARY KEY (strategy_id, intent_id),
+        FOREIGN KEY (strategy_id, intent_id)
+            REFERENCES {schema}.open_intents_current(strategy_id, intent_id)
+            ON DELETE CASCADE
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS {schema}.order_intents (
         strategy_id TEXT NOT NULL,
         intent_id TEXT NOT NULL,
@@ -313,6 +340,10 @@ _DDL = (
             REFERENCES {schema}.order_intent_definitions(strategy_id, intent_id)
             ON DELETE RESTRICT
     )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS execution_progress_intent_lookup
+    ON {schema}.execution_progress (strategy_id, intent_id)
     """,
     """
     CREATE TABLE IF NOT EXISTS {schema}.fills (
@@ -448,6 +479,14 @@ _DDL = (
     )
     """,
     """
+    CREATE INDEX IF NOT EXISTS events_strategy_recent
+    ON {schema}.events (strategy_id, event_ordinal DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS events_strategy_event_id
+    ON {schema}.events (strategy_id, event_id)
+    """,
+    """
     CREATE TABLE IF NOT EXISTS {schema}.revision_transitions (
         strategy_id TEXT NOT NULL REFERENCES {schema}.accounts(strategy_id)
             ON DELETE CASCADE,
@@ -480,6 +519,9 @@ class PostgresLedgerStore:
         identifier = sql.Identifier(self.schema)
         with psycopg.connect(self._database_url) as connection:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(identifier)
+                )
                 for statement in _DDL:
                     cursor.execute(
                         sql.SQL(statement).format(schema=identifier)
@@ -829,6 +871,131 @@ class PostgresLedgerStore:
                 )
         return account
 
+    def bootstrap_open_state(self, view: PortfolioLedgerView) -> PortfolioLedgerView:
+        """Seed bounded active-order state during a one-way JSON cutover.
+
+        This is intentionally separate from normal commits: imported progress
+        has already affected the imported account snapshot and must not be
+        replayed.  Future canonical progress supersedes these seed rows.
+        """
+
+        if type(view) is not PortfolioLedgerView:
+            raise TypeError("view must be PortfolioLedgerView")
+        intent_ids = {item.id for item in view.open_intents}
+        if any(item.intent_id not in intent_ids for item in view.execution_progress):
+            raise LedgerError("migration progress must refer to an open intent")
+        if any(item.status == "FILLED" for item in view.execution_progress):
+            raise LedgerError("migration open state must not contain filled progress")
+        psycopg, sql, Jsonb = _driver()
+        schema = sql.Identifier(self.schema)
+        with psycopg.connect(self._database_url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    sql.SQL(
+                        "SELECT strategy_id FROM {}.accounts "
+                        "WHERE strategy_id=%s FOR UPDATE"
+                    ).format(schema),
+                    (view.account.strategy_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise KeyError(
+                        f"portfolio account not found: {view.account.strategy_id}"
+                    )
+                if self._load_account_cursor(cursor, view.account.strategy_id) != view.account:
+                    raise LedgerError("migration account differs from PostgreSQL account")
+
+                for intent in view.open_intents:
+                    payload = _intent_to_json(intent)
+                    fingerprint = _intent_definition_fingerprint(intent)
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            INSERT INTO {}.order_intent_definitions
+                            (strategy_id,intent_id,intent_fingerprint,payload)
+                            VALUES (%s,%s,%s,%s)
+                            ON CONFLICT (strategy_id,intent_id) DO NOTHING
+                            RETURNING intent_id
+                            """
+                        ).format(schema),
+                        (
+                            view.account.strategy_id,
+                            intent.id,
+                            fingerprint,
+                            Jsonb(payload),
+                        ),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            sql.SQL(
+                                "SELECT intent_fingerprint,payload "
+                                "FROM {}.order_intent_definitions "
+                                "WHERE strategy_id=%s AND intent_id=%s FOR SHARE"
+                            ).format(schema),
+                            (view.account.strategy_id, intent.id),
+                        )
+                        if cursor.fetchone() != (fingerprint, payload):
+                            raise LedgerError(f"conflicting intent ID: {intent.id}")
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            INSERT INTO {}.open_intents_current
+                            (strategy_id,intent_id,payload)
+                            VALUES (%s,%s,%s)
+                            ON CONFLICT (strategy_id,intent_id) DO NOTHING
+                            RETURNING intent_id
+                            """
+                        ).format(schema),
+                        (view.account.strategy_id, intent.id, Jsonb(payload)),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            sql.SQL(
+                                "SELECT payload "
+                                "FROM {}.open_intents_current "
+                                "WHERE strategy_id=%s AND intent_id=%s FOR SHARE"
+                            ).format(schema),
+                            (view.account.strategy_id, intent.id),
+                        )
+                        if cursor.fetchone() != (payload,):
+                            raise LedgerError(
+                                f"conflicting migration intent ID: {intent.id}"
+                            )
+
+                for item in view.execution_progress:
+                    payload = _progress_to_json(item)
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            INSERT INTO {}.execution_progress_current
+                            (strategy_id,intent_id,last_occurred_at,payload)
+                            VALUES (%s,%s,%s,%s)
+                            ON CONFLICT (strategy_id,intent_id) DO NOTHING
+                            RETURNING intent_id
+                            """
+                        ).format(schema),
+                        (
+                            view.account.strategy_id,
+                            item.intent_id,
+                            item.fills[-1].occurred_at,
+                            Jsonb(payload),
+                        ),
+                    )
+                    if cursor.fetchone() is None:
+                        cursor.execute(
+                            sql.SQL(
+                                "SELECT last_occurred_at,payload "
+                                "FROM {}.execution_progress_current "
+                                "WHERE strategy_id=%s AND intent_id=%s FOR SHARE"
+                            ).format(schema),
+                            (view.account.strategy_id, item.intent_id),
+                        )
+                        if cursor.fetchone() != (item.fills[-1].occurred_at, payload):
+                            raise LedgerError(
+                                "conflicting migration execution progress: "
+                                f"{item.intent_id}"
+                            )
+        return self.load_view(view.account.strategy_id)
+
     def load(self, strategy_id: str) -> AccountSnapshot:
         if type(strategy_id) is not str or not strategy_id:
             raise ValueError("strategy_id must be a non-empty string")
@@ -854,7 +1021,23 @@ class PostgresLedgerStore:
             ).format(schema, schema, schema),
             (strategy_id,),
         )
-        intent_rows = cursor.fetchall()
+        live_intent_rows = cursor.fetchall()
+        cursor.execute(
+            sql.SQL(
+                "SELECT m.payload,NULL,"
+                "d.intent_fingerprint,d.payload "
+                "FROM {}.open_intents_current AS m "
+                "JOIN {}.order_intent_definitions AS d "
+                "ON d.strategy_id=m.strategy_id AND d.intent_id=m.intent_id "
+                "WHERE m.strategy_id=%s ORDER BY m.intent_id"
+            ).format(schema, schema),
+            (strategy_id,),
+        )
+        # Preserve the immutable fact order from committed_runs.  The bounded
+        # current-state projection is appended only as a migration fallback;
+        # duplicate definitions must not move an existing fact to the front of
+        # the performance history.
+        intent_rows = (*live_intent_rows, *cursor.fetchall())
         intent_occurrences = tuple(_intent_from_json(item[0]) for item in intent_rows)
         for intent, item in zip(intent_occurrences, intent_rows):
             if (
@@ -894,7 +1077,26 @@ class PostgresLedgerStore:
             ).format(schema, schema),
             (strategy_id,),
         )
-        progress = tuple(_progress_from_json(item[1]) for item in cursor.fetchall())
+        live_progress = tuple(
+            _progress_from_json(item[1]) for item in cursor.fetchall()
+        )
+        cursor.execute(
+            sql.SQL(
+                "SELECT payload FROM {}.execution_progress_current "
+                "WHERE strategy_id=%s ORDER BY intent_id"
+            ).format(schema),
+            (strategy_id,),
+        )
+        current_progress = tuple(
+            _progress_from_json(item[0]) for item in cursor.fetchall()
+        )
+        try:
+            progress = merge_latest_execution_progress(
+                current_progress,
+                live_progress,
+            )
+        except ProgressStateConflict as exc:
+            raise LedgerError(str(exc)) from exc
         completed = {item.intent_id for item in progress if item.status == "FILLED"}
         open_intents = tuple(
             sorted(
@@ -927,6 +1129,128 @@ class PostgresLedgerStore:
             events_by_id.setdefault(event.id, event)
         events = tuple(events_by_id.values())
         return intents, progress, open_intents, open_progress, events
+
+    def _load_current_state(
+        self,
+        cursor: Any,
+        strategy_id: str,
+    ) -> tuple[
+        tuple[OrderIntent, ...],
+        tuple[OrderExecutionProgress, ...],
+        tuple[PortfolioEvent, ...],
+    ]:
+        """Load the bounded materialized state used by the runtime hot path."""
+
+        _psycopg, sql, _Jsonb = _driver()
+        schema = sql.Identifier(self.schema)
+        cursor.execute(
+            sql.SQL(
+                "SELECT c.payload,d.intent_fingerprint,d.payload "
+                "FROM {}.open_intents_current AS c "
+                "JOIN {}.order_intent_definitions AS d "
+                "ON d.strategy_id=c.strategy_id AND d.intent_id=c.intent_id "
+                "WHERE c.strategy_id=%s ORDER BY c.intent_id"
+            ).format(schema, schema),
+            (strategy_id,),
+        )
+        intent_rows = cursor.fetchall()
+        intents = tuple(_intent_from_json(row[0]) for row in intent_rows)
+        for intent, row in zip(intents, intent_rows):
+            if (
+                row[1] != _intent_definition_fingerprint(intent)
+                or row[2] != row[0]
+            ):
+                raise LedgerError("current order intent differs from its definition")
+
+        cursor.execute(
+            sql.SQL(
+                "SELECT payload FROM {}.execution_progress_current "
+                "WHERE strategy_id=%s ORDER BY intent_id"
+            ).format(schema),
+            (strategy_id,),
+        )
+        progress = tuple(_progress_from_json(row[0]) for row in cursor.fetchall())
+        intent_ids = {item.id for item in intents}
+        if any(item.intent_id not in intent_ids for item in progress):
+            raise LedgerError("current execution progress has no open intent")
+        if any(item.status == "FILLED" for item in progress):
+            raise LedgerError("filled execution progress must not remain current")
+
+        cursor.execute(
+            sql.SQL(
+                "SELECT payload FROM ("
+                "SELECT event_ordinal,payload FROM {}.events "
+                "WHERE strategy_id=%s ORDER BY event_ordinal DESC LIMIT 100"
+                ") AS recent ORDER BY event_ordinal"
+            ).format(schema),
+            (strategy_id,),
+        )
+        events = tuple(_event_from_json(row[0]) for row in cursor.fetchall())
+        if len({item.id for item in events}) != len(events):
+            raise LedgerError("duplicate event ID in current event window")
+        return intents, progress, events
+
+    def _load_commit_state(
+        self,
+        cursor: Any,
+        strategy_id: str,
+        intent_ids: tuple[str, ...],
+    ) -> tuple[tuple[OrderIntent, ...], tuple[OrderExecutionProgress, ...]]:
+        """Load only facts referenced by the batch currently being committed."""
+
+        if not intent_ids:
+            return (), ()
+        _psycopg, sql, _Jsonb = _driver()
+        schema = sql.Identifier(self.schema)
+        unique_ids = sorted(set(intent_ids))
+        cursor.execute(
+            sql.SQL(
+                "SELECT payload FROM {}.order_intent_definitions "
+                "WHERE strategy_id=%s AND intent_id=ANY(%s) ORDER BY intent_id"
+            ).format(schema),
+            (strategy_id, unique_ids),
+        )
+        intents = tuple(_intent_from_json(item[0]) for item in cursor.fetchall())
+        cursor.execute(
+            sql.SQL(
+                """
+                SELECT payload FROM (
+                    SELECT p.payload,p.intent_id,r.commit_ordinal,p.ordinal,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY p.intent_id
+                               ORDER BY r.commit_ordinal DESC,p.ordinal DESC
+                           ) AS latest
+                    FROM {}.execution_progress AS p
+                    JOIN {}.committed_runs AS r
+                      ON r.strategy_id=p.strategy_id AND r.run_key=p.run_key
+                    WHERE p.strategy_id=%s AND p.intent_id=ANY(%s)
+                ) AS ranked
+                WHERE latest=1 ORDER BY intent_id
+                """
+            ).format(schema, schema),
+            (strategy_id, unique_ids),
+        )
+        historical_progress = tuple(
+            _progress_from_json(item[0]) for item in cursor.fetchall()
+        )
+        cursor.execute(
+            sql.SQL(
+                "SELECT payload FROM {}.execution_progress_current "
+                "WHERE strategy_id=%s AND intent_id=ANY(%s) ORDER BY intent_id"
+            ).format(schema),
+            (strategy_id, unique_ids),
+        )
+        current_progress = tuple(
+            _progress_from_json(row[0]) for row in cursor.fetchall()
+        )
+        try:
+            progress = merge_latest_execution_progress(
+                historical_progress,
+                current_progress,
+            )
+        except ProgressStateConflict as exc:
+            raise LedgerError(str(exc)) from exc
+        return intents, progress
 
     def _load_normalized_batch_cursor(self, cursor: Any, row: tuple) -> DecisionBatch:
         (
@@ -1298,14 +1622,15 @@ class PostgresLedgerStore:
             _begin_read_snapshot(connection)
             with connection.cursor() as cursor:
                 account = self._load_account_cursor(cursor, strategy_id)
-                _all_intents, _all_progress, intents, progress, events = (
-                    self._load_intents_progress_events(cursor, strategy_id)
+                intents, progress, events = self._load_current_state(
+                    cursor,
+                    strategy_id,
                 )
         return PortfolioLedgerView(
             account=account,
             open_intents=intents,
             execution_progress=progress,
-            recent_events=events[-100:],
+            recent_events=events,
         )
 
     def load_performance_view(
@@ -1498,6 +1823,18 @@ class PostgresLedgerStore:
                             list(cancelled_ids),
                         ),
                     )
+                    cursor.execute(
+                        sql.SQL(
+                            """
+                            DELETE FROM {}.open_intents_current
+                            WHERE strategy_id=%s AND intent_id = ANY(%s)
+                            """
+                        ).format(schema),
+                        (
+                            transition.strategy_id,
+                            list(cancelled_ids),
+                        ),
+                    )
                 self._insert_event(
                     cursor,
                     event,
@@ -1565,21 +1902,38 @@ class PostgresLedgerStore:
                     )
                 if batch.strategy_revision != account.strategy_revision:
                     raise LedgerError("batch strategy revision differs from account")
-                (
-                    existing_intents,
-                    existing_progress,
-                    _open_intents,
-                    _open_progress,
-                    existing_events,
-                ) = self._load_intents_progress_events(cursor, batch.strategy_id)
+                canonical_intents = canonical_facts[0]
+                canonical_progress = canonical_facts[2]
+                existing_intents, existing_progress = self._load_commit_state(
+                    cursor,
+                    batch.strategy_id,
+                    tuple(
+                        item.id for item in canonical_intents
+                    )
+                    + tuple(item.intent_id for item in canonical_progress),
+                )
                 transition = self._apply_canonical_batch(
                     account=account,
                     batch=batch,
                     canonical_facts=canonical_facts,
                     existing_intents=existing_intents,
                     existing_progress=existing_progress,
-                    existing_events=existing_events,
+                    existing_events=(),
                 )
+                completed_intent_ids = {
+                    item.intent_id
+                    for item in existing_progress
+                    if item.status == "FILLED"
+                }
+                reused_completed_ids = completed_intent_ids.intersection(
+                    {item.id for item in canonical_intents}
+                    | {item.intent_id for item in canonical_progress}
+                )
+                if reused_completed_ids:
+                    raise LedgerError(
+                        "completed intent cannot be reused: "
+                        + ", ".join(sorted(reused_completed_ids))
+                    )
                 current = transition["account"]
                 cursor.execute(
                     sql.SQL(
@@ -1612,6 +1966,11 @@ class PostgresLedgerStore:
                     paired_fills=transition["paired_fills"],
                     risk_facts=transition["risk_facts"],
                     events=transition["reconciled_events"],
+                )
+                self._write_current_execution_state(
+                    cursor,
+                    batch=batch,
+                    canonical_facts=canonical_facts,
                 )
                 self._write_current_account(cursor, current)
                 return current
@@ -1715,6 +2074,62 @@ class PostgresLedgerStore:
                 Jsonb(_event_to_json(event)),
             ),
         )
+
+    def _write_current_execution_state(
+        self,
+        cursor: Any,
+        *,
+        batch: DecisionBatch,
+        canonical_facts: tuple,
+    ) -> None:
+        """Materialize bounded open-order state in the commit transaction."""
+
+        _psycopg, sql, Jsonb = _driver()
+        schema = sql.Identifier(self.schema)
+        intents, _fills, progress, _updates, _settlements, _accruals = (
+            canonical_facts
+        )
+        for intent in intents:
+            cursor.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {}.open_intents_current
+                    (strategy_id,intent_id,payload)
+                    VALUES (%s,%s,%s)
+                    ON CONFLICT (strategy_id,intent_id) DO UPDATE
+                    SET payload=EXCLUDED.payload
+                    """
+                ).format(schema),
+                (batch.strategy_id, intent.id, Jsonb(_intent_to_json(intent))),
+            )
+        for item in progress:
+            if item.status == "FILLED":
+                cursor.execute(
+                    sql.SQL(
+                        "DELETE FROM {}.open_intents_current "
+                        "WHERE strategy_id=%s AND intent_id=%s"
+                    ).format(schema),
+                    (batch.strategy_id, item.intent_id),
+                )
+                continue
+            cursor.execute(
+                sql.SQL(
+                    """
+                    INSERT INTO {}.execution_progress_current
+                    (strategy_id,intent_id,last_occurred_at,payload)
+                    VALUES (%s,%s,%s,%s)
+                    ON CONFLICT (strategy_id,intent_id) DO UPDATE
+                    SET last_occurred_at=EXCLUDED.last_occurred_at,
+                        payload=EXCLUDED.payload
+                    """
+                ).format(schema),
+                (
+                    batch.strategy_id,
+                    item.intent_id,
+                    item.fills[-1].occurred_at,
+                    Jsonb(_progress_to_json(item)),
+                ),
+            )
 
     def _insert_batch_facts(
         self,

@@ -163,14 +163,19 @@ def test_schema_count(database_url: str) -> int:
 
 
 @contextmanager
-def isolated_postgres_schema(database_url: str) -> Iterator[str]:
+def isolated_postgres_schema(
+    database_url: str,
+    *,
+    create: bool = True,
+) -> Iterator[str]:
     """Create a unique schema and unconditionally remove only that schema."""
 
     psycopg, sql = _psycopg()
     schema = require_isolated_schema_name(f"stock_agent_test_{uuid.uuid4().hex}")
-    with psycopg.connect(database_url, autocommit=True) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    if create:
+        with psycopg.connect(database_url, autocommit=True) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
     try:
         yield schema
     finally:
@@ -179,5 +184,7 @@ def isolated_postgres_schema(database_url: str) -> Iterator[str]:
         with psycopg.connect(database_url, autocommit=True) as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema))
+                    sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                        sql.Identifier(schema)
+                    )
                 )

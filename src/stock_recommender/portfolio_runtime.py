@@ -24,9 +24,9 @@ from .portfolio_engine.contracts import (
 )
 from .portfolio_engine.ledger import (
     InMemoryLedgerStore,
-    JsonLedgerStore,
     portfolio_ledger_path,
 )
+from .portfolio_store import open_portfolio_store
 from .us_data_providers import strategy_us_data_source
 
 
@@ -197,7 +197,7 @@ def open_portfolio_runtime(
     revision = strategy.get("revision")
     if type(revision) is not int or revision < 1:
         raise ValueError("strategy.revision must be positive")
-    ledger = JsonLedgerStore(path)
+    ledger = open_portfolio_store(path)
     try:
         account = ledger.load(strategy_id)
     except KeyError:
@@ -374,7 +374,7 @@ def project_strategy_performance(
     captured_at = _utc_datetime(occurred_at)
     source = _performance_source(strategy)
     strategy_id = source.id
-    persistent_store = JsonLedgerStore(portfolio_ledger_path(path))
+    persistent_store = open_portfolio_store(path)
     try:
         ledger_view = persistent_store.load_performance_view(strategy_id)
         store = persistent_store
@@ -382,7 +382,7 @@ def project_strategy_performance(
         revision = strategy.get("revision")
         if type(revision) is not int or revision < 1:
             raise ValueError("strategy.revision must be positive")
-        store = InMemoryLedgerStore(persistent_store.path)
+        store = InMemoryLedgerStore(portfolio_ledger_path(path))
         account = store.create_account(
             AccountSnapshot(
                 id=f"account-{strategy_id}",

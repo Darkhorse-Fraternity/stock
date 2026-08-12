@@ -42,6 +42,7 @@ from stock_recommender.portfolio_engine.contracts import (
     OrderSide,
     PlanRequest,
     PortfolioEvent,
+    PortfolioLedgerView,
     PositionEffect,
     PositionRiskUpdate,
     PositionSettlementUpdate,
@@ -50,6 +51,7 @@ from stock_recommender.portfolio_engine.contracts import (
     ProcessRequest,
     RevisionTransition,
     SignalCandidate,
+    stable_execution_intent_id,
     stable_execution_progress_fill_id,
 )
 from stock_recommender.portfolio_engine.ledger import (
@@ -973,6 +975,20 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             with self.subTest(unsafe=unsafe), self.assertRaises(ValueError):
                 require_isolated_schema_name(unsafe)
 
+    def test_postgres_store_bootstraps_a_missing_schema(self):
+        before_schemas = non_test_schemas(DATABASE_URL)
+        before_fingerprint = non_test_database_fingerprint(DATABASE_URL)
+        with isolated_postgres_schema(DATABASE_URL, create=False) as schema:
+            self.assertFalse(schema_exists(DATABASE_URL, schema))
+            self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            self.assertTrue(schema_exists(DATABASE_URL, schema))
+        self.assertFalse(schema_exists(DATABASE_URL, schema))
+        self.assertEqual(non_test_schemas(DATABASE_URL), before_schemas)
+        self.assertEqual(
+            non_test_database_fingerprint(DATABASE_URL),
+            before_fingerprint,
+        )
+
     def test_postgres_store_is_independent_and_schema_is_normalized(self):
         self.assertFalse(issubclass(self.PostgresLedgerStore, JsonLedgerStore))
         required_tables = {
@@ -982,6 +998,8 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             "financing_lifecycles",
             "committed_runs",
             "order_intent_definitions",
+            "open_intents_current",
+            "execution_progress_current",
             "order_intents",
             "execution_progress",
             "fills",
@@ -1016,6 +1034,18 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                     """,
                     (schema,),
                 ).fetchall()
+                hot_path_indexes = {
+                    (row[0], row[1])
+                    for row in connection.execute(
+                        """
+                        SELECT tablename, indexname
+                        FROM pg_indexes
+                        WHERE schemaname = %s
+                          AND tablename IN ('execution_progress', 'events')
+                        """,
+                        (schema,),
+                    ).fetchall()
+                }
             self.assertNotIn("ledger_state", tables)
             self.assertTrue(required_tables.issubset(tables))
             by_table = {}
@@ -1026,6 +1056,172 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
             for table in required_tables - {"accounts"}:
                 self.assertIn("FOREIGN KEY", by_table.get(table, set()), table)
             self.assertIn("UNIQUE", by_table.get("committed_runs", set()))
+            self.assertIn(
+                ("execution_progress", "execution_progress_intent_lookup"),
+                hot_path_indexes,
+            )
+            self.assertIn(
+                ("events", "events_strategy_recent"),
+                hot_path_indexes,
+            )
+            self.assertIn(
+                ("events", "events_strategy_event_id"),
+                hot_path_indexes,
+            )
+
+    def test_migration_open_intent_accepts_future_cumulative_progress(self):
+        with isolated_postgres_schema(DATABASE_URL) as schema:
+            store = self.PostgresLedgerStore(DATABASE_URL, schema=schema)
+            account = AccountSnapshot(
+                id="account-migration-open",
+                strategy_id="migration-open",
+                strategy_revision=1,
+                occurred_at=START,
+                available_cash=1_000.0,
+                snapshot_id="migration-open-bootstrap",
+            )
+            identity = {
+                "symbol": "NVDA",
+                "position_side": PositionSide.LONG,
+                "order_side": OrderSide.BUY,
+                "position_effect": PositionEffect.OPEN,
+                "quantity": 10,
+                "reason": "migration-open",
+                "created_snapshot_id": account.snapshot_id,
+                "created_market_at": START + timedelta(minutes=1),
+            }
+            intent = OrderIntent(
+                id=stable_execution_intent_id(**identity),
+                **identity,
+            )
+            store.create_account(account)
+
+            seeded = store.bootstrap_open_state(
+                PortfolioLedgerView(account=account, open_intents=(intent,))
+            )
+
+            self.assertEqual(seeded.open_intents, (intent,))
+            fill_facts = {
+                "intent_id": intent.id,
+                "symbol": intent.symbol,
+                "position_side": intent.position_side,
+                "order_side": intent.order_side,
+                "snapshot_id": "migration-open-market-1",
+                "occurred_at": START + timedelta(minutes=2),
+                "quantity": 5,
+                "price": 100.0,
+                "fees": 0.5,
+                "commission": 0.5,
+                "status": "PARTIAL",
+            }
+            progress_fill = ExecutionProgressFill(
+                id=stable_execution_progress_fill_id(**fill_facts),
+                **fill_facts,
+            )
+            progress = OrderExecutionProgress(
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                position_side=intent.position_side,
+                order_side=intent.order_side,
+                intent_quantity=intent.quantity,
+                execution_policy_fingerprint="migration-policy",
+                fills=(progress_fill,),
+            )
+            batch = DecisionBatch(
+                run_key="migration-open-run-1",
+                strategy_id=account.strategy_id,
+                strategy_revision=account.strategy_revision,
+                portfolio_snapshot_id=account.snapshot_id,
+                market_snapshot_id=progress_fill.snapshot_id,
+                request_fingerprint="migration-open-request-1",
+                fills=(
+                    ExecutionFill(
+                        intent_id=intent.id,
+                        symbol=intent.symbol,
+                        quantity=5,
+                        price=100.0,
+                        fees=0.5,
+                        status="PARTIAL",
+                    ),
+                ),
+                execution_progress=(progress,),
+            )
+
+            current = store.commit(batch)
+            view = store.load_view(account.strategy_id)
+
+            import psycopg
+            from psycopg import sql
+
+            with psycopg.connect(DATABASE_URL) as connection:
+                current_counts = connection.execute(
+                    sql.SQL(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM {}.open_intents_current), "
+                        "(SELECT COUNT(*) FROM {}.execution_progress_current)"
+                    ).format(sql.Identifier(schema), sql.Identifier(schema))
+                ).fetchone()
+
+            self.assertEqual(current.positions[0].quantity, 5)
+            self.assertEqual(view.execution_progress, (progress,))
+            self.assertEqual(view.open_intents, (intent,))
+            self.assertEqual(current_counts, (1, 1))
+
+            final_fill_facts = {
+                **fill_facts,
+                "snapshot_id": "migration-open-market-2",
+                "occurred_at": START + timedelta(minutes=3),
+                "price": 101.0,
+                "status": "FILLED",
+            }
+            final_progress_fill = ExecutionProgressFill(
+                id=stable_execution_progress_fill_id(**final_fill_facts),
+                **final_fill_facts,
+            )
+            completed_progress = OrderExecutionProgress(
+                intent_id=intent.id,
+                symbol=intent.symbol,
+                position_side=intent.position_side,
+                order_side=intent.order_side,
+                intent_quantity=intent.quantity,
+                execution_policy_fingerprint="migration-policy",
+                fills=(progress_fill, final_progress_fill),
+            )
+            completed = store.commit(
+                DecisionBatch(
+                    run_key="migration-open-run-2",
+                    strategy_id=account.strategy_id,
+                    strategy_revision=account.strategy_revision,
+                    portfolio_snapshot_id=current.snapshot_id,
+                    market_snapshot_id=final_progress_fill.snapshot_id,
+                    request_fingerprint="migration-open-request-2",
+                    fills=(
+                        ExecutionFill(
+                            intent_id=intent.id,
+                            symbol=intent.symbol,
+                            quantity=5,
+                            price=101.0,
+                            fees=0.5,
+                            status="FILLED",
+                        ),
+                    ),
+                    execution_progress=(completed_progress,),
+                )
+            )
+            completed_view = store.load_view(account.strategy_id)
+            with psycopg.connect(DATABASE_URL) as connection:
+                completed_counts = connection.execute(
+                    sql.SQL(
+                        "SELECT "
+                        "(SELECT COUNT(*) FROM {}.open_intents_current), "
+                        "(SELECT COUNT(*) FROM {}.execution_progress_current)"
+                    ).format(sql.Identifier(schema), sql.Identifier(schema))
+                ).fetchone()
+
+            self.assertEqual(completed.positions[0].quantity, 10)
+            self.assertEqual(completed_view.open_intents, ())
+            self.assertEqual(completed_view.execution_progress, ())
+            self.assertEqual(completed_counts, (0, 0))
 
     def test_intent_definition_registry_enforces_relationships_and_conflicts(self):
         with isolated_postgres_schema(DATABASE_URL) as schema:
@@ -1064,7 +1260,12 @@ class MonthLongShortIntegrationTests(unittest.TestCase):
                 }
                 self.assertEqual(
                     relationships,
-                    {"order_intents", "execution_progress", "fills"},
+                    {
+                        "order_intents",
+                        "open_intents_current",
+                        "execution_progress",
+                        "fills",
+                    },
                 )
                 with self.assertRaises(psycopg.errors.ForeignKeyViolation):
                     connection.execute(

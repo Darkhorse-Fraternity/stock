@@ -110,13 +110,19 @@ Hermes 可通过以下环境变量同步三个现有任务：
 
 ## PostgreSQL 迁移与隔离集成测试
 
-`PostgresLedgerStore` 是独立的可选适配器，不继承 JSON 或内存账本；生产 JSON 部署也不依赖 Psycopg。PostgreSQL 把 canonical 事实拆分到 15 张规范化表：账户、持仓、借券与融资生命周期、已提交批次、订单意图定义、每 run 的订单意图 occurrence、执行进度、成交、持仓风险事实与更新、结算更新、费用计提、事件和 revision 迁移。订单意图定义以 `(strategy_id, intent_id)` 全局唯一并校验 payload fingerprint，occurrence 以 `(strategy_id, run_key, intent_id)` 标识，因此同一 canonical intent 可以被多个 run 完整引用，内容冲突仍会 fail-closed。`batch_payload` 只是审计副本，不是读取权威；当前账户、开放订单、已提交批次和策略表现都从类型化关系表重建，不保存或读取整份 `ledger_state`。所有需要多条查询重建结果的公开只读入口都在 `REPEATABLE READ READ ONLY` 事务中运行，避免账户、facts 与批次来自不同数据库快照。
+`PostgresLedgerStore` 是独立适配器，不继承 JSON 或内存账本；生产运行必须显式设置 `STOCK_AGENT_LEDGER_BACKEND=postgres`、`STOCK_AGENT_PORTFOLIO_DATABASE_URL` 和 `STOCK_AGENT_PORTFOLIO_SCHEMA`，配置错误直接 fail-closed，禁止静默退回 JSON。JSON 只保留为本地开发适配器和一次性迁移源。PostgreSQL 将数据分成两类：追加式 canonical 审计表保存账户、批次、订单、成交、风控、费用、事件和 revision 全生命周期；`open_intents_current` 与 `execution_progress_current` 只物化当前未完成订单。新订单、部分成交、完全成交和 revision 切换都在同一提交事务中同步更新这两张当前状态表，因此它们的规模由开放订单数决定，不随运行天数增长。迁移瞬间尚未完成的订单也写入同一当前状态模型，不保留迁移专用运行分支。订单意图定义以 `(strategy_id, intent_id)` 全局唯一并校验 payload fingerprint，occurrence 以 `(strategy_id, run_key, intent_id)` 标识，内容冲突会 fail-closed。`batch_payload` 只是审计副本，不是读取权威；当前账户和开放订单从有界物化表读取，已提交批次和策略表现从审计表重建，不保存或读取整份 `ledger_state`。所有需要多条查询重建结果的公开只读入口都在 `REPEATABLE READ READ ONLY` 事务中运行，避免账户、facts 与批次来自不同数据库快照。
+
+JSON 本地适配器还有第二道保护：`STOCK_AGENT_JSON_LEDGER_MAX_BYTES` 默认 16MiB。账本超过阈值时直接拒绝运行并提示配置 PostgreSQL，避免生产环境误配回 JSON 后重新出现锁竞争和超时。
 
 读取已提交批次时，适配器用 `committed_runs` 元数据及各事实表的 ordinal 重建完整 `DecisionBatch`，再将 canonical graph 和 fingerprint 与审计副本及已存指纹逐项核对。任何事实缺行、多行、ordinal 断裂、列与 payload 不一致或审计副本被修改都会 fail-closed。批次事件通过 `source_kind` 区分原始事件与账本派生事件：前者还原到 `DecisionBatch.events`，后者只进入 ledger event view。
 
 每次提交在一个数据库事务内完成：先对策略账户行 `FOR UPDATE`，再检查来源快照和 revision，写入 canonical 事实，最后更新当前账户。数据库生成的单调 `commit_ordinal` 是批次及批次事实的唯一追加顺序；不得用 run key 或业务时间猜测提交顺序，幂等重试也不得分配新序号。数据库主键 `(strategy_id, run_key)` 与逐类事实唯一键共同保证跨进程幂等；同一 run/request 的不同事实必须只有一个提交成功，另一方得到明确冲突。策略表现读取仍返回 `PortfolioPerformanceLedgerView`，不向服务层暴露 SQL 或 JSON 存储细节。
 
-迁移前先执行 preflight：确认目标 PostgreSQL 版本和容量、校验连接账户只拥有目标应用 schema 的权限、检查当前 JSON 账本完整性，并分别对应用目录、策略配置和组合账本创建带时间戳的备份。先在空的预演 schema 执行建表和全量校验；只有 preflight 全部通过才允许 apply。schema 与表标识符必须使用 Psycopg `Identifier`，不得拼接用户输入。
+热读取只加载当前账户、有界开放订单状态和最近 100 条事件；热提交只额外按本批涉及的 intent ID 做索引查询，不扫描历史事件或历史订单。完整历史只在策略表现/显式审计读取中加载。这样每 5 分钟风控的工作量由当前持仓与开放订单决定，不随运行天数增长。
+
+迁移前先暂停产生新组合写入的调度，确认目标 PostgreSQL 版本和容量、校验连接账户只拥有目标应用 schema 的权限、检查当前 JSON 账本完整性，并分别对应用目录、策略配置和组合账本创建带时间戳的备份。`stock-portfolio-bootstrap-postgres --check --archive ...` 只校验、不写入，同时报告活动订单与执行进度数量；`--apply` 仅允许空目标 schema，将已验证的当前账户及活动订单状态导入 PostgreSQL，并把原 JSON 语义等价地压缩为不可写历史归档。设置 `STOCK_AGENT_PORTFOLIO_ARCHIVE_PATH` 后，`ArchivedLedgerStore` 只在策略表现/显式历史审计读取时合并旧历史与 PostgreSQL 新事实，提交路径绝不打开归档，任何实时写入都只进入 PostgreSQL。先在空的预演 schema 执行建表和全量校验；只有 preflight 全部通过才允许 apply。schema 与表标识符必须使用 Psycopg `Identifier`，不得拼接用户输入。
+
+每次 CLI 运行将成功/失败、模式、策略、账本后端、耗时和错误类型写入有上限的 SQLite 运行日志（默认最多 2000 条），通过 `stock-runtime-runs --limit 50` 查询。该日志用于区分应用执行失败与 Hermes/飞书投递失败，不包含数据库口令或飞书凭据。
 
 隔离测试只允许创建 `stock_agent_test_<32位小写十六进制>` schema。fixture 在 `finally` 中使用独立连接执行精确 `DROP SCHEMA ... CASCADE`；禁止删除或修改 `public`、既有 schema、既有表或业务数据。运行方式：
 

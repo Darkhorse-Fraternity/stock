@@ -37,6 +37,7 @@ from .parameters import (
 )
 from .portfolio_engine.ledger import portfolio_ledger_path
 from .portfolio_runtime import project_strategy_performance
+from .runtime_runs import recent_runtime_runs
 from .strategy_chat import chat_strategy
 from .strategy_runs import StrategyRunInProgressError, get_strategy_run, list_strategy_runs, start_strategy_run
 from .us_data_providers import us_market_data_status
@@ -109,6 +110,12 @@ def health_payload() -> dict:
         for item in PARAMETER_CATALOG
         if config["parameters"][item["id"]].get("enabled") and item["status"] in {"live", "derived"}
     )
+    try:
+        recent_runs = recent_runtime_runs(limit=1)
+        runtime_journal_status = "ok"
+    except Exception:
+        recent_runs = ()
+        runtime_journal_status = "error"
     return {
         "status": "ok",
         "strategy": config["name"],
@@ -117,6 +124,11 @@ def health_payload() -> dict:
         "approval_gate": config.get("validation", {}).get("approval_gate"),
         "active_parameters": active,
         "effective_parameters": effective,
+        "ledger_backend": os.getenv("STOCK_AGENT_LEDGER_BACKEND", "json")
+        .strip()
+        .lower(),
+        "runtime_journal_status": runtime_journal_status,
+        "last_runtime_run": None if not recent_runs else recent_runs[0],
         "us_market_data": us_market_data_status(),
     }
 
@@ -154,6 +166,9 @@ class AdminHandler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json(health_payload())
+            return
+        if path == "/api/runtime-runs":
+            self._send_json({"runs": recent_runtime_runs(limit=100)})
             return
         run_id = self._run_route(path)
         if run_id:

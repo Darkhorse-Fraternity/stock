@@ -309,7 +309,11 @@ class BacktestTests(unittest.TestCase):
                 data_loader=lambda _: synthetic_dataset(),
             )
             completed = None
-            deadline = time.monotonic() + 30
+            # The production-class ARM runner can need slightly over 30s for
+            # the unchanged full synthetic dataset.  Keep the data and all
+            # assertions intact while avoiding deletion of the temporary
+            # result store underneath a still-running worker.
+            deadline = time.monotonic() + 90
             while time.monotonic() < deadline:
                 completed = get_backtest(queued["id"], path=results_path)
                 if completed and completed["status"] in {"succeeded", "failed"}:
