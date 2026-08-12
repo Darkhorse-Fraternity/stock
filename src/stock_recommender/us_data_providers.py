@@ -190,7 +190,14 @@ class AlpacaMarketDataClient:
                 "/v2/stocks/snapshots",
                 {"symbols": ",".join(batch), "feed": self.feed},
             )
-            snapshots = payload.get("snapshots") or {}
+            # Alpaca's current multi-snapshot endpoint returns the symbol map
+            # at the top level (for example, {"AAPL": {...}}).  Some fixtures
+            # and older responses wrap the same map in a ``snapshots`` field.
+            # Keep transport-shape handling inside the vendor adapter so the
+            # market and strategy layers only consume normalized quote rows.
+            snapshots = payload.get("snapshots")
+            if snapshots is None:
+                snapshots = payload
             if not isinstance(snapshots, dict):
                 continue
             for raw_symbol, raw_snapshot in snapshots.items():

@@ -289,23 +289,21 @@ class UsMarketAdapterTests(unittest.TestCase):
     def test_alpaca_snapshot_parser_maps_realtime_price_and_daily_volume(self):
         captured = {}
         payload = {
-            "snapshots": {
-                "AAPL": {
-                    "latestTrade": {
-                        "p": 213.25,
-                        "t": "2026-07-30T15:45:00Z",
-                    },
-                    "minuteBar": {"c": 213.2, "t": "2026-07-30T15:45:00Z"},
-                    "dailyBar": {
-                        "o": 210,
-                        "h": 214,
-                        "l": 209,
-                        "c": 213.2,
-                        "v": 12_345_678,
-                        "vw": 212.5,
-                    },
-                    "prevDailyBar": {"c": 208.5},
-                }
+            "AAPL": {
+                "latestTrade": {
+                    "p": 213.25,
+                    "t": "2026-07-30T15:45:00Z",
+                },
+                "minuteBar": {"c": 213.2, "t": "2026-07-30T15:45:00Z"},
+                "dailyBar": {
+                    "o": 210,
+                    "h": 214,
+                    "l": 209,
+                    "c": 213.2,
+                    "v": 12_345_678,
+                    "vw": 212.5,
+                },
+                "prevDailyBar": {"c": 208.5},
             }
         }
 
